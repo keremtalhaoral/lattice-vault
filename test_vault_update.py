@@ -114,6 +114,12 @@ class VaultUpdateTest(unittest.TestCase):
         prop = tu.agent(self.db, "preference.set", "user:owner", {"value": "su"}, key="drink")
         r = self.imp(block([dict(PREF, supersedes=prop, cites=[own])]))
         self.assertEqual(r["new"], 1)
+        # L4r: an agent proposal the user already approved (or rejected) can no longer be superseded by an import
+        for verdict in ("approve", "reject"):
+            p2 = tu.agent(self.db, "learning.captured", "user:owner", {"text": f"agent note {verdict}"})
+            vault.review(self.db, p2, verdict)
+            self.refused(block([dict(LEARN, supersedes=p2)],
+                               idempotency_key=f"ctx-l4r-{verdict}:1"), "still-proposed")
         # the user's own later write is never blocked by an imported proposal
         tu.user(self.db, "preference.set", "user:owner", {"value": "ayran"}, key="drink")
 

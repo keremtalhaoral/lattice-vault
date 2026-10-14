@@ -3,6 +3,8 @@ All notable changes to this project are documented here. Format: [Keep a Changel
 
 ## [Unreleased]
 ### Added
+- `vault sync-seq` (counters and refused artefacts) and `vault sync-seq-advance --stream S --to N` (human-only
+  recovery after restoring a sending device from an old backup). docs/adr/0016-signed-sequences-and-hpke.md.
 - Context Pack v2 (docs/adr/0015-context-pack-v2.md): `vault export-context` now writes `context-pack/2` by default
   (`--format 1` keeps lattice-context/v1): [V]/[U] markers with author and date on every line, fixed section order,
   counts and a token-estimate block in the front matter, JSON `vault_update/2` template.
@@ -13,9 +15,20 @@ All notable changes to this project are documented here. Format: [Keep a Changel
   only, same checks as the agent API, preview + terminal confirmation (`--dry-run`, `--yes`), atomic, idempotent;
   entries land unverified as `agent:<name>`.
 ### Changed
+- MCP `export_context_pack` tool description matches the context-pack/2 output.
 - MCP context pack (`export_context_pack`, `vault://pack/*`) uses the context_pack export path (`context-pack/2`);
   `max_chars` minimum is 2000. User-approved agent proposals appear as approved facts in packs.
 ### Security
+- Sync packages are `vaultsync/0.2`: the manifest (body hash, vector, sequence number, previous package hash) is
+  signed by the user key; peer watermarks use the signed vector, capped at what the receiver holds. `vaultsync/0.1`
+  is refused (re-export). `key.*` events are no longer exported (ADR 0016).
+- Key bundles are `vaultkeys/0.2`: DEKs are wrapped with standard RFC 9180 HPKE (X25519, HKDF-SHA256, AES-256-GCM)
+  from `cryptography` (RFC test vectors in the test suite); bundles carry a signed sequence number and previous
+  bundle hash. `vaultkeys/0.1` is refused (re-export from the sender). Closes ADR 0013 N2/N3.
+- Receivers keep per-sender sequence state; replayed, rolled-back or forked packages and bundles are refused and
+  recorded (ADR 0016).
+- `vault import-update`: `supersedes` may only target events that are still proposed (not approved or rejected).
+- SECURITY.md: `vault pack` output contains decrypted values; do not paste it into an AI.
 - Agent read surfaces render sensitive fields as `[encrypted]` and omit subjects with a pending or applied shred;
   context packs (v1 and v2) withhold those subjects, based on the keystore and shredding plan state.
 - `vault import-update`: shares the agent rate limit and revocation, sanitised preview/messages, stricter input

@@ -77,10 +77,10 @@ weakening crypto-shredding or the quarantine model (ADR 0008, 0011, 0012).
     human-only (TTY). Output contains ids and fingerprints only.
 
 ## Review items deferred (Data Systems review of #14)
-- **N2: signed bundle sequence numbers. MUST be closed before real user data.** Not implemented (deviates from S8). Bundles are idempotent by key id, and
-  tombstones stop shredded keys from coming back. Needs explicit Security sign-off.
-- **N3: HPKE-style construction instead of age. MUST be closed before real user data** (decision + Security sign-off).
-  Deviates from S5 (see item 4).
+- **N2: signed bundle sequence numbers.** Closed by ADR 0016 (signed per-sender sequence numbers for packages and
+  bundles; replay, rollback and fork refused). Security sign-off pending.
+- **N3: key wrap construction.** Closed by ADR 0016: vaultkeys/0.2 uses standard RFC 9180 HPKE from `cryptography`
+  (with test vectors); vaultkeys/0.1 is refused. Security sign-off pending.
 - **N4: signing key.** Bundles and certificates are signed by the user key, not by a device key. `sender_device` is
   only as authentic as the user key; see item 8. Device keys come with vaultsync/0.2.
 - **N5: key-transport revocation is separate from pairing.** `revoke-peer` stops key transport and synced shreds

@@ -2,6 +2,17 @@
 All notable changes to this project are documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
+### Changed
+- Projections are applied incrementally on append, inside the append transaction, through the same fold
+  functions as `rebuild()`. Unsafe event shapes (corrections, reverts, redaction/shred, HLC merges, approval of
+  order-dependent types) fall back to a full rebuild. Mean append time went from 21.5 to 1.2 ms at 1k events,
+  150 to 2.3 ms at 10k and 1696 to 3.6 ms at 100k.
+- Open verifies the hash chains incrementally from `chain_checkpoint` (verified head seq/hash), and skips the
+  rebuild when `proj_meta.last_seq == MAX(seq)`. Open with a current checkpoint takes 1.2–1.7 ms at 1k–100k events,
+  down from 11 ms to 973 ms. `vault doctor` (`--full`) still verifies from genesis.
+- `rebuild()` runs in a single transaction, so a failure leaves the old projections intact. Link lookups during a
+  rebuild are batched (no per-event N+1 queries). A full rebuild is about 1.1–1.4× slower, because it also
+  checkpoints `projection_hash`. See docs/projections.md.
 ### Added
 - Event schema registry + upcasters (`schemas.py`, docs/schema-evolution.md). Every emitted type has a
   current `schema_version` and a declarative validator. `append()` validates and stamps the version, and MCP
@@ -9,6 +20,8 @@ All notable changes to this project are documented here. Format: [Keep a Changel
   read (rebuild, history, pack, export-context, show, `get_event`), and stored events are never rewritten.
   Events newer than the code are tolerated, excluded from projections (status `unknown_version`) and reported
   by `vault doctor`. The human CLI may still add unregistered types, with a warning.
+- `bench_append.py` (append ms, rebuild time, open time, peak RSS, DB size) and `test_projections.py`
+  (randomized incremental-vs-full equivalence, shuffled delivery, checkpoint + tail, atomic rebuild, tamper detection).
 - `vault export-context`: MCP-fallback Context Pack (`lattice-context/v1`, Markdown + YAML front matter) of
   approved facts only, with `[encrypted]`/`[redacted]` placeholders, deterministic output, token budget and a
   `vault_update` template. See docs/context-pack.md. `vault pack` is unchanged.

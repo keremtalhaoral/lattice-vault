@@ -134,7 +134,7 @@ class SyncTest(unittest.TestCase):
         b = self.B.execute("SELECT payload, payload_ct FROM events WHERE id=?", (eid,)).fetchone()
         self.assertEqual(tuple(a), tuple(b))
         st = self.B.execute("SELECT status FROM proj_status WHERE event_id=?", (eid,)).fetchone()[0]
-        self.assertEqual(st, "redacted")   # B has no key (key sync is planned) -> unreadable, never plaintext
+        self.assertEqual(st, "undecryptable")   # B has no key (key sync is planned) -> unreadable, never plaintext
 
     def test_dry_run_writes_nothing(self):
         vault.append(self.A, "preference.set", U, {"key": "dil", "value": "Türkçe"}, U, "verified")

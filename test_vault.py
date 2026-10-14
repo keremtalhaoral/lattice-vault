@@ -108,7 +108,9 @@ class VaultUserTest(unittest.TestCase):
     def test_vault_user_sets_human_actor(self):
         import subprocess, sys, tempfile
         d = tempfile.mkdtemp(); env = dict(os.environ, VAULT_DB=os.path.join(d, "v.db"), VAULT_USER="ada")
+        self.addCleanup(__import__("shutil").rmtree, d, True)
         here = os.path.dirname(os.path.abspath(__file__))
+        subprocess.run([sys.executable, os.path.join(here, "vault.py"), "init"], check=True, capture_output=True, env=env)
         r = subprocess.run([sys.executable, os.path.join(here, "vault.py"), "add", "note.added", "x", "--text", "hi"],
                            capture_output=True, text=True, env=env)
         self.assertEqual(r.returncode, 0, r.stderr)

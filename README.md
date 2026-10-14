@@ -79,6 +79,7 @@ Set `VAULT_DB` (default `./vault.db`). The human actor is `user:$VAULT_USER` (de
 Human-only commands require an interactive terminal.
 ```sh
 export VAULT_DB=$HOME/.local/share/lattice-vault/vault.db
+./vault init                     # once: create the vault (commands never auto-create a missing VAULT_DB)
 
 ./vault add preference.set user:ada --key language --payload '{"value":"English"}'
 ./vault add decision.made decision:D-100 --payload '{"decision_id":"D-100","title":"Local-first","decision":"No cloud"}'

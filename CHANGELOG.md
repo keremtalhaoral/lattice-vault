@@ -2,7 +2,30 @@
 All notable changes to this project are documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
+### Security
+- Restore drill 2026-10-14 fixes. `restore --keys` trial-decrypts with the target KEK (every live DEK + one
+  event per key) and refuses on mismatch instead of exiting 0 with silently unreadable fields.
+- `vault doctor` checks decryptability (DEKs unwrap; sampled events, or all with `--decrypt-all`).
+- Restore without `--keys` is refused when unshredded encrypted events exist; `--allow-no-keys` overrides it on
+  purpose and no longer auto-creates keys.db / a fresh KEK at the target.
+- Restore errors for a corrupt vault.db no longer leak stored row text from SQLite messages.
+- Read-only commands (`verify`, `doctor`, `history`, MCP, …) never create keys.db or a KEK. keys.db / KEK are
+  created only by a sensitive write on a vault with no keystore and no encrypted events; a missing KEK for an
+  existing keystore or existing encrypted events fails loudly instead of minting a new KEK.
+- keys.db stores a KEK check value; restore verifies it, so a wrong KEK is caught even with no live keys. A keys
+  backup with neither is restored with a `KEK NOT VERIFIED` warning (`kek_verified.tested: false`).
+### Added
+- `vault backup-kek --out DIR` (separate, explicit KEK backup; salt only in passphrase mode) and
+  `restore --kek DIR`. A KEK is never bundled with `backup-keys`. See docs/backup-restore.md.
+- `vault verify`: read-only full chain verify + projection hash vs a fresh rebuild.
+- Event status `undecryptable` (missing key / wrong KEK), distinct from `redacted` (redacted or crypto-shredded).
+- `doctor` reports `shredded_keys` separately from `events_with_missing_keys`, plus `checks.keystore`.
+- Shredded subjects stay `redacted` (not `undecryptable`) even without keys.db, e.g. after `--allow-no-keys`.
+### Fixed
+- Tests no longer leak temp dirs (`testutil.fresh` registers `shutil.rmtree` cleanup).
 ### Changed
+- **Breaking (CLI):** a missing `VAULT_DB` is an error instead of silently creating an empty vault; create one
+  with the new `vault init`. The MCP server never creates a vault.
 - Projections are applied incrementally on append, inside the append transaction, through the same fold
   functions as `rebuild()`. Unsafe event shapes (corrections, reverts, redaction/shred, HLC merges, approval of
   order-dependent types) fall back to a full rebuild. Mean append time went from 21.5 to 1.2 ms at 1k events,

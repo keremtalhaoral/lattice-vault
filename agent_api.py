@@ -97,7 +97,7 @@ def _ro():
 
 
 def _rw():
-    return vault.connect(_db_path())
+    return vault.connect(_db_path(), create=False)   # never auto-create a vault from the MCP side
 
 
 def _audit(actor, outcome, reason, event_id=None):

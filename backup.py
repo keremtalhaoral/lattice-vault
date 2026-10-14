@@ -6,7 +6,9 @@ manifest; refused inside/around a vault backup dir so the two are stored apart. 
 PRAGMA integrity_check, triggers and full hash chains on a staged copy, atomically rename into place, re-apply
 shreds recorded in the restored log, rebuild projections.
 
-The KEK (keys.kek / VAULT_PASSPHRASE) is never written to a backup: keep it separately.
+The KEK is never part of a vault or keys backup. `vault backup-kek --out DIR3` makes an explicit, separate KEK
+backup (keys.kek, or only the salt in VAULT_PASSPHRASE mode); `restore --kek DIR3` installs it. With --keys,
+restore trial-decrypts with the target KEK and refuses on mismatch.
 """
 import json, os, shutil, sqlite3, tempfile
 from datetime import datetime, timezone
@@ -16,6 +18,9 @@ from ops import _sha256_file
 FORMAT = "lattice-backup/v1"
 TOOL_VERSION = "0.1.0-prototype"
 KEYS_FORMAT = "lattice-keys-backup/v1"
+KEK_FORMAT = "lattice-kek-backup/v1"
+KEK_WARNING = ("this KEK backup unlocks every keys backup. Store it apart from BOTH vault and keys backups "
+               "(different medium / password manager / offline), never next to keys.db.")
 KEYS_WARNING = ("this keys backup contains keys.db: any subject shredded AFTER this backup stays decryptable from it. "
                 "Store it apart from vault backups and delete old key backups after a shred.")
 
@@ -74,7 +79,9 @@ def _near_backup(out_dir, fmt):
 
 
 def _prepare_out(out_dir, other_fmt, what):
-    near = _near_backup(out_dir, other_fmt)
+    near = None
+    for fmt in (other_fmt if isinstance(other_fmt, tuple) else (other_fmt,)):
+        near = near or _near_backup(out_dir, fmt)
     if near:
         raise BackupError(f"{what} output {out_dir} overlaps backup dir {near}; keep vault and key backups in separate locations")
     if os.path.exists(out_dir) and os.listdir(out_dir):
@@ -90,7 +97,7 @@ def _write_manifest(out_dir, man):
 
 def backup_keys(db, out_dir):
     """Copy keys.db only (KEK-wrapped) + manifest with key ids. Human-only CLI: `vault backup-keys`."""
-    _prepare_out(out_dir, FORMAT, "backup-keys")
+    _prepare_out(out_dir, (FORMAT, KEK_FORMAT), "backup-keys")
     with obs.span("ops", "backup_keys"):
         ks = vault.keystore(db); ks.db.commit()      # keystore's own path (honours VAULT_KEYS_DB)
         kp = os.path.join(out_dir, "keys.db")
@@ -128,11 +135,48 @@ def verify_keys(keys_dir):
     return man
 
 
+def backup_kek(db, out_dir):
+    """Explicit, separate KEK backup (`vault backup-kek --out DIR3`, human-only). File mode: copies keys.kek.
+    Passphrase mode: copies only the scrypt salt (the passphrase itself is never written anywhere).
+    Refused if DIR3 equals, is inside or contains a vault or keys backup."""
+    import crypto_keys
+    _prepare_out(out_dir, (FORMAT, KEYS_FORMAT), "backup-kek")
+    with obs.span("ops", "backup_kek"):
+        ks = vault.keystore(db)
+        src = crypto_keys.kek_paths(ks.kek_path)
+        name = "keys.kek.salt" if src.endswith(".salt") else "keys.kek"
+        dst = os.path.join(out_dir, name)
+        fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with open(src, "rb") as f, os.fdopen(fd, "wb") as o:
+            o.write(f.read())
+        man = {"format": KEK_FORMAT, "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+               "tool_version": TOOL_VERSION, "kek_id": ks.kek_id, "passphrase_included": False,
+               "files": {name: {"sha256": _sha256_file(dst)}}}
+        _write_manifest(out_dir, man)
+        vault.audit(db, vault.HUMAN, "backup_kek", "accepted", f"KEK backup written ({ks.kek_id})")
+    return {"out": out_dir, "manifest": man, "warning": KEK_WARNING}
+
+
+def verify_kek(kek_dir):
+    if _manifest_format(kek_dir) != KEK_FORMAT:
+        raise BackupError(f"{kek_dir}: not a KEK backup (manifest format must be {KEK_FORMAT})")
+    with open(os.path.join(kek_dir, "manifest.json")) as f:
+        man = json.load(f)
+    files = man.get("files", {})
+    if len(files) != 1 or next(iter(files)) not in ("keys.kek", "keys.kek.salt"):
+        raise BackupError("KEK manifest must list exactly keys.kek or keys.kek.salt")
+    name = next(iter(files))
+    p = os.path.join(kek_dir, name)
+    if not os.path.exists(p) or _sha256_file(p) != files[name]["sha256"]:
+        raise BackupError(f"{name}: missing or sha256 mismatch (tampered or corrupt)")
+    return man, name
+
+
 def backup(db, out_dir, include_keys=False):
     if include_keys:
         raise BackupError("vault backups never include keys.db; use `vault backup-keys --out DIR2` (separate location)")
     src = os.path.abspath(db.execute("PRAGMA database_list").fetchone()[2])
-    _prepare_out(out_dir, KEYS_FORMAT, "backup")
+    _prepare_out(out_dir, (KEYS_FORMAT, KEK_FORMAT), "backup")
     with obs.span("ops", "backup"):
         db.commit()
         vpath = os.path.join(out_dir, "vault.db")
@@ -178,6 +222,14 @@ def verify(backup_dir):
 
 
 def _check_copy(path, man):
+    try:
+        return _check_copy_inner(path, man)
+    except sqlite3.Error as e:
+        # never echo sqlite's message: it can quote stored row text (e.g. "Could not decode ... with text '...'")
+        raise BackupError(f"vault.db is corrupt or unreadable ({type(e).__name__}); backup rejected") from None
+
+
+def _check_copy_inner(path, man):
     c = sqlite3.connect(path); c.row_factory = sqlite3.Row
     try:
         integ = integrity(c)
@@ -195,16 +247,44 @@ def _check_copy(path, man):
         c.close()
 
 
+def _kek_path(tdir):
+    return os.environ.get("VAULT_KEK_FILE", os.path.join(tdir, "keys.kek"))
+
+
 def _kek_available(tdir):
     if os.environ.get("VAULT_PASSPHRASE"):
-        return os.path.exists(os.environ.get("VAULT_KEK_FILE", os.path.join(tdir, "keys.kek")) + ".salt")
-    return os.path.exists(os.environ.get("VAULT_KEK_FILE", os.path.join(tdir, "keys.kek")))
+        return os.path.exists(_kek_path(tdir) + ".salt")
+    return os.path.exists(_kek_path(tdir))
 
 
-def restore(backup_dir, to_path, force=False, allow_missing_keys=False, keys_dir=None):
+class _NoKeyStore:
+    """Stand-in keystore for a keyless restore: every encrypted field is undecryptable, and no keys.db / KEK
+    is created next to the restored vault."""
+    def open(self, *a):
+        raise KeyError("no keys restored")
+
+    def close(self):
+        pass
+
+
+def restore(backup_dir, to_path, force=False, allow_missing_keys=False, keys_dir=None, allow_no_keys=False, kek_dir=None):
+    """allow_missing_keys: --keys given but some referenced key ids are absent -> restore anyway (listed).
+    allow_no_keys: no --keys although the log has encrypted events -> restore anyway; those fields stay
+    'undecryptable' and no keys.db / KEK is created. kek_dir: KEK backup from `vault backup-kek`, installed
+    next to the target when no KEK is reachable there. With --keys the KEK is always trial-verified."""
+    import crypto_keys
     man = verify(backup_dir)
     if keys_dir is not None:
         verify_keys(keys_dir)
+    kek_src = None
+    if kek_dir is not None:
+        if keys_dir is None:
+            raise BackupError("--kek needs --keys (a KEK alone decrypts nothing)")
+        _kman, kname = verify_kek(kek_dir)
+        if (kname == "keys.kek.salt") != bool(os.environ.get("VAULT_PASSPHRASE")):
+            raise BackupError("KEK backup mode does not match this environment (salt backups need VAULT_PASSPHRASE; "
+                              "keys.kek backups must be used without it)")
+        kek_src = os.path.join(kek_dir, kname)
     to_path = os.path.abspath(to_path)
     tdir = os.path.dirname(to_path)
     keys_target = os.path.join(tdir, "keys.db")
@@ -213,7 +293,15 @@ def restore(backup_dir, to_path, force=False, allow_missing_keys=False, keys_dir
         for p in [to_path] + ([keys_target] if has_keys else []):
             if os.path.exists(p):
                 raise FileExistsError(f"{p} exists; pass --force to overwrite")
-    if has_keys and not _kek_available(tdir):
+    kek_install = None
+    if kek_src is not None:
+        kek_install = crypto_keys.kek_paths(_kek_path(tdir))
+        if os.path.exists(kek_install):
+            if open(kek_install, "rb").read() != open(kek_src, "rb").read():
+                raise BackupError(f"a different KEK already exists at {kek_install}; move it away first "
+                                  "(it is never overwritten, not even with --force)")
+            kek_install = None
+    if has_keys and kek_install is None and not _kek_available(tdir):
         raise BackupError("--keys given but no KEK is reachable for the target (copy the original keys.kek next "
                           "to it, or set VAULT_KEK_FILE / VAULT_PASSPHRASE); refusing so a fresh KEK is not auto-created")
     os.makedirs(tdir, mode=0o700, exist_ok=True)
@@ -232,6 +320,24 @@ def restore(backup_dir, to_path, force=False, allow_missing_keys=False, keys_dir
             ki = integrity(kc); kc.close()
             if not _ok(ki):
                 raise BackupError("keys.db integrity_check failed")
+            # trial-decrypt: the KEK must unwrap every live DEK, and one event per key must open (drill finding 1)
+            kek_file = kek_src if kek_src is not None else _kek_path(tdir)
+            try:
+                kek, _ = crypto_keys.read_kek(kek_file[:-5] if kek_file.endswith(".salt") else kek_file)
+            except (OSError, ValueError) as e:
+                raise BackupError(f"KEK for the target cannot be read ({type(e).__name__}: {e})") from None
+            kc = sqlite3.connect(sk); vc = sqlite3.connect(sv)
+            try:
+                trial = crypto_keys.trial_decrypt(kc, vc, kek, 1)
+            finally:
+                kc.close(); vc.close()
+            if trial["check_value"] == "mismatch":
+                raise BackupError("KEK does not match the keys backup (stored KEK check value fails). Use the keys.kek / "
+                                  "VAULT_PASSPHRASE that was in use when the keys backup was taken.")
+            if trial["bad_keys"] or trial["bad_events"]:
+                raise BackupError(f"KEK does not match the keys backup: {len(trial['bad_keys'])} of {trial['keys_checked']} key(s) "
+                                  f"cannot be unwrapped, {len(trial['bad_events'])} sampled event(s) fail to decrypt. "
+                                  "Use the keys.kek / VAULT_PASSPHRASE that was in use when the keys backup was taken.")
         # re-apply shreds recorded in the restored log (key ids from subject.shredded events)
         c = sqlite3.connect(sv)
         shredded = [json.loads(r[0]).get("key_id") for r in c.execute("SELECT payload FROM events WHERE type='subject.shredded'")]
@@ -240,6 +346,11 @@ def restore(backup_dir, to_path, force=False, allow_missing_keys=False, keys_dir
         enc_ids = {r[0] for r in c.execute("SELECT DISTINCT enc_key_id FROM events WHERE enc_key_id IS NOT NULL")}
         c.close()
         missing = []
+        live_enc = enc_ids - set(shredded)
+        if not has_keys and live_enc and not allow_no_keys:
+            raise BackupError(f"backup has encrypted events ({len(live_enc)} unshredded key id(s)) but no --keys was given; restoring "
+                              "would leave them undecryptable. Pass --keys KEYS_DIR, or --allow-no-keys to restore without "
+                              "them on purpose")
         if sk:
             kc = sqlite3.connect(sk)
             have = {r[0] for r in kc.execute("SELECT key_id FROM subject_keys")}
@@ -262,24 +373,42 @@ def restore(backup_dir, to_path, force=False, allow_missing_keys=False, keys_dir
         for p in (to_path + "-journal", to_path + "-wal", to_path + "-shm"):
             if os.path.exists(p):
                 os.remove(p)
+        if kek_install is not None:
+            fd = os.open(kek_install, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with open(kek_src, "rb") as f, os.fdopen(fd, "wb") as o:
+                o.write(f.read())
         if sk:
             os.replace(sk, keys_target)
         os.replace(sv, to_path)
     finally:
         shutil.rmtree(stage, ignore_errors=True)
     vault._KEYSTORE.pop(to_path, None)
-    db = vault.connect(to_path)          # verifies triggers + chains again
+    if not has_keys:
+        vault._KEYSTORE[to_path] = _NoKeyStore()   # never auto-create keys.db / a fresh KEK on a keyless restore
+    try:
+        db = vault.connect(to_path)          # verifies triggers + chains again
+    except BaseException:
+        vault._KEYSTORE.pop(to_path, None); raise
     try:
         vault.rebuild(db)
         vault.audit(db, vault.HUMAN, "restore", "accepted", f"restored from backup {man['created_at']} ({man['event_count']} events)")
         ph = vault.projection_hash(db)
     finally:
         db.close()
+        if not has_keys:
+            vault._KEYSTORE.pop(to_path, None)
     warnings = []
     if missing:
         warnings.append(f"MISSING KEYS: {len(missing)} key id(s) absent from keys.db; those fields are unreadable")
-    if not has_keys:
-        warnings.append("restored without --keys: encrypted fields are unreadable until a keys backup is restored")
+    kek_untested = has_keys and trial["keys_checked"] == 0 and trial["check_value"] is None
+    if kek_untested:
+        warnings.append("KEK NOT VERIFIED: the keys backup has no live keys and no stored KEK check value, so the KEK "
+                        "could not be tested; new encrypted data may become unreadable if it is the wrong KEK")
+    if not has_keys and live_enc:
+        warnings.append("restored without --keys (--allow-no-keys): encrypted fields are undecryptable until a keys "
+                        "backup and its KEK are restored")
     return {"restored": to_path, "keys_restored": has_keys, "event_count": man["event_count"], "chain_head": man["chain_head"],
             "integrity_check": integ["integrity_check"][0], "quick_check": integ["quick_check"][0],
-            "shreds_reapplied": reapplied, "missing_keys": missing, "projection_hash": ph, "warnings": warnings}
+            "shreds_reapplied": reapplied, "kek_installed": kek_install is not None,
+            "kek_verified": {"keys_checked": trial["keys_checked"], "events_checked": trial["events_checked"],
+                             "check_value": trial["check_value"], "tested": not kek_untested} if has_keys else None, "missing_keys": missing, "projection_hash": ph, "warnings": warnings}

@@ -13,3 +13,4 @@ Numbers match the project's internal decision log (D-003 … D-010); earlier num
 | [0010](0010-unsupported-claim-check.md) | Unsupported-claim (citation) check | Accepted | Partially implemented |
 | [0011](0011-signing-keys.md) | User signing key, signed human-only events, external anchor; device keys reserved | Accepted (user key) / Proposed (device keys) | Partially implemented (no device keys / package signing) |
 | [0012](0012-key-lifecycle.md) | User key rotation, revocation, offline recovery code, second anchor | Proposed | Implemented (review pending) |
+| [0013](0013-sync-key-transport.md) | Sync key transport: certified X25519 device keys, signed DEK bundles | Proposed | Prototype (review pending) |

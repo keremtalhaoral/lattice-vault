@@ -3,7 +3,7 @@
 Status: **file-based prototype** (packages are files you move by hand; no server, no network, no signing). Implements part of ADR 0008. Single owner, 2+ devices, no server,
 no network code. Device A exports a file, the user moves it (USB, file sync, …), device B imports it.
 
-> **Do not use multi-device sync with real data.** Packages are unsigned, there is no key sync, and redaction/shredding
+> **Do not use multi-device sync with real data.** Packages are unsigned, keys move only in separate signed `vaultkeys/0.1` bundles (see below, ADR 0013), and redaction
 > does not propagate to other devices. Until signing exists, `user:*` and approval events are quarantined (see Trust).
 
 ## Package format
@@ -133,3 +133,21 @@ Ed25519 package/event signing and device keys. Package encryption (age/AEAD). Ke
 Propagation of redaction to other devices (redact-copy on each device). A flag-instead-of-reject mode for skew. HLC counter overflow handling.
 `conflict.resolved` UX for correction forks. Sync-folder automation and compression. Watermarks acknowledged by the receiver.
 Partial import (it is all-or-nothing by design). `projection_hash` includes local `seq` (`decided_seq`), so it is **not** comparable across devices.
+
+## Key transport (`vaultkeys/0.1`, prototype, ADR 0013)
+Encrypted fields stay ciphertext in `.vaultsync` packages. To let a paired device read them, move the data keys in a
+separate signed bundle (human-only, TTY):
+
+    # on each device (same user key registered on both)
+    vault sync-keys init
+    vault sync-keys cert --out mydevice.cert          # public; give it to the other device
+    vault sync-keys add-peer otherdevice.cert         # device must already be paired (vault sync-pair)
+    # on the sender, after the events have been synced to the receiver
+    vault sync-keys export --to DEVICE --out keys.vaultkeys
+    # on the receiver
+    vault sync-keys import keys.vaultkeys
+    vault sync-keys quarantine                        # refused bundles / entries (ids and reasons only)
+
+The KEK never leaves a device; DEKs are wrapped to the recipient's certified X25519 key and re-wrapped under the
+recipient's KEK on import. Shredded keys are never sent; an applied, signed `subject.shredded` destroys the local copy.
+`vault sync-keys revoke-peer DEVICE --reason R` stops all key transport to and from that device.

@@ -95,6 +95,9 @@ access to an unlocked machine, a compromised Python interpreter or dependency.
 - Optional second, user-chosen anchor location `VAULT_ANCHOR_PATH2`: implemented (ADR 0012).
 - OS-keychain backend with the 0600 file as fallback (separate PR).
 - Defaults stay at 30 days (`VAULT_FULL_VERIFY_DAYS`) and K=4 (`VAULT_VERIFY_SAMPLE_K`).
+- Sync key transport (ADR 0013, prototype): DEKs move only in user-signed `vaultkeys/0.1` bundles, wrapped to a
+  paired device's certified X25519 key and re-wrapped under its own KEK; the KEK never leaves a device. Unpaired or
+  revoked devices get nothing; anything that fails verification is quarantined. Shredded keys are never sent.
 - Sync: the real device id is written into `replica_id` at write time (until then, verify against `origin_row`).
   Device keys are certified by the user key. Retroactive revocation needs `compromised:true`, a user signature and a
   human decision. Anchors are kept per device / per origin chain. `vaultsync/0.2` carries `key.*` events; until

@@ -24,6 +24,9 @@ GENESIS = "0" * 64
 REVIEW_TYPES = ("event.approved", "event.rejected")
 HUMAN_ONLY_TYPES = ("event.approved", "event.rejected", "event.reverted", "import.batch_approved",
                     "event.redacted", "subject.shredded", "conflict.resolved")
+# Every event type that must carry a user Ed25519 signature (signing.py). Kept separate from HUMAN_ONLY_TYPES so the
+# existing trigger SQL (and therefore check_triggers on existing vaults) does not change.
+SIGNED_TYPES = HUMAN_ONLY_TYPES + ("key.registered", "key.rotated", "key.revoked", "attestation.recorded")
 META_TYPES = REVIEW_TYPES + ("event.reverted", "import.batch_approved", "event.redacted", "subject.shredded",
                              "event.corrected", "conflict.resolved")
 
@@ -107,6 +110,28 @@ for _t in ("event_parents", "event_targets", "redactions", "redacted_blocklist",
     TRIGGERS[f"{_t}_no_update"] = f"CREATE TRIGGER {_t}_no_update BEFORE UPDATE ON {_t} BEGIN SELECT RAISE(ABORT, '{_t} is append-only'); END"
     TRIGGERS[f"{_t}_no_delete"] = f"CREATE TRIGGER {_t}_no_delete BEFORE DELETE ON {_t} BEGIN SELECT RAISE(ABORT, '{_t} is append-only'); END"
 
+# Signing side tables (signing.py, docs/adr/0011). Additive: created by create_schema() for new vaults and lazily by
+# ensure_sig_schema() for existing ones (the "migration": old rows are never rewritten; human-only events at or below
+# the first key.registered event are classified legacy-unsigned). event_sigs is only an index: the signature bytes are
+# bound into the event hash (event_hash), so deleting or editing a signature row breaks the event chain.
+SIG_TABLES_SQL = """
+CREATE TABLE IF NOT EXISTS event_sigs (event_id TEXT PRIMARY KEY, key_id TEXT NOT NULL, alg TEXT NOT NULL CHECK (alg = 'ed25519'),
+  sig TEXT NOT NULL);
+"""
+_NEW_SIGNED = ("key.registered", "key.rotated", "key.revoked", "attestation.recorded")
+SIG_TRIGGERS = {
+    "event_sigs_no_update": "CREATE TRIGGER event_sigs_no_update BEFORE UPDATE ON event_sigs BEGIN SELECT RAISE(ABORT, 'event_sigs is append-only'); END",
+    "event_sigs_no_delete": "CREATE TRIGGER event_sigs_no_delete BEFORE DELETE ON event_sigs BEGIN SELECT RAISE(ABORT, 'event_sigs is append-only'); END",
+    "events_signed_types_human": "CREATE TRIGGER events_signed_types_human BEFORE INSERT ON events WHEN NEW.type IN ("
+        + ",".join(f"'{t}'" for t in _NEW_SIGNED) + ") AND NEW.actor NOT LIKE 'user:%' BEGIN SELECT RAISE(ABORT, 'signed events require a human actor'); END",
+    # after signing is enabled (a key.registered exists), a locally written signed-type event needs its event_sigs row
+    # inserted first. Sync-imported rows (replica_id <> 'local') are classified remote-unsigned instead (ADR 0011).
+    "events_require_sig": "CREATE TRIGGER events_require_sig BEFORE INSERT ON events WHEN NEW.type IN ("
+        + ",".join(f"'{t}'" for t in SIGNED_TYPES) + ") AND NEW.replica_id = 'local' AND NEW.actor LIKE 'user:%' AND NEW.type <> 'key.registered' "
+        "AND EXISTS (SELECT 1 FROM events WHERE type='key.registered') "
+        "AND NOT EXISTS (SELECT 1 FROM event_sigs WHERE event_id=NEW.id) BEGIN SELECT RAISE(ABORT, 'unsigned human-only event refused'); END",
+}
+
 PROJ_SCHEMA = """
 CREATE TABLE proj_meta (projection TEXT PRIMARY KEY, projection_version INTEGER NOT NULL, last_seq INTEGER NOT NULL);
 CREATE TABLE proj_status (event_id TEXT PRIMARY KEY, status TEXT NOT NULL, decided_by TEXT, decided_seq INTEGER, trust_eff TEXT);
@@ -163,10 +188,25 @@ def find_secrets(text):
     return hits
 
 
-def require_human_tty(what):
-    """Human-only commands need an interactive TTY . VAULT_ALLOW_NONTTY=1 is a TEST-ONLY escape
-    hatch; the real fix is Ed25519-signed approvals (next step)."""
-    if sys.stdin.isatty() or os.environ.get("VAULT_ALLOW_NONTTY") == "1":
+def _nontty_allowed():
+    """VAULT_ALLOW_NONTTY=1 is honoured ONLY inside the test harness (testutil.py): it also needs VAULT_TEST_HARNESS=1 and
+    an explicit VAULT_USER_KEY under the system temp dir. With the real key location it is ignored. This is a guard
+    against accidental use, not a security boundary (same-user processes can set env vars and allocate a pty); the
+    security control for human-only events is the Ed25519 user signature."""
+    if os.environ.get("VAULT_ALLOW_NONTTY") != "1" or os.environ.get("VAULT_TEST_HARNESS") != "1":
+        return False
+    kp = os.environ.get("VAULT_USER_KEY")
+    if not kp:
+        return False
+    import tempfile
+    tmp = os.path.realpath(tempfile.gettempdir()) + os.sep
+    return os.path.realpath(kp).startswith(tmp)
+
+
+def require_human_tty(what, strict=False):
+    """Human-only commands need an interactive TTY (speed bump; signatures are the real control). `strict` ignores
+    the test-harness bypass entirely (used by `vault sign-legacy`)."""
+    if sys.stdin.isatty() or (not strict and _nontty_allowed()):
         return
     raise HumanRequired(f"`{what}` requires an interactive terminal (human-only)")
 
@@ -219,10 +259,28 @@ EVENT_HASH_FIELDS = ("id", "replica_id", "replica_seq", "hlc", "ts", "type", "sc
                      "import_id", "content_hash")
 
 
+def _row_sig(row):
+    try:
+        return row["_sig"]
+    except (KeyError, IndexError):
+        return None
+
+
 def event_hash(prev, row):
+    """hash = sha256(prev "\n" canon(event) ["\n" sig]). Hash format v2 binds the Ed25519 signature (row["_sig"], from
+    event_sigs) into the chain. For an event without a signature v2 is byte-identical to v1, so existing chains,
+    sync-imported and agent rows verify unchanged; deleting a signature of a signed row changes its hash."""
     ct = row["payload_ct"]
     body = canon([row[f] for f in EVENT_HASH_FIELDS] + [hashlib.sha256(ct).hexdigest() if ct else ""])
-    return hashlib.sha256(f"{prev}\n{body}".encode()).hexdigest()
+    sig = _row_sig(row)
+    return hashlib.sha256((f"{prev}\n{body}" + (f"\n{sig}" if sig else "")).encode()).hexdigest()
+
+
+def events_sql(db):
+    """SELECT over events that also yields `_sig` (needed by event_hash). Works on vaults without event_sigs."""
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name='event_sigs'").fetchone():
+        return "SELECT e.*, s.sig AS _sig FROM events e LEFT JOIN event_sigs s ON s.event_id=e.id"
+    return "SELECT e.*, NULL AS _sig FROM events e"
 
 
 AUDIT_HASH_FIELDS = ("ts", "epoch", "actor", "action", "outcome", "reason", "event_id")
@@ -239,7 +297,10 @@ def _norm_sql(s):
 def check_triggers(db):
     have = {r[0]: r[1] for r in db.execute("SELECT name, sql FROM sqlite_master WHERE type='trigger'")}
     problems = []
-    for name, sql in TRIGGERS.items():
+    expected = dict(TRIGGERS)
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name='event_sigs'").fetchone():
+        expected.update(SIG_TRIGGERS)
+    for name, sql in expected.items():
         if name not in have:
             problems.append(f"missing trigger {name}")
         elif _norm_sql(have[name]) != _norm_sql(sql):
@@ -250,7 +311,7 @@ def check_triggers(db):
 def verify_chains(db):
     problems = []
     prev = GENESIS
-    for r in db.execute("SELECT * FROM events ORDER BY seq"):
+    for r in db.execute(events_sql(db) + " ORDER BY e.seq"):
         if r["prev_hash"] != prev or event_hash(prev, r) != r["hash"]:
             problems.append(f"event chain broken at seq {r['seq']}"); break
         prev = r["hash"]
@@ -267,37 +328,109 @@ CHECKPOINT_SQL = "CREATE TABLE IF NOT EXISTS chain_checkpoint (k TEXT PRIMARY KE
 
 def _verify_tail(db, table, key, hasher, cp):
     """Verify `table` from checkpoint (seq, hash) to head. The checkpoint row itself is re-hashed too."""
+    label = {"events": "event", "audit": "audit"}[table]
+    sel = events_sql(db) + " WHERE e." if table == "events" else f"SELECT * FROM {table} WHERE "
     prev, start = GENESIS, 0
     if cp:
-        r = db.execute(f"SELECT * FROM {table} WHERE {key}=?", (cp[0],)).fetchone()
+        r = db.execute(f"{sel}{key}=?", (cp[0],)).fetchone()
         if r is None or r["hash"] != cp[1] or hasher(r["prev_hash"], r) != r["hash"]:
-            return f"{table} chain broken at {'seq' if key == 'seq' else 'id'} {cp[0]} (checkpoint mismatch)", None
+            return f"{table} chain broken at {'id' if key == 'id' else 'seq'} {cp[0]} (checkpoint mismatch)", None
         prev, start = cp[1], cp[0]
     head = cp
-    for r in db.execute(f"SELECT * FROM {table} WHERE {key}>? ORDER BY {key}", (start,)):
+    for r in db.execute(f"{sel}{key}>? ORDER BY {key}", (start,)):
         if r["prev_hash"] != prev or hasher(prev, r) != r["hash"]:
-            return f"{'event' if table == 'events' else 'audit'} chain broken at {'seq' if key == 'seq' else 'id'} {r[key]}", None
+            return f"{label} chain broken at {'id' if key == 'id' else 'seq'} {r[key]}", None
         prev = r["hash"]; head = (r[key], prev)
     return None, head
 
 
-def verify_chains_incremental(db):
-    """Open-time check: verify only events/audit rows after the last verified checkpoint (verified_head_seq/hash),
-    then advance the checkpoint. Rows below the checkpoint are covered by `vault doctor` (full verify_chains)."""
+def _verify_range(db, table, key, hasher, lo, hi):
+    """Verify rows lo..hi of a chain, linked to the row just before lo. Returns an error string or None."""
+    label = {"events": "event", "audit": "audit"}[table]
+    sel = events_sql(db) + " WHERE e." if table == "events" else f"SELECT * FROM {table} WHERE "
+    r0 = db.execute(f"SELECT hash FROM {table} WHERE {key}<? ORDER BY {key} DESC LIMIT 1", (lo,)).fetchone()
+    prev = r0[0] if r0 else GENESIS
+    for r in db.execute(f"{sel}{key} BETWEEN ? AND ? ORDER BY {key}", (lo, hi)):
+        if r["prev_hash"] != prev or hasher(prev, r) != r["hash"]:
+            return f"{label} chain broken at {'id' if key == 'id' else 'seq'} {r[key]} (sampled segment)"
+        prev = r["hash"]
+    return None
+
+
+import random as _random
+_RNG = _random.SystemRandom()
+
+
+def sample_segments(upto, k=None, seg=None, rng=None):
+    """Pick K random segments of SEG consecutive keys among 1..upto (rows below the checkpoint)."""
+    k = int(os.environ.get("VAULT_VERIFY_SAMPLE_K", "4")) if k is None else k
+    seg = int(os.environ.get("VAULT_VERIFY_SEGMENT", "64")) if seg is None else seg
+    if upto <= 0 or k <= 0 or seg <= 0:
+        return []
+    n = (upto + seg - 1) // seg
+    picks = (rng or _RNG).sample(range(n), min(k, n))
+    return [(i * seg + 1, min((i + 1) * seg, upto)) for i in sorted(picks)]
+
+
+CHAINS = (("events", "seq", event_hash), ("audit", "id", audit_hash))
+OPEN_WARNINGS = {}   # db path -> warnings from the last connect() (printed by the CLI)
+
+
+def verify_chains_incremental(db, warnings=None):
+    """Open-time check (docs/projections.md "open-time check"):
+    1. events/audit/signature chains from the last verified checkpoint to the head (checkpoint row re-hashed);
+    2. K random segments (VAULT_VERIFY_SAMPLE_K, default 4, of VAULT_VERIFY_SEGMENT=64 rows) below the checkpoint;
+    3. Ed25519 signatures of signed-type events in (1)+(2), a whole-log SQL check that no post-epoch human-only event lacks a
+       signature row, the key registry, and the external anchor (signing.check_anchor).
+    Rows below the checkpoint that are not sampled are covered only by `vault doctor` (full verify)."""
+    import signing
+    warnings = [] if warnings is None else warnings
     db.execute(CHECKPOINT_SQL)
     cps = {r[0]: (r[1], r[2]) for r in db.execute("SELECT k, seq, hash FROM chain_checkpoint WHERE k IN ('events','audit')")}
-    problems, heads = [], {}
-    for table, key, hasher in (("events", "seq", event_hash), ("audit", "id", audit_hash)):
-        err, head = _verify_tail(db, table, key, hasher, cps.get(table))
+    problems, heads, ranges = [], {}, []
+    for table, key, hasher in CHAINS:
+        ck = table
+        cp = cps.get(ck)
+        err, head = _verify_tail(db, table, key, hasher, cp)
         if err:
-            problems.append(err)
-        elif head:
-            heads[table] = head
+            problems.append(err); continue
+        if head:
+            heads[ck] = head
+        for lo, hi in sample_segments(cp[0] - 1 if cp else 0):
+            e = _verify_range(db, table, key, hasher, lo, hi)
+            if e:
+                problems.append(e); break
+            if table == "events":
+                ranges.append((lo, hi))
+        if table == "events":
+            ranges.append(((cp[0] if cp else 0) + 1, 1 << 62))
+    keys, kp = signing.registry_problems(db)
+    problems += kp
+    for eid, (seq, st) in signing.classify(db, ranges, keys).items():
+        if st in signing.BAD:
+            problems.append(f"signature check failed at seq {seq}: {st}"); break
+    bad = signing.unsigned_after_epoch(db)
+    if bad:
+        problems.append(f"unsigned human-only event at seq {bad[0]} (created after signing was enabled)")
+    aerr, awarn = signing.check_anchor(db, keys)
+    problems += aerr; warnings += awarn
     if not problems:
         for k, (sq, h) in heads.items():
             db.execute("INSERT OR REPLACE INTO chain_checkpoint VALUES(?,?,?)", (k, sq, h))
         db.commit()
     return problems
+
+
+def last_full_verify(db):
+    db.execute(CHECKPOINT_SQL)
+    r = db.execute("SELECT seq FROM chain_checkpoint WHERE k='last_full_verify'").fetchone()
+    return r[0] if r else None
+
+
+def set_last_full_verify(db, t=None):
+    db.execute(CHECKPOINT_SQL)
+    db.execute("INSERT OR REPLACE INTO chain_checkpoint VALUES('last_full_verify',?,'')", (int(t or time.time()),))
+    db.commit()
 
 
 def _secure_files(path):
@@ -306,12 +439,28 @@ def _secure_files(path):
             os.chmod(p, 0o600)
 
 
+def ensure_sig_schema(db):
+    """Create the signing side tables on vaults that predate them (additive migration; no row is rewritten).
+    If the audit chain says a key was registered but the tables are gone, that is tampering, not a fresh vault."""
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name='event_sigs'").fetchone():
+        return
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name='audit'").fetchone() and \
+            db.execute("SELECT 1 FROM audit WHERE action='key_register' LIMIT 1").fetchone():
+        raise TamperError("signing tables are missing but the audit chain records a registered user key")
+    db.executescript(SIG_TABLES_SQL)
+    for sql in SIG_TRIGGERS.values():
+        db.execute(sql)
+    db.commit()
+
+
 def create_schema(db):
     db.executescript(TABLES_SQL)
     for sql in TRIGGERS.values():
         db.execute(sql)
     db.execute("INSERT INTO schema_meta VALUES('schema_version', ?)", (SCHEMA_VERSION,))
     db.commit()
+    ensure_sig_schema(db)
+    set_last_full_verify(db)   # an empty log is trivially fully verified
 
 
 class VaultNotFound(FileNotFoundError):
@@ -334,6 +483,7 @@ def connect(path=None, verify=True, create=None):
     db.execute("PRAGMA journal_mode=DELETE"); db.execute("PRAGMA secure_delete=ON")
     db.execute("PRAGMA synchronous=FULL")   # DELETE journal: FULL is the only setting that is durable on power loss
     _secure_files(path)
+    warnings = OPEN_WARNINGS[os.path.abspath(path)] = []
     if new:
         create_schema(db)
     else:
@@ -342,16 +492,35 @@ def connect(path=None, verify=True, create=None):
         if not v or v[0] != SCHEMA_VERSION:
             db.close()
             raise TamperError(f"{path}: schema version {v[0] if v else '1'} != {SCHEMA_VERSION}; migrate with `vault migrate <old> <new>`")
+        try:
+            ensure_sig_schema(db)
+        except TamperError as e:
+            db.close()
+            raise TamperError(f"{path}: integrity check failed: {e}") from None
         if verify:
-            problems = check_triggers(db) + verify_chains_incremental(db)
+            problems = check_triggers(db) + verify_chains_incremental(db, warnings)
             if problems:
                 db.close()
                 raise TamperError(f"{path}: integrity check failed: {'; '.join(problems)}. Not auto-repaired; "
                                   "restore from a snapshot or investigate (`vault doctor`).")
+            days = float(os.environ.get("VAULT_FULL_VERIFY_DAYS", "30"))
+            lf = last_full_verify(db)
+            if lf is None or time.time() - lf > days * 86400:
+                warnings.append(f"last full verification is {'unknown' if lf is None else f'{(time.time() - lf) / 86400:.0f} days old'}"
+                                f" (> {days:g} days): run `vault doctor`")
     if not db.execute("SELECT 1 FROM sqlite_master WHERE name='proj_meta'").fetchone() or _proj_last_seq(db) != \
             db.execute("SELECT COALESCE(MAX(seq),0) FROM events").fetchone()[0]:
         rebuild(db)   # missing projections or checkpoint behind the log (e.g. crash between append and apply)
     return db
+
+
+def _after_commit(db):
+    """Write the external anchor after a commit (signing.write_anchor; skipped without a usable user key)."""
+    import signing
+    try:
+        signing.write_anchor(db)
+    except OSError as e:
+        print(f"warning: could not write the external anchor ({type(e).__name__})", file=sys.stderr)
 
 
 def _proj_last_seq(db):
@@ -474,9 +643,16 @@ def append(db, type_, subject, payload, actor, trust, key=None, target_id=None, 
            "idempotency_key": idempotency_key, "import_id": import_id, "content_hash": chash,
            "text_norm": tr_norm(f"{type_} {subject} {_flatten({k: v for k, v in stored.items() if k not in sens and k != 'provenance'})}")}
     row["prev_hash"] = prev
+    sig = None
+    if type_ in SIGNED_TYPES and actor.startswith("user:"):   # non-human actors are refused by the triggers
+        sig = signing_sign(db, row, sorted(set(parents) | set(targets)))
+        row["_sig"] = sig[1]
     row["hash"] = event_hash(prev, row)
+    row.pop("_sig", None)
     cols = list(row)
     try:
+        if sig:
+            db.execute("INSERT INTO event_sigs(event_id,key_id,alg,sig) VALUES(?,?,'ed25519',?)", (eid, *sig))
         db.execute(f"INSERT INTO events({','.join(cols)}) VALUES({','.join('?' * len(cols))})", [row[c] for c in cols])
         for p in parents:
             db.execute("INSERT INTO event_parents VALUES(?,?, 'supersedes')", (eid, p))
@@ -492,7 +668,14 @@ def append(db, type_, subject, payload, actor, trust, key=None, target_id=None, 
         db.commit()
         if _rebuild and not incremental:
             rebuild(db)   # fallback: event type/shape not safely applicable incrementally (docs/projections.md)
+        _after_commit(db)
     return eid, False
+
+
+def signing_sign(db, row, parents):
+    """New human-only events MUST be signed: raises signing.SignatureError without a registered user key."""
+    import signing
+    return signing.sign_row(db, row, parents)
 
 
 def review(db, event_id, verdict, actor=HUMAN, reason=None):
@@ -519,6 +702,7 @@ def audit(db, actor, action, outcome, reason, event_id=None):
     db.execute("INSERT INTO audit(ts,epoch,actor,action,outcome,reason,event_id,prev_hash,hash) VALUES(?,?,?,?,?,?,?,?,?)",
                [row[k] for k in ("ts", "epoch", "actor", "action", "outcome", "reason", "event_id", "prev_hash", "hash")])
     db.commit()
+    _after_commit(db)
 
 
 # ---------- projections (pure replay of the log in (hlc, id) order, deterministic) ----------
@@ -1010,6 +1194,9 @@ def main(argv=None):
     sh.add_argument("--grace-days", type=float, default=float(os.environ.get("VAULT_SHRED_GRACE_DAYS", "7")))
     for n in ("shred-cancel", "shred-finalize"):
         x = sp.add_parser(n); x.add_argument("subject")
+    ky = sp.add_parser("keys", help="user signing key (Ed25519) for human-only events")
+    ky.add_argument("action", choices=["init-user", "show"])
+    sp.add_parser("sign-legacy", help="re-attest legacy unsigned human-only events (interactive TTY required)")
     mg = sp.add_parser("migrate"); mg.add_argument("old"); mg.add_argument("new")
     sp.add_parser("review-queue", help="citation check: pending human-review items")
     rv = sp.add_parser("review-verdict", help="citation check: human verdict on a queued item")
@@ -1038,11 +1225,17 @@ def main(argv=None):
     rs.add_argument("--allow-no-keys", action="store_true",
                     help="restore WITHOUT --keys although encrypted events exist (they stay undecryptable)")
     rs.add_argument("--kek", metavar="KEK_DIR", help="KEK backup dir from `vault backup-kek`, installed next to the target")
-    sp.add_parser("verify", help="read-only: full hash-chain verify + projection hash vs a fresh rebuild (exit 2 on failure)")
+    sp.add_parser("verify", help="read-only: full hash-chain + signature + anchor verify, projection hash vs a fresh rebuild (exit 2 on failure)")
     args = ap.parse_args(argv)
     try:
-        if args.cmd in HUMAN_CMDS or (args.cmd == "shred" and args.confirm):
+        if args.cmd in HUMAN_CMDS or (args.cmd == "shred" and args.confirm) or (args.cmd == "keys" and args.action == "init-user"):
             require_human_tty(args.cmd)
+        if args.cmd == "sign-legacy":
+            require_human_tty("sign-legacy", strict=True)   # never bypassable, not even in the test harness
+        if args.cmd == "propose":
+            import signing; signing.USER_KEY_DISABLED = True   # agent path: never load the user private key
+        if args.cmd in ("keys", "sign-legacy"):
+            import signing
         if args.cmd == "migrate":
             import ops
             ops.migrate(args.old, args.new).close(); print(f"migrated -> {args.new}"); return 0
@@ -1059,6 +1252,36 @@ def main(argv=None):
                 raise FileExistsError(f"{path} already exists")
             connect(path, create=True).close(); print(f"initialized empty vault at {path}"); return 0
         db = connect()
+        for w in OPEN_WARNINGS.get(os.path.abspath(os.environ.get("VAULT_DB", "./vault.db")), []):
+            print(f"warning: {w}", file=sys.stderr)
+        if args.cmd == "keys":
+            if args.action == "init-user":
+                # order: `vault init` first (connect() above refuses a missing vault), THEN the key file is created.
+                # Read-only commands (incl. `keys show`) never create the key file or an anchor.
+                kp = signing.key_path()
+                if not os.path.exists(kp):
+                    _, kid0 = signing.generate_user_key(kp)
+                    print(f"generated user key {kid0} at {kp} (mode 0600; back it up offline)")
+                def _fp(fp):
+                    print(f"user key fingerprint (sha256 of the Ed25519 public key):\n  {fp}")
+                    if not sys.stdin.isatty():
+                        return True    # only reachable in the test harness (require_human_tty above)
+                    return input("Register this key as the vault owner's signing key? [yes/no] ").strip() == "yes"
+                kid, created = signing.register_user_key(db, confirm=_fp)
+                signing.write_anchor(db)
+                print(f"user key {kid} {'registered in this vault' if created else 'already registered'}")
+            else:
+                keys, probs = signing.registered_keys(db)
+                local = signing.try_user_key()
+                print(json.dumps({"key_file": signing.key_path(), "local_key_id": local[1] if local else None,
+                                  "registered": sorted(keys), "problems": probs}, indent=2))
+            return 0
+        if args.cmd == "sign-legacy":
+            def _confirm(items):
+                for seq, eid, typ in items:
+                    print(f"  seq {seq}  {typ:<22} {eid}")
+                return input(f"Re-attest these {len(items)} unsigned event(s) with your key? Type 'attest': ").strip() == "attest"
+            print(json.dumps({"attestations": signing.sign_legacy(db, _confirm)})); return 0
         if args.cmd == "backup":
             import backup
             if args.no_keys:
@@ -1201,7 +1424,7 @@ def main(argv=None):
         if type(e).__name__ not in ("Refused", "ValueError", "OperationalError", "IntegrityError", "DatabaseError",
                                     "JSONDecodeError", "TamperError", "SecretRefused", "HumanRequired", "KeyError",
                                     "FileExistsError", "BackupError", "Shredded", "SyncError", "SchemaError", "CryptoUnavailable", "PermissionError",
-                                    "VaultNotFound", "KeystoreMissing"):
+                                    "VaultNotFound", "KeystoreMissing", "SignatureError"):
             raise
         print(f"error: {e}", file=sys.stderr); return 1
     return 0

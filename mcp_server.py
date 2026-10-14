@@ -173,6 +173,8 @@ def handle(msg):
 
 
 def main():
+    import signing
+    signing.USER_KEY_DISABLED = True   # agent-facing process: never load the user's private signing key
     log(f"started; db={agent_api._db_path()} token={'present' if TOKEN else 'absent'}")
     for line in sys.stdin:
         line = line.strip()

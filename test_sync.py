@@ -118,7 +118,8 @@ class SyncTest(unittest.TestCase):
         vault.append(C, "preference.set", U, {"key": "dil", "value": "Klingonca"}, U, "verified")
         vault.append(C, "event.approved", "event:x", {}, U, "verified")
         r = sync.import_package(self.B, self.pkg(C, "c.vaultsync"))
-        self.assertEqual((r["new"], r["quarantined"], len(r["skipped"])), (1, 1, 1))
+        # skipped: the approval AND C's key.registered (signed human-only types from an unpaired device)
+        self.assertEqual((r["new"], r["quarantined"], len(r["skipped"])), (1, 1, 2))
         e = self.B.execute("SELECT e.actor, e.trust, s.status FROM events e JOIN proj_status s ON s.event_id=e.id").fetchone()
         self.assertTrue(e[0].startswith("import:sync-")); self.assertEqual((e[1], e[2]), ("unverified", "proposed"))
         self.assertEqual(self.pref(self.B), [])   # not in the active projection until approved

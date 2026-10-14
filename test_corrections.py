@@ -86,6 +86,8 @@ class CorrectionTest(unittest.TestCase):
                                           "payload": {"field": "value", "new_value": 1}, "idempotency_key": "c3"})
 
     def test_cli_correct_follows_chain_tip_and_revert(self):
+        import signing
+        signing.register_user_key(self.db)   # as `vault keys init-user`
         env = {**os.environ}
         run = lambda *a: subprocess.run([sys.executable, os.path.join(HERE, "vault.py"), *a], capture_output=True, text=True, env=env)
         r = run("correct", self.base, "--field", "value", "--value", "A", "--reason", "x"); self.assertEqual(r.returncode, 0, r.stderr)

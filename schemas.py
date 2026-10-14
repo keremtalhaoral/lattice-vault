@@ -63,6 +63,15 @@ SCHEMAS = {
     "import.batch_approved": Spec(1, {"import_id": F(STR, True, 200), "confirmed_block_ids": F(LIST, True)}, extra="forbid"),
     "event.redacted": Spec(1, {"redaction_id": F(STR, True, 200), "reason": _TEXT}, extra="forbid"),
     "subject.shredded": Spec(1, {"key_id": F(STR, True, 200)}, extra="forbid"),
+    # signing (signing.py, docs/adr/0011): human-only, signed with a user Ed25519 key
+    "key.registered": Spec(1, {"key_id": F(STR, True, 200), "alg": F(STR, True, 20), "pubkey_b64": F(STR, True, 200),
+                               "role": F(STR, True, 20), "device_id": F(STR + NONE, max_len=200),
+                               "certified_by": F(STR, True, 200)}, extra="forbid"),
+    "key.rotated": Spec(1, {"old_key_id": F(STR, True, 200), "new_key_id": F(STR, True, 200),
+                            "new_key_sig": F(STR, True, 200)}, extra="forbid"),
+    "key.revoked": Spec(1, {"key_id": F(STR, True, 200), "effective_hlc": F(STR, True, 200), "reason": _TEXT,
+                            "compromised": F(BOOL, True)}, extra="forbid"),
+    "attestation.recorded": Spec(1, {"target_event_ids": F(LIST, True), "statement": F(STR, True, 2000)}, extra="forbid"),
     "conflict.resolved": Spec(1, {"reason": _TEXT, "chosen": F(STR + NONE, max_len=200)}),
 }
 

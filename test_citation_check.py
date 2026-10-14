@@ -1,4 +1,4 @@
-import os as _os; _os.environ.setdefault("VAULT_ALLOW_NONTTY", "1")  # test-only TTY bypass
+import testutil  # noqa: F401  test harness: harness key, config dir, TTY bypass (SECURITY.md)
 import json, os, tempfile, unittest
 import vault, citation_check as cc
 

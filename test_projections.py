@@ -101,12 +101,16 @@ class IncrementalEquivalenceTest(unittest.TestCase):
         rows = [dict(r) for r in self.db.execute("SELECT * FROM events ORDER BY seq")]
         par = self.db.execute("SELECT * FROM event_parents").fetchall()
         tgt = self.db.execute("SELECT * FROM event_targets").fetchall()
+        sigs = self.db.execute("SELECT event_id, key_id, alg, sig FROM event_sigs").fetchall()
+        sigmap = {x[0]: x[3] for x in sigs}
         for trial in range(3):
             order = rows[:]; random.Random(trial).shuffle(order)
             b = vault.connect(os.path.join(self.d, f"b{trial}.db"))
+            b.executemany("INSERT INTO event_sigs VALUES(?,?,?,?)", [tuple(x) for x in sigs])   # signatures travel with rows
             prev = vault.GENESIS
             for r in order:   # arrival order differs from HLC order (e.g. sync); hash chain follows arrival
-                r = dict(r); r.pop("seq"); r["prev_hash"] = prev; r["hash"] = prev = vault.event_hash(prev, r)
+                r = dict(r); r.pop("seq"); r["prev_hash"] = prev; r["_sig"] = sigmap.get(r["id"])
+                r["hash"] = prev = vault.event_hash(prev, r); r.pop("_sig")
                 b.execute(f"INSERT INTO events({','.join(r)}) VALUES({','.join('?' * len(r))})", list(r.values()))
                 for p in par:
                     if p["event_id"] == r["id"]:
@@ -160,6 +164,7 @@ class RebuildAndCheckpointTest(unittest.TestCase):
         r.execute(vault.TRIGGERS["events_no_update"]); r.commit(); r.close()
 
     def test_tamper_old_event_detected_by_doctor_full(self):
+        os.environ["VAULT_VERIFY_SAMPLE_K"] = "0"; self.addCleanup(os.environ.pop, "VAULT_VERIFY_SAMPLE_K")  # no sampling
         self.db.close(); vault.connect(self.dbp).close()      # checkpoint at seq 10
         self._tamper(2)
         db = vault.connect(self.dbp)                          # below checkpoint: open-time check does not cover it
@@ -178,6 +183,7 @@ class RebuildAndCheckpointTest(unittest.TestCase):
             vault.connect(self.dbp)
 
     def test_tampered_checkpoint_row_detected(self):
+        os.environ["VAULT_VERIFY_SAMPLE_K"] = "0"; self.addCleanup(os.environ.pop, "VAULT_VERIFY_SAMPLE_K")
         self.db.close(); vault.connect(self.dbp).close()
         self._tamper(10)
         with self.assertRaisesRegex(vault.TamperError, "checkpoint mismatch"):

@@ -2,7 +2,8 @@
 
 Quarantined events are kept with their full origin row and stay retryable: `vault sync-quarantine --release`
 re-verifies them against the current key registry/pairings (release_quarantined), independent of peer watermarks.
-Not for real data: packages are unsigned, there is no key sync, and redaction/shredding does not propagate.
+Not for real data: packages are unsigned and redaction does not propagate. DEKs move in separate signed
+vaultkeys/0.1 bundles (key_transport.py, ADR 0013); an applied subject.shredded schedules the local DEK for destroy.
 Human-only events are applied only with a valid user signature (signing.py, #10) from a key registered on this vault and
 a paired origin device; all other user:*/human-only events are quarantined (sync_quarantine), never applied.
 Integration with main: incoming plaintext payloads are upcast (schemas.upcast) and validated against the current
@@ -45,7 +46,7 @@ class SyncError(ValueError):
 
 
 UNSUPPORTED_WARNING = ("WARNING: multi-device sync is an unsigned, file-based prototype. Do not use it with real data: no package signing, "
-                       "no key sync, no redaction/shred propagation. Unsigned user:*/approval events are quarantined, not applied.")
+                       "key transport only via signed vaultkeys bundles (ADR 0013), no redaction propagation. Unsigned user:*/approval events are quarantined, not applied.")
 
 
 def _schema_problem(e):
@@ -185,6 +186,8 @@ def release_quarantined(db, event_ids=None, dry_run=False, actor=vault.HUMAN):
     except Exception:
         db.rollback(); raise
     vault.rebuild(db)
+    import key_transport
+    key_transport.apply_remote_shreds(db)   # released subject.shredded -> local pending_destroy (ADR 0013)
     vault.audit(db, actor, "sync_release", "accepted",
                 f"released {len(ids)} re-verified event(s) from quarantine (first {ids[0]}), attestation {att}", att)
     rep["attestation"] = att
@@ -400,6 +403,10 @@ def import_package(db, path, dry_run=False, now_ms=None, _trust_unsigned=False):
     except Exception:
         db.rollback(); raise
     vault.rebuild(db)
+    import key_transport
+    scheduled = key_transport.apply_remote_shreds(db)   # applied subject.shredded -> local pending_destroy (ADR 0013)
+    if scheduled:
+        rep["pending_destroy_keys"] = scheduled
     vault.audit(db, vault.HUMAN, "sync_import", "accepted" if plan else "duplicate",
                 f"{len(plan)} new, {rep['duplicate']} dup, {rep['quarantined']} quarantined from {m['source_device']}")
     return rep

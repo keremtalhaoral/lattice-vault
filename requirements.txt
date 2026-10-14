@@ -1,2 +1,2 @@
 # Core is Python stdlib only (3.11+). Optional: field encryption / crypto-shredding.
-cryptography>=42
+cryptography>=49

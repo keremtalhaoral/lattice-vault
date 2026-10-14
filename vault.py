@@ -511,6 +511,14 @@ def connect(path=None, verify=True, create=None):
     if not db.execute("SELECT 1 FROM sqlite_master WHERE name='proj_meta'").fetchone() or _proj_last_seq(db) != \
             db.execute("SELECT COALESCE(MAX(seq),0) FROM events").fetchone()[0]:
         rebuild(db)   # missing projections or checkpoint behind the log (e.g. crash between append and apply)
+    if not new and db.execute("SELECT 1 FROM sqlite_master WHERE name='sync_imported'").fetchone() and db.execute(
+            "SELECT 1 FROM events WHERE type='subject.shredded' LIMIT 1").fetchone():
+        import key_transport   # synced shreds: DEK at least pending_destroy, destroyed after grace (ADR 0013)
+        try:
+            key_transport.reconcile_shreds(db)
+        except Exception as x:   # reads stay refused (shred_applies); doctor reports the unreconciled key
+            warnings.append(f"synced shred not reconciled ({type(x).__name__}); run `vault doctor`")
+            print(f"warning: synced shred not reconciled ({type(x).__name__}); run `vault doctor`", file=sys.stderr)
     return db
 
 
@@ -728,6 +736,8 @@ def payload_state(db, e):
         return None, "redacted"
     if e["enc_key_id"]:
         import crypto_keys
+        if shred_applies(db, e["enc_key_id"], e["subject"]):   # shredded means unreadable, even while a DEK copy is
+            return None, "redacted"                            # still pending destroy (synced shred, ADR 0013)
         try:
             p.update(keystore(db).open(e["enc_key_id"], e["id"], e["payload_ct"]))
         except crypto_keys.Shredded:
@@ -737,6 +747,23 @@ def payload_state(db, e):
                 return None, "redacted"
             return None, "undecryptable"
     return read_upcast(e, p), None
+
+
+def shred_applies(db, key_id, subject):
+    """True if an applied subject.shredded for this key AND subject is in the log, except one that came from a device
+    revoked for key transport (ADR 0013). Fail-safe for reads: no signature work here (reconcile re-checks it)."""
+    ids = [r[0] for r in db.execute("SELECT id FROM events WHERE type='subject.shredded' AND subject=? AND "
+                                    "json_extract(payload,'$.key_id')=?", (subject, key_id))]
+    if not ids:
+        return False
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE name='sync_imported'").fetchone() or \
+            not db.execute("SELECT 1 FROM sqlite_master WHERE name='sync_ka_revoked'").fetchone():
+        return True
+    for i in ids:
+        r = db.execute("SELECT origin_device FROM sync_imported WHERE event_id=?", (i,)).fetchone()
+        if r is None or not db.execute("SELECT 1 FROM sync_ka_revoked WHERE device_id=?", (r[0],)).fetchone():
+            return True
+    return False
 
 
 def _shredded_in_log(db, key_id):
@@ -1216,6 +1243,12 @@ def main(argv=None):
     sq.add_argument("--dry-run", action="store_true")
     sq.add_argument("--all", action="store_true", help="list: include released events (signed attestation id, time)")
     sp.add_parser("device-id", help="show (create on first use) this vault's stable device id")
+    sk = sp.add_parser("sync-keys", help="sync key transport PROTOTYPE (ADR 0013): device key-agreement keys and signed DEK bundles")
+    sk.add_argument("action", choices=["init", "cert", "add-peer", "revoke-peer", "export", "import", "quarantine"])
+    sk.add_argument("arg", nargs="?", help="add-peer/import: FILE; revoke-peer: DEVICE")
+    sk.add_argument("--out", help="cert/export: output file"); sk.add_argument("--to", help="export: recipient DEVICE")
+    sk.add_argument("--subject", action="append", help="export: only keys of these subjects")
+    sk.add_argument("--reason", help="revoke-peer: reason")
     spr = sp.add_parser("sync-pair", help="register another device of the owner (human-only)")
     spr.add_argument("device"); spr.add_argument("--name", required=True)
     bk = sp.add_parser("backup", help="consistent online copy of vault.db (never keys.db) with manifest.json")
@@ -1236,7 +1269,8 @@ def main(argv=None):
     sp.add_parser("verify", help="read-only: full hash-chain + signature + anchor verify, projection hash vs a fresh rebuild (exit 2 on failure)")
     args = ap.parse_args(argv)
     try:
-        if args.cmd in HUMAN_CMDS or (args.cmd == "shred" and args.confirm) or (args.cmd == "keys" and args.action != "show"):
+        if args.cmd in HUMAN_CMDS or (args.cmd == "shred" and args.confirm) or (args.cmd == "keys" and args.action != "show") \
+                or (args.cmd == "sync-keys" and args.action != "quarantine"):
             require_human_tty(args.cmd)
         if args.cmd == "sign-legacy":
             require_human_tty("sign-legacy", strict=True)   # never bypassable, not even in the test harness
@@ -1469,6 +1503,37 @@ def main(argv=None):
                 print(json.dumps(sync.export(db, args.out, args.since_peer), ensure_ascii=False))
             else:
                 print(json.dumps(sync.import_package(db, args.file, dry_run=args.dry_run), ensure_ascii=False))
+        elif args.cmd == "sync-keys":
+            import key_transport as kt
+            a = args.action
+            if a in ("add-peer", "import", "revoke-peer") and not args.arg:
+                raise ValueError(f"sync-keys {a} needs an argument")
+            if a == "init":
+                print(json.dumps({"device_id": __import__("sync").device_id(db),
+                                  "ka_fingerprint": kt.ka_fp(kt.init_device_key(db))}))
+            elif a == "cert":
+                if not args.out:
+                    raise ValueError("sync-keys cert needs --out FILE")
+                c = kt.make_cert(db)
+                with open(args.out, "x", encoding="utf-8") as f:
+                    f.write(canon(c) + "\n")
+                print(json.dumps({"device_id": c["cert"]["device_id"], "ka_fingerprint": kt.ka_fp(kt.signing.unb64(c["cert"]["ka_pub_b64"])),
+                                  "out": args.out}))
+            elif a == "add-peer":
+                dev, fp = kt.add_peer(db, json.load(open(args.arg, encoding="utf-8")))
+                print(json.dumps({"device_id": dev, "ka_fingerprint": fp}))
+            elif a == "revoke-peer":
+                if not args.reason:
+                    raise ValueError("sync-keys revoke-peer needs --reason")
+                kt.revoke_peer(db, args.arg, args.reason); print(f"revoked {args.arg} for key transport")
+            elif a == "export":
+                if not (args.out and args.to):
+                    raise ValueError("sync-keys export needs --to DEVICE --out FILE")
+                print(json.dumps(kt.export_keys(db, args.to, args.out, args.subject), ensure_ascii=False))
+            elif a == "import":
+                print(json.dumps(kt.import_keys(db, args.arg), ensure_ascii=False))
+            else:
+                print(json.dumps(kt.quarantined(db), ensure_ascii=False))
         elif args.cmd in ("review-queue", "review-verdict", "review-enqueue"):
             import citation_check as cc
             if args.cmd == "review-enqueue":
@@ -1482,7 +1547,7 @@ def main(argv=None):
         if type(e).__name__ not in ("Refused", "ValueError", "OperationalError", "IntegrityError", "DatabaseError",
                                     "JSONDecodeError", "TamperError", "SecretRefused", "HumanRequired", "KeyError",
                                     "FileExistsError", "BackupError", "Shredded", "SyncError", "SchemaError", "CryptoUnavailable", "PermissionError",
-                                    "VaultNotFound", "KeystoreMissing", "SignatureError"):
+                                    "VaultNotFound", "KeystoreMissing", "SignatureError", "KeyTransportError"):
             raise
         print(f"error: {e}", file=sys.stderr); return 1
     return 0

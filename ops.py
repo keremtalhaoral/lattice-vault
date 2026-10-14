@@ -195,7 +195,11 @@ def shred_confirm(db, subject, grace_days, by=vault.HUMAN):
 
 
 def shred_cancel(db, subject, by=vault.HUMAN):
+    i = vault.keystore(db).info(subject)
+    if i and vault.shred_applies(db, i["key_id"], subject):
+        raise ValueError("a subject.shredded for this key is already in the log (synced shred); it cannot be cancelled")
     vault.keystore(db).cancel(subject)
+    vault.rebuild(db)   # readability may change (L4): keep projections equal to a fresh rebuild
     vault.audit(db, by, "shred_cancel", "accepted", "pending destroy cancelled")
 
 
@@ -342,6 +346,14 @@ def doctor(db, decrypt_all=False):
                         f"VAULT_PASSPHRASE?): encrypted fields are undecryptable")
     if dec["bad_events"]:
         problems.append(f"{len(dec['bad_events'])} encrypted event(s) fail to decrypt")
+    import key_transport
+    sp2 = key_transport.shred_problems(db)
+    checks["synced_shreds_unreconciled"] = len(sp2); problems += sp2
+    if sp2:
+        try:
+            key_transport.reconcile_shreds(db); checks["synced_shreds_reconciled_now"] = True
+        except Exception as e:
+            problems.append(f"synced shred reconcile failed: {type(e).__name__}")
     readable = 0
     for k in keys:
         if not k["has_dek"]:

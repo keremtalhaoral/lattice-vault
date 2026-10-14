@@ -28,6 +28,8 @@ agents.json.tmp
 agents.toml
 demo-agents.json
 *.vaultsync
+*.vaultkeys
+*.cert
 .env
 .env.*
 # MCP client configs (may contain tokens/paths)

@@ -3,6 +3,15 @@ All notable changes to this project are documented here. Format: [Keep a Changel
 
 ## [Unreleased]
 ### Security
+- Sync key transport prototype (docs/adr/0013-sync-key-transport.md): `vault sync-keys init|cert|add-peer|revoke-peer|
+  export|import|quarantine`. Per-device X25519 key-agreement keys (KEK-wrapped in keys.db) certified by the user
+  Ed25519 key; DEKs wrapped per recipient (X25519 + HKDF-SHA256 + AES-256-GCM, AAD binds version, bundle, key,
+  subject, event ids, both devices, recipient key, signer) in a user-signed `vaultkeys/0.1` bundle and re-wrapped
+  under the recipient's KEK. The KEK is never transported. Unpaired/revoked devices get nothing; failures are
+  recorded in `sync_key_quarantine`. Shredded keys are never sent; an applied `subject.shredded` from another
+  device makes its data unreadable at once and destroys the receiver's key after the local grace period, reconciled
+  on vault open and in doctor (ignored from a revoked device; key must belong to the subject);
+  `revoke-peer` is not a substitute for user-key rotation. `vaultsync/0.1` packages are unchanged.
 - Sync: `vault sync-quarantine --release [ID ...] [--dry-run]` re-verifies held events against the current key
   registry/pairings and applies only those that pass (recorded in `sync_released`; quarantine rows unchanged).
   Sync-imported human-only events re-verify their origin signature in doctor/verify (`remote-signed`), bound to the

@@ -25,7 +25,7 @@ class BackupRestoreTest(unittest.TestCase):
         self.to = os.path.join(self.d, "restored", "vault.db")
 
     def test_round_trip_projections_and_chain_head(self):
-        m = backup.backup(self.db, self.bk, include_keys=False)["manifest"]
+        m = backup.backup(self.db, self.bk)["manifest"]
         self.assertEqual(m["event_count"], 2); self.assertEqual(m["chain_head"], head(self.db))
         self.assertEqual(stat.S_IMODE(os.stat(self.bk).st_mode), 0o700)
         for f in os.listdir(self.bk):
@@ -39,13 +39,13 @@ class BackupRestoreTest(unittest.TestCase):
         self.assertEqual(status(nd, self.e1), "active")
 
     def test_tampered_backup_rejected(self):
-        backup.backup(self.db, self.bk, include_keys=False)
+        backup.backup(self.db, self.bk)
         c = sqlite3.connect(os.path.join(self.bk, "vault.db")); c.execute("PRAGMA user_version=7"); c.commit(); c.close()
         with self.assertRaisesRegex(backup.BackupError, "sha256"):
             backup.restore(self.bk, self.to)
         self.assertFalse(os.path.exists(self.to))
         # attacker also rewrites the manifest: chain/trigger verification still rejects an altered event
-        bk2 = os.path.join(self.d, "bk2"); backup.backup(self.db, bk2, include_keys=False)
+        bk2 = os.path.join(self.d, "bk2"); backup.backup(self.db, bk2)
         c = sqlite3.connect(os.path.join(bk2, "vault.db"))
         for (n,) in c.execute("SELECT name FROM sqlite_master WHERE type='trigger'").fetchall():
             c.execute(f"DROP TRIGGER {n}")
@@ -56,7 +56,7 @@ class BackupRestoreTest(unittest.TestCase):
         self.assertFalse(os.path.exists(self.to))
 
     def test_refuses_overwrite_without_force(self):
-        backup.backup(self.db, self.bk, include_keys=False)
+        backup.backup(self.db, self.bk)
         backup.restore(self.bk, self.to)
         with self.assertRaises(FileExistsError):
             backup.restore(self.bk, self.to)
@@ -107,39 +107,67 @@ class EncryptedBackupTest(unittest.TestCase):
         nd = vault.connect(path or self.to); self.addCleanup(nd.close)
         return nd, (lambda eid: vault.decrypt_payload(nd, nd.execute("SELECT * FROM events WHERE id=?", (eid,)).fetchone()))
 
-    def test_keys_included_readable_and_wrapped(self):
-        rep = backup.backup(self.db, self.bk)
-        self.assertIn("keys.db", rep["manifest"]["files"]); self.assertIn("shredded AFTER", rep["warning"])
-        self.assertFalse(any("kek" in f for f in os.listdir(self.bk)))
+    def full(self, name):
+        bk, kd = os.path.join(self.d, name), os.path.join(self.d, name + "-keys")
+        backup.backup(self.db, bk); backup.backup_keys(self.db, kd)
+        return bk, kd
+
+    def test_default_backup_has_no_keys(self):
+        m = backup.backup(self.db, self.bk)["manifest"]
+        self.assertFalse(m["includes_keys"]); self.assertEqual(set(m["files"]), {"vault.db"})
+        self.assertEqual(sorted(os.listdir(self.bk)), ["manifest.json", "vault.db"])
+        with self.assertRaises(backup.BackupError):
+            backup.backup(self.db, os.path.join(self.d, "x"), include_keys=True)
+
+    def test_backup_keys_separate_and_wrapped(self):
+        bk, kd = self.full("b")
+        rep = backup.backup_keys(self.db, os.path.join(self.d, "k2"))
+        self.assertIn("shredded AFTER", rep["warning"]); self.assertEqual(len(rep["manifest"]["keys"]), 2)
+        self.assertEqual(sorted(os.listdir(kd)), ["keys.db", "manifest.json"])
+        self.assertEqual(stat.S_IMODE(os.stat(kd).st_mode), 0o700)
         dek = vault.keystore(self.db).dek_for("user:owner")[1]
-        self.assertNotIn(dek, open(os.path.join(self.bk, "keys.db"), "rb").read())     # wrapped only
-        self.assertNotIn(SECRET.encode(), open(os.path.join(self.bk, "vault.db"), "rb").read())
-        backup.restore(self.bk, self.to)
+        self.assertNotIn(dek, open(os.path.join(kd, "keys.db"), "rb").read())     # wrapped only
+        self.assertNotIn(SECRET.encode(), open(os.path.join(bk, "vault.db"), "rb").read())
+        backup.restore(bk, self.to, keys_dir=kd)
         nd, dec = self._open()
         self.assertEqual(dec(self.e)["secret"], SECRET)
 
-    def test_no_keys_backup_unreadable(self):
-        backup.backup(self.db, self.bk, include_keys=False)
+    def test_backup_keys_overlap_refused(self):
+        backup.backup(self.db, self.bk)
+        for target in (self.bk, os.path.join(self.bk, "keys"), self.d):          # same, inside, contains
+            with self.subTest(target=target):
+                with self.assertRaisesRegex(backup.BackupError, "overlaps"):
+                    backup.backup_keys(self.db, target)
+        kd = os.path.join(self.d, "kk"); backup.backup_keys(self.db, kd)
+        with self.assertRaisesRegex(backup.BackupError, "overlaps"):
+            backup.backup(self.db, os.path.join(kd, "v"))
+        with self.assertRaisesRegex(backup.BackupError, "not a keys backup"):
+            backup.restore(self.bk, self.to, keys_dir=self.bk)
+
+    def test_no_keys_restore_unreadable(self):
+        backup.backup(self.db, self.bk)
         self.assertTrue(backup.restore(self.bk, self.to)["warnings"])
         nd, dec = self._open()
         self.assertIsNone(dec(self.e))
 
     def test_missing_keys_rejected_unless_allowed(self):
-        backup.backup(self.db, self.bk)
-        c = sqlite3.connect(os.path.join(self.bk, "keys.db")); c.execute("DELETE FROM subject_keys WHERE subject='kisi:b'")
-        c.commit(); c.close(); rehash(self.bk, "keys.db")
+        bk, kd = self.full("b")
+        c = sqlite3.connect(os.path.join(kd, "keys.db")); c.execute("DELETE FROM subject_keys WHERE subject='kisi:b'")
+        c.commit(); c.close(); rehash(kd, "keys.db")
+        mp = os.path.join(kd, "manifest.json"); man = json.load(open(mp))
+        man["keys"] = [k for k in man["keys"] if k["key_id"] != vault.keystore(self.db).info("kisi:b")["key_id"]]
+        json.dump(man, open(mp, "w"))
         with self.assertRaisesRegex(backup.BackupError, "missing"):
-            backup.restore(self.bk, self.to)
+            backup.restore(bk, self.to, keys_dir=kd)
         self.assertFalse(os.path.exists(self.to))
-        rep = backup.restore(self.bk, self.to, allow_missing_keys=True)
+        rep = backup.restore(bk, self.to, allow_missing_keys=True, keys_dir=kd)
         self.assertEqual(len(rep["missing_keys"]), 1); self.assertTrue(rep["warnings"])
 
     def test_restore_reapplies_shred_in_log(self):
-        backup.backup(self.db, self.bk)                     # keys.db from before the shred ...
+        _, old_keys = self.full("b")                         # keys.db from before the shred ...
         ops.shred_confirm(self.db, "user:owner", 0); ops.shred_finalize(self.db, "user:owner")
         bk2 = os.path.join(self.d, "bk2"); backup.backup(self.db, bk2)
-        shutil.copyfile(os.path.join(self.bk, "keys.db"), os.path.join(bk2, "keys.db")); rehash(bk2, "keys.db")
-        rep = backup.restore(bk2, self.to)                  # ... paired with a log that records the shred
+        rep = backup.restore(bk2, self.to, keys_dir=old_keys)   # ... paired with a log that records the shred
         self.assertEqual(rep["shreds_reapplied"], 1)
         nd, dec = self._open()
         self.assertIsNone(dec(self.e)); self.assertEqual(status(nd, self.e), "redacted")
@@ -147,25 +175,42 @@ class EncryptedBackupTest(unittest.TestCase):
         self.assertTrue(ops.doctor(nd)["ok"])
 
     def test_drill_backup_shred_restore(self):
-        old = os.path.join(self.d, "bk-old"); backup.backup(self.db, old)
+        old, old_keys = self.full("old")
         ops.shred_confirm(self.db, "user:owner", 0); ops.shred_finalize(self.db, "user:owner")
         live_ph = vault.projection_hash(self.db)
-        new = os.path.join(self.d, "bk-new"); backup.backup(self.db, new)
-        self.assertEqual(backup.restore(new, self.to)["projection_hash"], live_ph)
+        new, new_keys = self.full("new")
+        self.assertEqual(backup.restore(new, self.to, keys_dir=new_keys)["projection_hash"], live_ph)
         nd, dec = self._open()
         d = ops.doctor(nd); self.assertTrue(d["ok"], d)
         self.assertEqual(vault.projection_hash(nd), live_ph)
         self.assertIsNone(dec(self.e)); self.assertEqual(status(nd, self.e), "redacted")
         self.assertEqual(dec(self.e2)["secret"], "ikinci-gizli")
-        # documented limitation: the pre-shred backup (log + keys) still decrypts the shredded subject
-        od, odec = self._open(os.path.join(self.d, "r-old", "vault.db")) if backup.restore(old, os.path.join(self.d, "r-old", "vault.db")) else None
+        # documented limitation: the pre-shred vault + keys backups still decrypt the shredded subject
+        op = os.path.join(self.d, "r-old", "vault.db"); backup.restore(old, op, keys_dir=old_keys)
+        od, odec = self._open(op)
         self.assertEqual(odec(self.e)["secret"], SECRET)
 
+    def test_cli_backup_keys_and_restore(self):
+        env = dict(os.environ)
+        run = lambda *a: subprocess.run([sys.executable, os.path.join(HERE, "vault.py"), *a], capture_output=True,
+                                        text=True, env=env, timeout=120)
+        self.db.close()
+        kd = os.path.join(self.d, "kd")
+        r = run("backup", "--out", self.bk, "--no-keys"); self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("deprecated", r.stderr); self.assertFalse(json.loads(r.stdout)["includes_keys"])
+        r = run("backup-keys", "--out", self.bk); self.assertEqual(r.returncode, 1); self.assertIn("overlaps", r.stderr)
+        r = run("backup-keys", "--out", kd); self.assertEqual(r.returncode, 0, r.stderr); self.assertIn("WARNING", r.stderr)
+        r = run("restore", self.bk, "--to", self.to, "--keys", kd); self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(json.loads(r.stdout)["keys_restored"])
+        self.db = vault.connect(self.dbp)
+        nd, dec = self._open()
+        self.assertEqual(dec(self.e)["secret"], SECRET)
+
     def test_refuses_keys_restore_without_kek(self):
-        backup.backup(self.db, self.bk)
+        bk, kd = self.full("b")
         os.environ.pop("VAULT_KEK_FILE")
         with self.assertRaisesRegex(backup.BackupError, "KEK"):
-            backup.restore(self.bk, self.to)
+            backup.restore(bk, self.to, keys_dir=kd)
         self.assertFalse(os.path.exists(self.to))
 
 

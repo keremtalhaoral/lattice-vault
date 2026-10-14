@@ -733,7 +733,7 @@ def pack(db, profile="full", max_chars=None, include_unverified=False):
 
 # ---------- CLI ----------
 HUMAN_CMDS = {"add", "approve", "reject", "correct", "revert", "import-approve", "revert-import", "redact",
-              "shred-cancel", "shred-finalize", "agent-add", "agent-revoke", "review-verdict", "migrate", "sync-pair", "backup", "restore"}
+              "shred-cancel", "shred-finalize", "agent-add", "agent-revoke", "review-verdict", "migrate", "sync-pair", "backup", "backup-keys", "restore"}
 
 
 def _tip(db, event_id):
@@ -803,11 +803,14 @@ def main(argv=None):
     sp.add_parser("device-id", help="show (create on first use) this vault's stable device id")
     spr = sp.add_parser("sync-pair", help="register another device of the owner (human-only)")
     spr.add_argument("device"); spr.add_argument("--name", required=True)
-    bk = sp.add_parser("backup", help="consistent online copy of vault.db + keys.db (wrapped) with manifest.json")
+    bk = sp.add_parser("backup", help="consistent online copy of vault.db (never keys.db) with manifest.json")
     bk.add_argument("--out", required=True); bk.add_argument("--no-keys", action="store_true",
-                                                             help="omit keys.db (keeps crypto-shredding effective)")
+                                                             help="deprecated no-op: backups never include keys.db")
+    bkk = sp.add_parser("backup-keys", help="separate backup of keys.db (KEK-wrapped); store apart from vault backups")
+    bkk.add_argument("--out", required=True)
     rs = sp.add_parser("restore", help="verify a backup and restore it to a new path")
     rs.add_argument("backup_dir"); rs.add_argument("--to", required=True); rs.add_argument("--force", action="store_true")
+    rs.add_argument("--keys", metavar="KEYS_DIR", help="keys backup dir from `vault backup-keys`")
     rs.add_argument("--allow-missing-keys", action="store_true", help="restore even if keys.db lacks keys the log references")
     args = ap.parse_args(argv)
     try:
@@ -821,13 +824,18 @@ def main(argv=None):
             sys.stdout.write(event_detail.show(args.event_id, args.json, args.tree)); return 0
         if args.cmd == "restore":   # does not open the live vault
             import backup
-            print(json.dumps(backup.restore(args.backup_dir, args.to, args.force, args.allow_missing_keys), ensure_ascii=False, indent=2)); return 0
+            print(json.dumps(backup.restore(args.backup_dir, args.to, args.force, args.allow_missing_keys, args.keys), ensure_ascii=False, indent=2)); return 0
         db = connect()
         if args.cmd == "backup":
             import backup
-            rep = backup.backup(db, args.out, include_keys=not args.no_keys)
-            if rep["warning"]:
-                print("WARNING: " + rep["warning"], file=sys.stderr)
+            if args.no_keys:
+                print("note: --no-keys is deprecated and a no-op; backups never include keys.db", file=sys.stderr)
+            rep = backup.backup(db, args.out)
+            print(json.dumps(rep["manifest"], ensure_ascii=False, indent=2)); return 0
+        if args.cmd == "backup-keys":
+            import backup
+            rep = backup.backup_keys(db, args.out)
+            print("WARNING: " + rep["warning"], file=sys.stderr)
             print(json.dumps(rep["manifest"], ensure_ascii=False, indent=2)); return 0
         if args.cmd == "add":
             payload = json.loads(args.payload) if args.payload else {"text": args.text}

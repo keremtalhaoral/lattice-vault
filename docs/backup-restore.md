@@ -1,42 +1,44 @@
 # Backup and restore
 
 ```sh
-./vault backup --out ~/vault-backups/2026-10-14          # vault.db + keys.db (wrapped) + manifest.json
-./vault backup --out DIR --no-keys                       # log only; keeps crypto-shredding effective
-./vault restore DIR --to /path/new/vault.db [--force] [--allow-missing-keys]
-./vault doctor                                           # now includes PRAGMA integrity_check / quick_check
+./vault backup --out ~/vault-backups/2026-10-14          # vault.db + manifest.json only (never keys.db)
+./vault backup-keys --out /other/media/keys-2026-10-14   # keys.db (KEK-wrapped) + its own manifest, stored apart
+./vault restore DIR --to /path/new/vault.db [--keys KEYS_DIR] [--force] [--allow-missing-keys]
+./vault doctor                                           # includes PRAGMA integrity_check / quick_check
 ```
 
-Both commands are human-only (TTY gate, like `redact`/`migrate`).
+All three write commands are human-only (TTY gate, like `redact`/`migrate`). `--no-keys` on `backup` is
+accepted as a deprecated no-op.
 
-## Backup
-- Uses the sqlite3 online backup API (page-consistent while the vault is open; `busy_timeout` 5 s).
-  vault.db and keys.db are copied one after the other, so a key created between the two copies may be in
-  keys.db but not vault.db (harmless) — never the reverse in normal use, since keys are created before events.
-- Output dir is created 0700 and must be empty; every file is 0600.
-- `manifest.json` (`lattice-backup/v1`): sha256 of each file, event count, event + audit chain heads,
-  schema version, `created_at` (UTC), tool version, `includes_keys`.
-- keys.db stays KEK-wrapped. **The KEK (`keys.kek` / `VAULT_PASSPHRASE` salt) is never in a backup**;
-  keep it separately (password manager / OS keychain). Without it the encrypted fields of a backup are unreadable.
+## Vault backup (`vault backup`)
+- sqlite3 online backup API (page-consistent while the vault is open; `busy_timeout` 5 s). **Never includes
+  keys.db**, so vault backups can be kept long-term / off-site without defeating crypto-shredding.
+- Output dir 0700, must be empty, files 0600; refused if it equals, is inside, or contains a keys backup.
+- `manifest.json` (`lattice-backup/v1`): sha256 of vault.db, event count, event + audit chain heads, schema
+  version, `created_at` (UTC), tool version, `includes_keys: false`.
 
-> **Warning — crypto-shredding.** A backup that contains keys.db can decrypt every subject that was not yet
-> shredded at backup time. Shredding a subject later does not reach existing backups. After a shred, delete
-> (or re-take) older backups that include keys, or use `--no-keys` for long-lived/off-site copies.
+## Keys backup (`vault backup-keys`)
+- Copies only keys.db (still KEK-wrapped) + `manifest.json` (`lattice-keys-backup/v1`: sha256, key ids with
+  state). Refused if the target equals, is inside, or contains a vault backup dir (detected via manifest).
+- **The KEK (`keys.kek` / `VAULT_PASSPHRASE` salt) is never backed up**; keep it separately.
+
+> **Warning — crypto-shredding.** A keys backup can decrypt every subject that was not yet shredded when it
+> was taken. Shredding later does not reach it. After a shred, delete (or re-take) older keys backups.
 
 ## Restore
-1. Manifest format/schema check, sha256 of every file.
-2. Staged copy in a temp dir next to the target: `PRAGMA integrity_check` + `quick_check`, trigger check,
-   full event + audit hash-chain verify, event count / chain head equal to manifest.
-3. With keys: every `enc_key_id` in the log must exist in keys.db or belong to a `subject.shredded` event;
-   otherwise restore fails (`--allow-missing-keys` restores anyway and lists them). A KEK must be reachable
-   for the target (keys.kek next to it, `VAULT_KEK_FILE` or `VAULT_PASSPHRASE`), else restore refuses rather
-   than letting a fresh KEK be auto-created.
+1. Vault manifest format/schema check, sha256; with `--keys`, keys manifest sha256 and key-id list check.
+2. Staged copy next to the target: `integrity_check` + `quick_check`, trigger check, full event + audit
+   hash-chain verify, count / chain head equal to manifest.
+3. With `--keys`: every `enc_key_id` in the log must exist in keys.db or belong to a `subject.shredded` event,
+   else restore fails (`--allow-missing-keys` restores anyway and lists them). A KEK must be reachable for the
+   target (keys.kek next to it, `VAULT_KEK_FILE`, or `VAULT_PASSPHRASE`), else restore refuses rather than
+   letting a fresh KEK be auto-created. Keys come only from `--keys`.
 4. Shreds recorded in the restored log are re-applied to the restored keys.db (wrapped DEK nulled).
-5. Refuses existing target (vault.db or keys.db) without `--force`; `os.replace` (atomic, same filesystem).
-6. `connect()` re-verifies, projections are rebuilt, a `restore` audit row is written; JSON report printed.
+5. Refuses existing target vault.db / keys.db without `--force`; atomic `os.replace` (same filesystem).
+6. `connect()` re-verifies, projections rebuilt, `restore` audit row written; JSON report printed.
 
-Limitation: restore only knows shreds that are *in the restored log*. Restoring a pre-shred backup brings
-the subject back as readable; nothing in the backup can tell it otherwise.
+Limitation: restore only knows shreds that are *in the restored log*. Restoring a pre-shred vault backup with
+a pre-shred keys backup brings the subject back as readable.
 
 ## Durability settings (decision)
 `connect()` now sets `busy_timeout=5000` and `synchronous=FULL` (vault.db and keys.db). We **stay on

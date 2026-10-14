@@ -8,10 +8,12 @@ All notable changes to this project are documented here. Format: [Keep a Changel
   `vault_update` template. See docs/context-pack.md. `vault pack` is unchanged.
 - `vault show <id|suffix> [--json] [--tree]`: read-only event detail with review/audit history and the full
   correction/supersede chain (effective head, reverts, conflict flagging); never decrypts. See docs/event-detail.md.
-- `vault backup --out DIR [--no-keys]` / `vault restore DIR --to PATH [--force] [--allow-missing-keys]`:
-  online sqlite3-backup of vault.db + wrapped keys.db with sha256 manifest; restore verifies hashes,
+- `vault backup --out DIR` (vault.db + sha256 manifest, never keys.db), separate human-only
+  `vault backup-keys --out DIR2` (wrapped keys.db + manifest; refused in/around a vault backup dir), and
+  `vault restore DIR --to PATH [--keys DIR2] [--force] [--allow-missing-keys]`: verifies hashes,
   integrity_check, triggers, hash chains and key coverage, re-applies logged shreds, renames atomically and
-  rebuilds projections. A backup with keys.db defeats later crypto-shredding (warned). See docs/backup-restore.md.
+  rebuilds projections. A keys backup defeats later crypto-shredding (warned). `--no-keys` is a deprecated
+  no-op. See docs/backup-restore.md.
 ### Changed
 - `connect()` sets `busy_timeout=5000` and `synchronous=FULL`; journal mode stays DELETE (decision in
   docs/backup-restore.md).

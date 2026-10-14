@@ -100,6 +100,8 @@ def _quarantine_reason(db, e, row, parents_held, keys, paired):
             return "valid user signature but origin device is not paired"
     elif e["actor"].startswith("user:"):
         return "unsigned user:* event"   # content types are never user-signed (only SIGNED_TYPES are)
+    if not signing.origin_targets_ok(e):
+        return "targets do not match the signed target parents"
     if any(p in parents_held for p, _ in e["parents"]):
         return "parent quarantined"
     return _schema_problem(e)

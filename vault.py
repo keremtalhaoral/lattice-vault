@@ -1459,7 +1459,7 @@ def main(argv=None):
                     print(json.dumps(sync.quarantined(db, include_released=args.all), ensure_ascii=False))
                 else:
                     if not args.dry_run:
-                        require_human_tty("sync-quarantine --release")
+                        require_human_tty("sync-quarantine --release", strict=True)   # signs an attestation, like sign-legacy
                     print(json.dumps(sync.release_quarantined(db, args.release or None, dry_run=args.dry_run), ensure_ascii=False, indent=2))
             elif args.cmd == "device-id":
                 print(sync.device_id(db))

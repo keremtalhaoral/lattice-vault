@@ -384,7 +384,7 @@ def sign_row(db, row, parents):
 
 def _attested(db, keys):
     out = set()
-    for r in _sig_rows(db, "WHERE e.type=?", (ATTEST_TYPE,)):
+    for r in _sig_rows(db, "WHERE e.type=? AND e.subject='attestation:legacy'", (ATTEST_TYPE,)):
         k = keys.get(r["skid"])
         if k and r["ssig"] and _verify(k["pub"], r["ssig"], sig_message(r, _parents_all(db, r["id"]), r["skid"])):
             out.update(json.loads(r["payload"]).get("target_event_ids", []))
@@ -431,11 +431,22 @@ def classify(db, ranges=None, keys=None):
             st = "legacy-attested" if r["id"] in att else "legacy-unsigned"
         elif r["replica_id"] != "local" and has_sync and (imp := db.execute(
                 "SELECT origin_row FROM sync_imported WHERE event_id=?", (r["id"],)).fetchone()):
-            st = remote_status(json.loads(imp[0]), keys, r, _parents_all(db, r["id"]))
+            try:
+                st = "targets-mismatch" if not targets_match(db, r["id"]) else \
+                    remote_status(json.loads(imp[0]), keys, r, _parents_all(db, r["id"]))
+            except (KeyError, TypeError, ValueError):
+                st = "remote-mismatch"          # malformed origin_row: fail closed, never crash verify
         else:
             st = "unsigned"
         out[r["id"]] = (r["seq"], st)
     return out
+
+
+def origin_targets_ok(e):
+    """A package/origin row's unsigned `targets` list (and target_id) must equal its signed rel='target' parents."""
+    signed = {p for p, rel in e.get("parents", []) if rel == "target"}
+    targets = set(e.get("targets") or [])
+    return targets == signed and (e.get("target_id") in targets if targets else e.get("target_id") is None)
 
 
 def remote_status(orig, keys, local=None, local_parents=None):
@@ -448,7 +459,7 @@ def remote_status(orig, keys, local=None, local_parents=None):
     if not sg.get("sig"):
         return "remote-unsigned"
     if not HAVE_CRYPTO:
-        return "remote-unsigned"       # cannot check here; reported as a warning like before
+        return "remote-unverifiable"   # cryptography missing: warning, distinct from "no signature"
     row = dict(orig)
     row["payload_ct"] = base64.b64decode(orig["payload_ct"]) if orig.get("payload_ct") else None
     parents = sorted({p for p, _ in orig.get("parents", [])})   # same message as sync._user_sig_problem
@@ -456,6 +467,8 @@ def remote_status(orig, keys, local=None, local_parents=None):
         if any(row[f] != local[f] for f in ("id", "type", "subject", "actor", "hlc")) or \
                 payload_hash(row) != payload_hash(local) or parents != sorted(local_parents or []):
             return "remote-mismatch"
+    if not origin_targets_ok(orig):
+        return "targets-mismatch"
     k = keys.get(sg.get("key_id"))
     if not k:
         return "unknown-key"
@@ -468,7 +481,9 @@ def remote_status(orig, keys, local=None, local_parents=None):
     return "remote-signed"
 
 
-BAD = ("targets-mismatch", "remote-mismatch", "bad-signature", "unknown-key", "revoked-key", "wrong-role-key", "unsigned")
+# remote-unsigned is BAD: it only occurs after the signing epoch (earlier rows are legacy), and since #13 import never
+# applies an unsigned human-only event, so such a row can only come from a pre-#13 import or a forged sync_imported row.
+BAD = ("remote-unsigned", "targets-mismatch", "remote-mismatch", "bad-signature", "unknown-key", "revoked-key", "wrong-role-key", "unsigned")
 
 
 def unsigned_after_epoch(db):

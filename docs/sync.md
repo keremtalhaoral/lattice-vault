@@ -27,12 +27,15 @@ plus `origin_device`. Forwarded events (A→B→C) are re-exported from the stor
    Accepted events are stored without a local `event_sigs` row (the local copy's `replica_id` differs from the
    origin's); the origin row with `sig` stays in `sync_imported` and is re-exported as is. `doctor`/`verify` re-verify
    that origin signature and check that the origin row matches the chained local event (id, type, subject, actor,
-   hlc, payload hash, parents): `remote-signed` (ok), `remote-unsigned` (no signature at all: warning), and
-   `remote-mismatch` / `unknown-key` / `bad-signature` / `wrong-role-key` / `revoked-key` (errors). A revoked key is
+   hlc, payload hash, parents): `remote-signed` (ok), `remote-unverifiable` (cryptography not installed: warning), and
+   `remote-unsigned` / `remote-mismatch` / `targets-mismatch` / `unknown-key` / `bad-signature` / `wrong-role-key` /
+   `revoked-key` (errors; import never applies an unsigned human-only event, so `remote-unsigned` after the signing
+   epoch means a pre-#13 import or a tampered side table). An event's `targets` list (and `target_id`) must equal its
+   signed `rel='target'` parents, on import, on release and in doctor/verify. A revoked key is
    judged by the local log position of the imported copy, never by the sender-chosen HLC; an event signed by a key
    that is already revoked when it arrives is quarantined whatever its HLC.
    *Interim design (deviation from the multi-device draft §11.2):* `origin_row` is not hash-chained, so editing it can
-   only downgrade a status. The permanent fix is that the origin writes its real device id into `replica_id` at write
+   only downgrade a status (adding or editing rows yields an error status, never `remote-signed`). The permanent fix is that the origin writes its real device id into `replica_id` at write
    time, so the local copy can keep the signature in `event_sigs` and bind it into the local hash.
 4. **Not built:** Ed25519 package signing (`signature` is always null). SHA-256 detects corruption. It does **not** authenticate the sender:
    anyone who can write the file can recompute both hashes. Until signing exists, "paired device" is a label the

@@ -402,8 +402,9 @@ class SyncTest(unittest.TestCase):
         run = lambda *x: subprocess.run([sys.executable, os.path.join(HERE, "vault.py"), *x], capture_output=True, text=True, env=env)
         r = run("sync-quarantine", "--release", "--dry-run"); self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(json.loads(r.stdout)["released"], [ap])
-        r = run("sync-quarantine", "--release", ap); self.assertEqual(r.returncode, 0, r.stderr)
-        r = run("sync-quarantine"); self.assertNotIn(ap, r.stdout)
+        r = run("sync-quarantine", "--release", ap)          # L1: strict TTY, no harness bypass (signs an attestation)
+        self.assertEqual(r.returncode, 1); self.assertIn("interactive terminal", r.stderr)
+        r = run("sync-quarantine"); self.assertIn(ap, r.stdout)
 
 
     # ---- Data Systems review of #13 (B1, B2, N3-N5) + Security nit (signed release) ----
@@ -428,7 +429,7 @@ class SyncTest(unittest.TestCase):
         st = signing.classify(self.B)[ap][1]
         self.assertEqual(st, "bad-signature"); self.assertIn(st, signing.BAD)
         self.assertFalse(ops.verify(self.B)["ok"])
-        self.set_origin(ap, lambda o: o.pop("sig"))                       # only a missing signature is a warning
+        self.set_origin(ap, lambda o: o.pop("sig"))                       # missing signature after the epoch: BAD (M1)
         self.assertEqual(signing.classify(self.B)[ap][1], "remote-unsigned")
 
     @unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
@@ -506,6 +507,58 @@ class SyncTest(unittest.TestCase):
         sync.ensure_schema(C)
         sync.release_quarantined(C, dry_run=True)
         self.assertIsNone(sync.device_id(C, create=False))
+
+    # ---- Security review of #13 @ b60c085: H1 targets binding, M1, L2 ----
+    def widened_pkg(self):
+        x = vault.append(self.A, "learning.captured", "x", {"text": "x"}, "agent:bot", "unverified")[0]
+        y = vault.append(self.A, "learning.captured", "y", {"text": "y"}, "agent:bot", "unverified")[0]
+        ap = vault.review(self.A, x, "approve", actor=U)
+        p = self.pkg(self.A, "wide")
+        self.rewrite(p, ap, lambda e: e.update(targets=sorted([x, y])))
+        return x, y, ap, p
+
+    @unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
+    def test_h1_widened_targets_held_on_import(self):
+        signing.register_user_key(self.B)
+        x, y, ap, p = self.widened_pkg()
+        sync.import_package(self.B, p)
+        self.assertEqual(self.held(self.B)[ap], "targets do not match the signed target parents")
+        self.assertEqual(self.st(self.B, y), "proposed")
+
+    @unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
+    def test_h1_widened_targets_never_released(self):
+        x, y, ap, p = self.widened_pkg()
+        sync.import_package(self.B, p)
+        signing.register_user_key(self.B)
+        r = sync.release_quarantined(self.B, [ap])
+        self.assertEqual(r["released"], []); self.assertEqual(self.st(self.B, y), "proposed")
+
+    @unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
+    def test_h1_local_target_insert_is_bad(self):
+        import ops
+        a, ap, p = self.applied_approval()
+        z = vault.append(self.B, "learning.captured", "z", {"text": "z"}, "agent:bot", "unverified")[0]
+        self.B.execute("INSERT INTO event_targets VALUES(?,?)", (ap, z)); self.B.commit()
+        self.assertEqual(signing.classify(self.B)[ap][1], "targets-mismatch")
+        self.assertFalse(ops.verify(self.B)["ok"])
+
+    @unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
+    def test_m1_forged_sync_imported_row_is_bad(self):
+        a, ap, p = self.applied_approval()
+        self.set_origin(ap, lambda o: o.pop("sig"))
+        st = signing.classify(self.B)[ap][1]
+        self.assertEqual(st, "remote-unsigned"); self.assertIn(st, signing.BAD)
+
+    @unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
+    def test_malformed_origin_row_fails_closed(self):
+        a, ap, p = self.applied_approval()
+        self.set_origin(ap, lambda o: o.pop("hlc"))
+        self.assertEqual(signing.classify(self.B)[ap][1], "remote-mismatch")
+
+    def test_l2_no_crypto_is_unverifiable_warning(self):
+        with mock.patch.object(signing, "HAVE_CRYPTO", False):
+            self.assertEqual(signing.remote_status({"sig": {"sig": "x", "key_id": "k"}}, {}), "remote-unverifiable")
+        self.assertNotIn("remote-unverifiable", signing.BAD)
 
 if __name__ == "__main__":
     unittest.main()

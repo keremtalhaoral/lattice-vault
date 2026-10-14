@@ -1195,7 +1195,10 @@ def main(argv=None):
     for n in ("shred-cancel", "shred-finalize"):
         x = sp.add_parser(n); x.add_argument("subject")
     ky = sp.add_parser("keys", help="user signing key (Ed25519) for human-only events")
-    ky.add_argument("action", choices=["init-user", "show"])
+    ky.add_argument("action", choices=["init-user", "show", "rotate", "revoke", "recovery-code", "recover"])
+    ky.add_argument("key_id", nargs="?", help="revoke: the key_id to revoke")
+    ky.add_argument("--new-key", help="rotate/recover: path for the NEW key file (must not exist)")
+    ky.add_argument("--reason", help="revoke: reason")
     sp.add_parser("sign-legacy", help="re-attest legacy unsigned human-only events (interactive TTY required)")
     mg = sp.add_parser("migrate"); mg.add_argument("old"); mg.add_argument("new")
     sp.add_parser("review-queue", help="citation check: pending human-review items")
@@ -1229,7 +1232,7 @@ def main(argv=None):
     sp.add_parser("verify", help="read-only: full hash-chain + signature + anchor verify, projection hash vs a fresh rebuild (exit 2 on failure)")
     args = ap.parse_args(argv)
     try:
-        if args.cmd in HUMAN_CMDS or (args.cmd == "shred" and args.confirm) or (args.cmd == "keys" and args.action == "init-user"):
+        if args.cmd in HUMAN_CMDS or (args.cmd == "shred" and args.confirm) or (args.cmd == "keys" and args.action != "show"):
             require_human_tty(args.cmd)
         if args.cmd == "sign-legacy":
             require_human_tty("sign-legacy", strict=True)   # never bypassable, not even in the test harness
@@ -1271,11 +1274,36 @@ def main(argv=None):
                 kid, created = signing.register_user_key(db, confirm=_fp)
                 signing.write_anchor(db)
                 print(f"user key {kid} {'registered in this vault' if created else 'already registered'}")
+            elif args.action == "rotate":
+                if not args.new_key:
+                    raise ValueError("keys rotate needs --new-key PATH")
+                old, new = signing.rotate_user_key(db, args.new_key)
+                print(f"rotated {old} -> {new}. Set VAULT_USER_KEY={args.new_key} now; the old key is revoked and "
+                      "can no longer sign. Back up the new key file offline.")
+            elif args.action == "revoke":
+                if not args.key_id or not args.reason:
+                    raise ValueError("keys revoke needs KEY_ID and --reason")
+                signing.revoke_key(db, args.key_id, args.reason); signing.write_anchor(db)
+                print(f"revoked {args.key_id} (signatures made before now stay valid)")
+            elif args.action == "recovery-code":
+                code, kid = signing.new_recovery_code(db)
+                print(f"recovery key {kid} registered (earlier recovery codes are revoked).\n"
+                      f"RECOVERY CODE (shown once, write it down offline, never store it with the vault):\n  {code}")
+            elif args.action == "recover":
+                if not args.new_key:
+                    raise ValueError("keys recover needs --new-key PATH")
+                import getpass
+                code = getpass.getpass("recovery code: ") if sys.stdin.isatty() else sys.stdin.readline().strip()
+                kid = signing.recover_with_code(db, code, args.new_key)
+                print(f"new user key {kid} at {args.new_key}; all earlier user keys and this recovery code are revoked. "
+                      f"Set VAULT_USER_KEY={args.new_key} and run `vault keys recovery-code` for a new code.")
             else:
                 keys, probs = signing.registered_keys(db)
                 local = signing.try_user_key()
                 print(json.dumps({"key_file": signing.key_path(), "local_key_id": local[1] if local else None,
-                                  "registered": sorted(keys), "problems": probs}, indent=2))
+                                  "registered": sorted(keys),
+                                  "keys": {k: {"role": v["role"], "revoked_hlc": v["revoked_hlc"]} for k, v in sorted(keys.items())},
+                                  "problems": probs}, indent=2))
             return 0
         if args.cmd == "sign-legacy":
             def _confirm(items):

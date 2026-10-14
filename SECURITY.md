@@ -90,8 +90,9 @@ access to an unlocked machine, a compromised Python interpreter or dependency.
 - **Ops log.** JSON lines to a 0600 file with an allowlist of fields; never vault content or tokens.
 
 ### Decided next steps (ADR 0011 "Decisions"; not implemented in this change)
-- Key rotation CLI and an offline recovery code (separate PR, before multi-device work).
-- Optional second, user-chosen anchor location `VAULT_ANCHOR_PATH2` (next PR).
+- Key rotation CLI and an offline recovery code: implemented (`vault keys rotate|revoke|recovery-code|recover`,
+  docs/adr/0012-key-lifecycle.md).
+- Optional second, user-chosen anchor location `VAULT_ANCHOR_PATH2`: implemented (ADR 0012).
 - OS-keychain backend with the 0600 file as fallback (separate PR).
 - Defaults stay at 30 days (`VAULT_FULL_VERIFY_DAYS`) and K=4 (`VAULT_VERIFY_SAMPLE_K`).
 - Sync: the real device id is written into `replica_id` at write time (until then, verify against `origin_row`).
@@ -117,7 +118,9 @@ access to an unlocked machine, a compromised Python interpreter or dependency.
   or register their own key first. Check the fingerprint shown by `keys init-user`.
 - **Sync-imported human-only events** are stored unsigned (`remote-unsigned`, flagged). Package/device signing is
   **(planned)** (ADR 0011).
-- **Key rotation** has no CLI yet (`key.rotated` verification exists). Losing the key file blocks new human-only events.
+- **Key loss.** Losing the key file blocks new human-only events unless a recovery code was created beforehand
+  (`vault keys recovery-code`). Whoever holds the recovery code can replace the signing key; keep it offline.
+  Revocation is never retroactive (`compromised:true` handling is **(planned)**).
 - **TTY gate.** Any same-user process can allocate a pseudo-terminal.
 - **DNS rebinding.** The citation check resolves and validates addresses, then lets `urllib` connect;
   the connection is not pinned to the validated address, so a rebinding DNS server could race it.

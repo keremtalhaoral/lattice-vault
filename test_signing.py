@@ -240,6 +240,23 @@ class Anchor(unittest.TestCase):
         self.assertTrue(any("no external anchor" in w for w in vault.OPEN_WARNINGS[os.path.abspath(self.dbp)]))
         db.close()
 
+    def test_verify_reports_signatures_and_anchor(self):
+        rep = ops.verify(self.db)
+        self.assertTrue(rep["ok"], rep["problems"]); self.assertEqual(rep["anchor"], "ok")
+        self.assertGreaterEqual(rep["signatures"].get("signed", 0), 2)        # key.registered + approval
+        os.remove(self.anchor)
+        rep = ops.verify(self.db)
+        self.assertTrue(any("no external anchor" in w for w in rep["warnings"]))
+
+    def test_restore_resets_anchor(self):
+        import backup
+        bk, to = os.path.join(self.d, "bk"), os.path.join(self.d, "restored.db")
+        backup.backup(self.db, bk)
+        vault.audit(self.db, H, "later", "accepted", "after backup")
+        backup.restore(bk, to)
+        db = vault.connect(to)                                           # fresh anchor for the restored path; no rollback error
+        self.assertTrue(os.path.exists(signing.anchor_path(to))); self.assertEqual(ops.verify(db)["anchor"], "ok"); db.close()
+
     def test_known_limit_rollback_of_both_files_undetected(self):
         """KNOWN LIMIT (documented): rolling back the DB AND the anchor together is not detected."""
         self.db.close()

@@ -89,6 +89,16 @@ access to an unlocked machine, a compromised Python interpreter or dependency.
   the vault root, `VAULT_OFFLINE=1` disables network access.
 - **Ops log.** JSON lines to a 0600 file with an allowlist of fields; never vault content or tokens.
 
+### Decided next steps (ADR 0011 "Decisions"; not implemented in this change)
+- Key rotation CLI and an offline recovery code (separate PR, before multi-device work).
+- Optional second, user-chosen anchor location `VAULT_ANCHOR_PATH2` (next PR).
+- OS-keychain backend with the 0600 file as fallback (separate PR).
+- Defaults stay at 30 days (`VAULT_FULL_VERIFY_DAYS`) and K=4 (`VAULT_VERIFY_SAMPLE_K`).
+- Sync: the real device id is written into `replica_id` at write time (until then, verify against `origin_row`).
+  Device keys are certified by the user key. Retroactive revocation needs `compromised:true`, a user signature and a
+  human decision. Anchors are kept per device / per origin chain. `vaultsync/0.2` carries `key.*` events; until
+  then, unsigned remote human-only events are to be quarantined (today, those from paired devices are only flagged).
+
 ## Known limitations
 - **Same-OS-user tampering is detectable, not preventable.** An attacker who can read the user key file can
   sign anything, including approvals and a fresh anchor, so they can rewrite the DB and re-sign both consistently.

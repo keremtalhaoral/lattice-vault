@@ -51,7 +51,24 @@ need per-device keys to authenticate packages.
    `<config dir>/anchors/<sha256(db path)[:16]>.anchor.json`. On open, a DB behind the anchor or a hash mismatch is
    an error, and a missing anchor is a warning.
 
-## What Data Systems must align on (open items)
+## Decisions (2026-10-14, Kerem / Lead Architect / Data Systems)
+1. **Key rotation and recovery** come in a separate PR *before* the multi-device work: a rotation CLI (`key.rotated`,
+   signed by both keys) and an offline recovery code. Not in this PR.
+2. **Second anchor location.** The user can choose an optional second location (`VAULT_ANCHOR_PATH2`). Planned for
+   the next PR, **not implemented** here.
+3. **OS keychain backend** first, with the 0600 file as the fallback. Separate PR (today the keychain backend is a stub).
+4. **Defaults stay** at `VAULT_FULL_VERIFY_DAYS=30` and `VAULT_VERIFY_SAMPLE_K=4` (segment 64).
+5. **Sync alignment (agreed with Data Systems):**
+   * The origin writes its real device id into `replica_id` at write time. Until that change lands, sync verifies
+     user signatures against the stored `origin_row`.
+   * Device keys are certified by the user key (`key.registered{role:'device', device_id, certified_by:<user key_id>}`).
+   * Retroactive revocation happens only with `compromised:true`, plus a user signature and a human decision.
+   * Anchors are kept per device and per origin chain (seq + head vector). This is Data Systems' PR 7.
+   * Packages carry `key.*` events from `vaultsync/0.2` on. Until then, `remote-unsigned` means **quarantine**.
+     Implementation gap in this PR: such events from *paired* devices are still accepted and only flagged by doctor.
+     Unpaired-device signed types are skipped. The quarantine rule lands with the sync PR.
+
+## What Data Systems must align on (open items, superseded where item 5 above decides)
 - **origin_device.** Sync rewrites `replica_id='local'` to the origin device id on import (`sync.py`), which changes
   a field that is signed. The receiver must verify against the stored origin row (`sync_imported.origin_row`), or
   `'local'` must be replaced by the real device id at write time. Decide before package signing.

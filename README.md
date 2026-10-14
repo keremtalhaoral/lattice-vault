@@ -87,8 +87,13 @@ Human-only commands require an interactive terminal.
 ```sh
 export VAULT_DB=$HOME/.local/share/lattice-vault/vault.db
 ./vault init                     # once: create the vault (commands never auto-create a missing VAULT_DB)
-./vault keys init-user           # once, after init: create + register your Ed25519 signing key (TTY, confirm fingerprint)
-./vault keys show                # registered signing key(s) and fingerprint
+./vault keys init-user           # once, after init: create + register your Ed25519 signing key and a one-time
+                                 # recovery code (TTY, confirm fingerprint; write the code down offline)
+./vault keys show                # registered signing key(s), roles, revocation
+./vault keys recovery-code --replace   # replace the recovery code (asks for the OLD code)
+./vault keys rotate --new-key PATH   # new key, old one revoked (old signatures stay valid); then set VAULT_USER_KEY=PATH
+./vault keys revoke KEY_ID --reason ...   # e.g. a lost recovery code
+./vault keys recover --new-key PATH  # lost key: reads the recovery code from the TTY
 
 ./vault add preference.set user:ada --key language --payload '{"value":"English"}'
 ./vault add decision.made decision:D-100 --payload '{"decision_id":"D-100","title":"Local-first","decision":"No cloud"}'
@@ -180,6 +185,7 @@ via `/proc/<pid>/environ` by the same OS user. Never commit MCP client configs.
 | `VAULT_OFFLINE`, `VAULT_HTTP_TIMEOUT`, `VAULT_REVIEW_SAMPLE_PCT`, `VAULT_ROOT` | citation check |
 | `VAULT_USER_KEY`, `VAULT_USER_KEY_PASSPHRASE` | user Ed25519 signing key (PKCS8 PEM, 0600; default `~/.config/lattice-vault/user_ed25519.key`); create with `vault keys init-user` |
 | `VAULT_CONFIG_DIR` | config dir for the default key and anchors (default `$XDG_CONFIG_HOME/lattice-vault`) |
+| `VAULT_ANCHOR_PATH2` | optional second anchor location (e.g. removable drive); written and checked in addition |
 | `VAULT_ANCHOR_PATH` | external chain-head anchor for the `VAULT_DB` vault (default `<config dir>/anchors/<id>.anchor.json`) |
 | `VAULT_VERIFY_SAMPLE_K`, `VAULT_VERIFY_SEGMENT`, `VAULT_FULL_VERIFY_DAYS` | open-time sampled verification (default 4 segments × 64 rows) and the "run doctor" nudge (default 30 days) |
 | `VAULT_ALLOW_NONTTY` | **test harness only**: honoured only with `VAULT_TEST_HARNESS=1` and a `VAULT_USER_KEY` under the temp dir (set by `testutil.py`) |

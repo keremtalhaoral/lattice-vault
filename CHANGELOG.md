@@ -3,6 +3,15 @@ All notable changes to this project are documented here. Format: [Keep a Changel
 
 ## [Unreleased]
 ### Security
+- Key lifecycle (docs/adr/0012-key-lifecycle.md): `vault keys rotate --new-key PATH`, `vault keys revoke`,
+  `vault keys recovery-code` and `vault keys recover`. Recovery keys (role `recovery`) can only certify a new user key
+  and revoke; revoked/non-user keys can no longer sign, certify or anchor. Optional second anchor `VAULT_ANCHOR_PATH2`.
+  After Security review: one active user key (others pending until a dual-signed rotation), transitive revocation of
+  non-recovery keys certified by a rotated/recovered key (the recovery key survives rotation), recovery-code replacement needs the old code, narrow revoke rights, and
+  revocation bound to log position (`seq < revoked_seq` and `hlc < revoked_hlc`).
+  Recovery keys are created only atomically with the first user key, `--replace` (old code) or `recover`; doctor
+  warns when no recovery key is live; `keys show` lists it. Revocations cannot backdate without `compromised:true`.
+  Signed events whose `event_targets` differ from their signed target parents are `targets-mismatch` (error).
 - Human-only events are signed with a user Ed25519 key (`vault keys init-user`, `VAULT_USER_KEY`). Signatures are
   stored in `event_sigs` and bound into the event hash. New unsigned human-only events are refused. Older ones are
   flagged as `legacy-unsigned`, and `vault sign-legacy` re-attests them. See docs/adr/0011-signing-keys.md.

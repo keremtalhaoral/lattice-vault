@@ -256,6 +256,10 @@ def signature_report(db):
                         "(package/device signing is planned, ADR 0011)")
     if signing.epoch_seq(db) is None:
         warnings.append("no user signing key registered in this vault: run `vault keys init-user`")
+    elif not any(k["role"] == "recovery" and k["revoked_seq"] is None for k in keys.values()):
+        warnings.append("WARNING: NO LIVE RECOVERY KEY. A lost user key cannot be recovered, and this vault cannot gain one "
+                        "(only init-user, --replace with the old code, or recover create recovery keys). Re-initialise "
+                        "the vault (ADR 0012 migration) if this is unexpected.")
     aerr, awarn = signing.check_anchor(db, keys)
     problems += aerr; warnings += awarn
     checks["anchor"] = "ok" if not aerr and not awarn else (aerr or awarn)[0]

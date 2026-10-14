@@ -146,16 +146,17 @@ class SignedApprovals(unittest.TestCase):
                 self.db.execute("INSERT INTO events(id,replica_id,replica_seq,hlc,ts,type,subject,payload,actor,trust,content_hash,prev_hash,hash) "
                                 f"VALUES('{t}','local',98,'f','t','{t}','e','{{}}','agent:x','unverified','c','p','h{t}')")
 
-    def test_revoked_key_cannot_sign_after_effective_hlc(self):
+    def test_user_key_cannot_self_revoke(self):
+        # ADR 0012: the active user key is replaced only via rotate/recover; a bare self-revocation is ignored + reported
         a = vault.review(self.db, self.p, "approve")
         kid = self.db.execute("SELECT key_id FROM event_sigs WHERE event_id=?", (a,)).fetchone()[0]
         hlc = vault.next_hlc(self.db, "local")
         vault.append(self.db, "key.revoked", f"key:{kid}", {"key_id": kid, "effective_hlc": hlc, "reason": "test",
                                                              "compromised": False}, H, "verified")
-        self.assertEqual(signing.classify(self.db)[a][1], "signed")   # signatures made before revocation stay valid
-        q = agent(self.db, "note.added", "y", {"text": "p2"})
-        with self.assertRaisesRegex(signing.SignatureError, "revoked"):
-            vault.review(self.db, q, "approve")
+        keys, probs = signing.registered_keys(self.db)
+        self.assertTrue(any("key.revoked" in x for x in probs), probs)
+        self.assertTrue(keys[kid]["active"])
+        self.assertEqual(signing.classify(self.db)[a][1], "signed")
 
 
 @unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
@@ -399,6 +400,20 @@ class KeyFileAndTTY(unittest.TestCase):
         self.assertIn("fingerprint", r.stdout); self.assertIn("registered in this vault", r.stdout)
         r = run("keys", "init-user"); self.assertIn("already registered", r.stdout)
         r = run("keys", "show"); self.assertEqual(json.loads(r.stdout)["problems"], [])
+
+
+@unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
+class TargetsBinding(unittest.TestCase):
+    """event_targets drives projections but is not in the signed message: it must equal the signed rel='target' set."""
+    def test_inserted_target_is_bad(self):
+        fresh(self)
+        x = agent(self.db, "note.added", "x", {"text": "x"}); y = agent(self.db, "note.added", "y", {"text": "y"})
+        ap = vault.review(self.db, x, "approve")
+        self.assertEqual(signing.classify(self.db)[ap][1], "signed")
+        self.db.execute("INSERT INTO event_targets VALUES(?,?)", (ap, y)); self.db.commit()
+        st = signing.classify(self.db)[ap][1]
+        self.assertEqual(st, "targets-mismatch"); self.assertIn(st, signing.BAD)
+        self.assertFalse(ops.verify(self.db)["ok"])
 
 
 if __name__ == "__main__":

@@ -1195,7 +1195,11 @@ def main(argv=None):
     for n in ("shred-cancel", "shred-finalize"):
         x = sp.add_parser(n); x.add_argument("subject")
     ky = sp.add_parser("keys", help="user signing key (Ed25519) for human-only events")
-    ky.add_argument("action", choices=["init-user", "show"])
+    ky.add_argument("action", choices=["init-user", "show", "rotate", "revoke", "recovery-code", "recover"])
+    ky.add_argument("key_id", nargs="?", help="revoke: the key_id to revoke")
+    ky.add_argument("--new-key", help="rotate/recover: path for the NEW key file (must not exist)")
+    ky.add_argument("--reason", help="revoke: reason")
+    ky.add_argument("--replace", action="store_true", help="recovery-code: replace the live code (asks for the OLD code)")
     sp.add_parser("sign-legacy", help="re-attest legacy unsigned human-only events (interactive TTY required)")
     mg = sp.add_parser("migrate"); mg.add_argument("old"); mg.add_argument("new")
     sp.add_parser("review-queue", help="citation check: pending human-review items")
@@ -1229,7 +1233,7 @@ def main(argv=None):
     sp.add_parser("verify", help="read-only: full hash-chain + signature + anchor verify, projection hash vs a fresh rebuild (exit 2 on failure)")
     args = ap.parse_args(argv)
     try:
-        if args.cmd in HUMAN_CMDS or (args.cmd == "shred" and args.confirm) or (args.cmd == "keys" and args.action == "init-user"):
+        if args.cmd in HUMAN_CMDS or (args.cmd == "shred" and args.confirm) or (args.cmd == "keys" and args.action != "show"):
             require_human_tty(args.cmd)
         if args.cmd == "sign-legacy":
             require_human_tty("sign-legacy", strict=True)   # never bypassable, not even in the test harness
@@ -1268,14 +1272,55 @@ def main(argv=None):
                     if not sys.stdin.isatty():
                         return True    # only reachable in the test harness (require_human_tty above)
                     return input("Register this key as the vault owner's signing key? [yes/no] ").strip() == "yes"
-                kid, created = signing.register_user_key(db, confirm=_fp)
+                if not signing.local_key_registered(db, signing.load_user_key(kp)[1]) and not (
+                        sys.stdout.isatty() or _nontty_allowed()):
+                    raise PermissionError("keys init-user prints the one-time recovery code: stdout must be an interactive terminal")
+                def _code(c):
+                    print(f"RECOVERY CODE (shown once; write it down offline, never store it with the vault):\n  {c}")
+                kid, created = signing.register_user_key(db, confirm=_fp, on_code=_code)
                 signing.write_anchor(db)
                 print(f"user key {kid} {'registered in this vault' if created else 'already registered'}")
+            elif args.action == "rotate":
+                if not args.new_key:
+                    raise ValueError("keys rotate needs --new-key PATH")
+                old, new = signing.rotate_user_key(db, args.new_key)
+                print(f"rotated {old} -> {new}. Set VAULT_USER_KEY={args.new_key} now; the old key and the pending/device keys it "
+                      "certified are revoked. Your recovery code stays valid. Back up the new key file offline.")
+            elif args.action == "revoke":
+                if not args.key_id or not args.reason:
+                    raise ValueError("keys revoke needs KEY_ID and --reason")
+                signing.revoke_key(db, args.key_id, args.reason); signing.write_anchor(db)
+                print(f"revoked {args.key_id} (signatures made before now stay valid)")
+            elif args.action == "recovery-code":
+                if not (sys.stdout.isatty() or _nontty_allowed()):   # never print the code into a pipe/log file
+                    raise PermissionError("keys recovery-code prints a secret: stdout must be an interactive terminal")
+                old = None
+                if args.replace:
+                    import getpass
+                    old = getpass.getpass("OLD recovery code: ") if sys.stdin.isatty() else sys.stdin.readline().strip()
+                code, kid = signing.new_recovery_code(db, old_code=old)
+                print(f"recovery key {kid} registered (the old recovery code is revoked).\n"
+                      f"RECOVERY CODE (shown once, write it down offline, never store it with the vault):\n  {code}")
+            elif args.action == "recover":
+                if not args.new_key:
+                    raise ValueError("keys recover needs --new-key PATH")
+                import getpass
+                code = getpass.getpass("recovery code: ") if sys.stdin.isatty() else sys.stdin.readline().strip()
+                if not (sys.stdout.isatty() or _nontty_allowed()):
+                    raise PermissionError("keys recover prints a new recovery code: stdout must be an interactive terminal")
+                kid, new_code = signing.recover_with_code(db, code, args.new_key)
+                print(f"new user key {kid} at {args.new_key}; all earlier user keys and the old recovery code are revoked. "
+                      f"Set VAULT_USER_KEY={args.new_key}.\nNEW RECOVERY CODE (shown once, store offline):\n  {new_code}")
             else:
                 keys, probs = signing.registered_keys(db)
                 local = signing.try_user_key()
                 print(json.dumps({"key_file": signing.key_path(), "local_key_id": local[1] if local else None,
-                                  "registered": sorted(keys), "problems": probs}, indent=2))
+                                  "registered": sorted(keys),
+                                  "keys": {k: {"role": v["role"], "active": v["active"], "revoked_hlc": v["revoked_hlc"],
+                                               "revoked_seq": v["revoked_seq"]} for k, v in sorted(keys.items())},
+                                  "live_recovery_key": next(({"key_id": k, "seq": v["seq"]} for k, v in sorted(keys.items())
+                                                             if v["role"] == "recovery" and v["revoked_seq"] is None), None),
+                                  "problems": probs}, indent=2))
             return 0
         if args.cmd == "sign-legacy":
             def _confirm(items):

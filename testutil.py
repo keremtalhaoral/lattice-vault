@@ -22,11 +22,20 @@ def _harness_append(db, type_, subject, payload, actor, trust, *a, **kw):
             and actor.startswith("user:")):
         vault.ensure_sig_schema(db)
         if signing.epoch_seq(db) is None:
-            signing.register_user_key(db)
+            signing.register_user_key(db, on_code=lambda c: RECOVERY_CODES.__setitem__(_dbkey(db), c))
     return _append(db, type_, subject, payload, actor, trust, *a, **kw)
 
 
 vault.append = _harness_append
+RECOVERY_CODES = {}   # harness only: one-time recovery codes created by init-user, per vault file
+
+
+def _dbkey(db):
+    return os.path.abspath(db.execute("PRAGMA database_list").fetchone()[2])
+
+
+def recovery_code(db):
+    return RECOVERY_CODES[_dbkey(db)]
 
 try:
     import crypto_keys

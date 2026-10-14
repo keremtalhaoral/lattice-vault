@@ -23,6 +23,8 @@ ANCHOR_DOMAIN = b"lattice-anchor-sig/v1\n"
 PKG_DOMAIN = b"lattice-pkg-sig/v1\n"          # reserved for .vaultsync package signatures (not implemented)
 ATTEST_TYPE = "attestation.recorded"          # 'attestation' alone fails the events.type CHECK ('<a>.<b>')
 KEY_TYPES = ("key.registered", "key.rotated", "key.revoked")
+RECOVERY_DOMAIN = b"lattice-recovery-seed/v1\n"
+KEY_ROLES = ("user", "recovery", "device")
 
 # Set by agent-facing processes (MCP server, `vault propose`): never load the user private key there.
 USER_KEY_DISABLED = False
@@ -163,6 +165,14 @@ def _parents_all(db, eid):
     return sorted({r[0] for r in db.execute("SELECT parent_id FROM event_parents WHERE event_id=?", (eid,))})
 
 
+def targets_match(db, eid):
+    """Projections read approval/revert targets from event_targets, but the signature covers event_parents (targets
+    are written there with rel='target'). A signed event is only trustworthy if both sets are identical."""
+    t = {r[0] for r in db.execute("SELECT target_id FROM event_targets WHERE event_id=?", (eid,))}
+    s_ = {r[0] for r in db.execute("SELECT parent_id FROM event_parents WHERE event_id=? AND rel='target'", (eid,))}
+    return t == s_
+
+
 def payload_hash(row):
     ct = row["payload_ct"]
     if ct:
@@ -180,45 +190,122 @@ def sig_message(row, parents, key_id):
 
 
 def registered_keys(db):
-    """Replay key events in log order. Returns ({key_id: info}, problems). info = {pub, role, seq, revoked_hlc}.
-    A key.registered must be signed by `certified_by`: itself for the first user key (self-signed, TOFU, pinned by the
-    anchor), otherwise an already registered, unrevoked user key."""
+    """Replay key events in log order. Returns ({key_id: info}, problems).
+    info = {pub, role, seq, certified_by, active, revoked_hlc, revoked_seq, revoked_by}. Rules (docs/adr/0012):
+    * at most ONE active user key. The first user key is self-signed (TOFU, fingerprint confirmed on the TTY).
+      A further user key is only *pending* when registered by the active user key, and becomes active through a
+      dual-signed key.rotated, which atomically revokes the old key; or it is registered by the live recovery key
+      (recover), which atomically revokes every user key and the recovery key itself.
+    * a recovery key is registered by the active user key only while no recovery key is live (replacing one needs the
+      old recovery key's self-revocation, i.e. the old code).
+    * key.revoked: the active user key may revoke only device keys it certified; a recovery key may revoke only
+      itself. Any revocation also revokes, transitively, every live non-recovery key certified by the revoked key.
+      A recovery key survives rotation; it dies only by self-revocation (old code) or by `recover`.
+    * a revoked key's signature is valid only on events with seq < revoked_seq AND hlc < revoked_hlc (or on the
+      revoking event itself), see _sig_valid."""
     import vault
     vault.ensure_sig_schema(db)
     keys, problems = {}, []
+
+    def revoke(kid, r, hlc, keep=()):
+        k = keys[kid]
+        if k["revoked_seq"] is None:
+            k.update(revoked_hlc=hlc, revoked_seq=r["seq"], revoked_by=r["id"], active=False)
+        for c, ck in keys.items():
+            # recovery keys are never revoked transitively: they die only by self-revocation or by `recover`, so a
+            # thief who rotates the user key cannot kill the owner's offline recovery code
+            if ck["certified_by"] == kid and c != kid and c not in keep and ck["revoked_seq"] is None \
+                    and ck["role"] != "recovery":
+                revoke(c, r, hlc, keep)
+
+    def active_user():
+        return next((kid for kid, k in keys.items() if k["role"] == "user" and k["active"]), None)
+
+    # A recovery key may only be registered as the very next log event after an "anchor step" in the same
+    # transaction: the first user key (init-user), the old recovery key's self-revocation (--replace, needs the old
+    # code) or a recovery-certified user key (recover). A stolen user key alone can never add a recovery key.
+    last = {"seq": None, "kind": None, "user": None, "rk": None}
+
     for r in _sig_rows(db, f"WHERE e.type IN ({','.join('?' * len(KEY_TYPES))}) ORDER BY e.seq", KEY_TYPES):
         p = json.loads(r["payload"])
         signer = r["skid"]
-        def ok(pub):
-            return HAVE_CRYPTO and r["ssig"] and _verify(pub, r["ssig"], sig_message(r, _parents_all(db, r["id"]), signer))
+        sk = keys.get(signer)
+
+        def ok(k):
+            return bool(HAVE_CRYPTO and r["ssig"] and k and _sig_valid(k, r)
+                        and _verify(k["pub"], r["ssig"], sig_message(r, _parents_all(db, r["id"]), signer)))
         if r["type"] == "key.registered":
-            kid, pub = p.get("key_id"), p.get("pubkey_b64", "")
+            kid, pub, role = p.get("key_id"), p.get("pubkey_b64", ""), p.get("role", "user")
             try:
-                good_id = key_id_for(unb64(pub), p.get("role", "user")) == kid
+                good_id = key_id_for(unb64(pub), role) == kid
             except Exception:
                 good_id = False
-            if not good_id or p.get("alg") != "ed25519":
-                problems.append(f"key.registered at seq {r['seq']} is malformed"); continue
-            if not keys and p.get("role") == "user":
-                valid = signer == kid == p.get("certified_by") and ok(pub)
-            else:
-                c = keys.get(p.get("certified_by"))
-                valid = signer == p.get("certified_by") and c and c["role"] == "user" and c["revoked_hlc"] is None and ok(c["pub"])
-            if not valid:
+            if not good_id or p.get("alg") != "ed25519" or role not in KEY_ROLES or kid in keys:
+                problems.append(f"key.registered at seq {r['seq']} is malformed or a duplicate"); continue
+            info = {"pub": pub, "role": role, "seq": r["seq"], "certified_by": p.get("certified_by"), "active": True,
+                    "revoked_hlc": None, "revoked_seq": None, "revoked_by": None, "device_id": p.get("device_id")}
+            if signer != p.get("certified_by"):
+                problems.append(f"key.registered at seq {r['seq']}: signer is not the certifier"); continue
+            if not keys and role == "user":
+                if signer != kid or not (HAVE_CRYPTO and r["ssig"] and _verify(pub, r["ssig"], sig_message(
+                        r, _parents_all(db, r["id"]), signer))):
+                    problems.append(f"key.registered for {kid} at seq {r['seq']} has an invalid self-signature"); continue
+                keys[kid] = info; last.update(seq=r["seq"], kind="first-user", user=kid, rk=p.get("recovery_key_id"))
+                continue
+            if not ok(sk):
                 problems.append(f"key.registered for {kid} at seq {r['seq']} has an invalid signature/certification"); continue
-            keys[kid] = {"pub": pub, "role": p.get("role", "user"), "seq": r["seq"], "revoked_hlc": None,
-                         "device_id": p.get("device_id")}
+            if role == "user" and sk["role"] == "user" and signer == active_user():
+                info["active"] = False                     # pending until a dual-signed key.rotated
+                keys[kid] = info
+            elif role == "user" and sk["role"] == "recovery" and sk["active"]:
+                keys[kid] = info                           # recover: atomic takeover by the recovery key
+                for u, uk in list(keys.items()):
+                    if uk["role"] == "user" and u != kid and uk["revoked_seq"] is None:
+                        revoke(u, r, r["hlc"], keep=(kid,))
+                revoke(signer, r, r["hlc"], keep=(kid,))
+                last.update(seq=r["seq"], kind="recover", user=kid, rk=p.get("recovery_key_id")); continue
+            elif role == "recovery" and signer == active_user() and last["seq"] == r["seq"] - 1 and last["rk"] == kid and (
+                    last["kind"] == "recovery-self-revoke" or (last["kind"] in ("first-user", "recover")
+                                                               and last["user"] == signer)) and not any(
+                    k["role"] == "recovery" and k["revoked_seq"] is None for k in keys.values()):
+                keys[kid] = info
+            elif role == "device" and signer == active_user():
+                keys[kid] = info
+            else:
+                problems.append(f"key.registered for {kid} ({role}) at seq {r['seq']} is not allowed by the key rules")
         elif r["type"] == "key.rotated":
             old, new = keys.get(p.get("old_key_id")), keys.get(p.get("new_key_id"))
-            if not (old and new and signer == p.get("old_key_id") and ok(old["pub"]) and p.get("new_key_sig")
+            if not (old and new and signer == p.get("old_key_id") and signer == active_user() and ok(old)
+                    and new["role"] == "user" and not new["active"] and new["revoked_seq"] is None
+                    and new["certified_by"] == signer and p.get("new_key_sig")
                     and _verify(new["pub"], p["new_key_sig"], rotation_message(p["old_key_id"], p["new_key_id"]))):
-                problems.append(f"key.rotated at seq {r['seq']} is not signed by both keys"); continue
+                problems.append(f"key.rotated at seq {r['seq']} is not valid (dual signature / pending new key)"); continue
+            new["active"] = True
+            revoke(p["old_key_id"], r, r["hlc"], keep=(p["new_key_id"],))
         elif r["type"] == "key.revoked":
-            k = keys.get(signer)
-            if not (k and ok(k["pub"]) and p.get("key_id") in keys):
-                problems.append(f"key.revoked at seq {r['seq']} has an invalid signature"); continue
-            keys[p["key_id"]]["revoked_hlc"] = p.get("effective_hlc")
+            tk = keys.get(p.get("key_id"))
+            eff = r["hlc"] if p.get("effective_hlc") in (None, "", "now") else p["effective_hlc"]
+            # Data Systems N1: only an explicit compromised:true revocation may reach back before its own HLC
+            backdated = eff < r["hlc"] and p.get("compromised") is not True
+            allowed = tk and tk["revoked_seq"] is None and not backdated and ok(sk) and (
+                (sk["role"] == "recovery" and p["key_id"] == signer) or
+                (sk["role"] == "user" and signer == active_user() and tk["role"] == "device" and tk["certified_by"] == signer))
+            if not allowed:
+                problems.append(f"key.revoked at seq {r['seq']} is not allowed or has an invalid signature"); continue
+            revoke(p["key_id"], r, min(eff, r["hlc"]))
+            if sk["role"] == "recovery":
+                last.update(seq=r["seq"], kind="recovery-self-revoke", user=None, rk=p.get("recovery_key_id")); continue
     return keys, problems
+
+
+def _sig_valid(k, row):
+    """May key `k` have signed event `row`? Active keys: yes. Pending keys: never. Revoked keys: only before the
+    revocation in BOTH log position and HLC (HLC alone is chosen by the signer), or on the revoking event itself."""
+    if k["revoked_seq"] is None:
+        return k["active"]
+    if row["id"] == k["revoked_by"]:
+        return True
+    return row["seq"] < k["revoked_seq"] and row["hlc"] < k["revoked_hlc"]
 
 
 def rotation_message(old_kid, new_kid):
@@ -237,39 +324,61 @@ def local_key_registered(db, kid):
     return db.execute("SELECT 1 FROM events WHERE type='key.registered' AND json_extract(payload,'$.key_id')=?", (kid,)).fetchone()
 
 
-def register_user_key(db, actor=None, confirm=None):
-    """Register the local user key with a self-signed key.registered event (first key only). `confirm(fingerprint)`
-    must return True (the CLI shows the fingerprint on the TTY). Returns (key_id, created)."""
+def register_user_key(db, actor=None, confirm=None, on_code=None):
+    """Register the local user key with a self-signed key.registered event (first key only) AND, in the same
+    transaction, a recovery key (ADR 0012: there is never a window without a live recovery key). `confirm(fingerprint)`
+    must return True (the CLI shows the fingerprint on the TTY). `on_code(code)` receives the one-time recovery code
+    (the CLI prints it to the TTY only); without it the code is discarded (fail-safe: nobody, including a thief, can
+    add another recovery key). Returns (key_id, created)."""
     import vault
     priv, kid = load_user_key()
     vault.ensure_sig_schema(db)
     if local_key_registered(db, kid):
         return kid, False
     if db.execute("SELECT 1 FROM events WHERE type='key.registered'").fetchone():
-        raise SignatureError("a different user key is already registered in this vault; rotation (key.rotated, signed by "
-                             "both keys) has no CLI yet (docs/adr/0011-signing-keys.md)")
+        raise SignatureError("a different user key is already registered in this vault; use `vault keys rotate` (with the "
+                             "current key) or `vault keys recover` (with the recovery code), docs/adr/0012-key-lifecycle.md")
     pub = pub_raw(priv)
     if confirm is not None and not confirm(fingerprint(pub)):
         raise SignatureError("fingerprint not confirmed; nothing registered")
-    eid, _ = vault.append(db, "key.registered", f"key:{kid}", {"key_id": kid, "alg": "ed25519", "pubkey_b64": b64(pub),
-                          "role": "user", "certified_by": kid}, actor or vault.HUMAN, "verified")
-    vault.audit(db, actor or vault.HUMAN, "key_register", "accepted", f"user key {kid} registered", eid)
+    code = _new_code()
+    rkid = key_id_for(pub_raw(_recovery_priv(code)), "recovery")
+    try:
+        eid, _ = vault.append(db, "key.registered", f"key:{kid}", {"key_id": kid, "alg": "ed25519", "pubkey_b64": b64(pub),
+                              "role": "user", "certified_by": kid, "recovery_key_id": rkid}, actor or vault.HUMAN, "verified",
+                              commit=False, _rebuild=False)
+        rk = _register(db, (priv, kid), _recovery_priv(code), "recovery", actor or vault.HUMAN, commit=False)
+        db.commit()
+    except BaseException:
+        db.rollback(); raise
+    vault.audit(db, actor or vault.HUMAN, "key_register", "accepted", f"user key {kid} + recovery key {rk} registered", eid)
+    if on_code:
+        on_code(code)
     return kid, True
+
+
+# (priv, key_id) override used only inside rotate_user_key / recover_with_code; never set from the environment.
+_SIGNER = None
 
 
 def sign_row(db, row, parents):
     """Sign a new event row with the local user key. The key must be registered (or this is its own key.registered)."""
-    priv, kid = load_user_key()
+    priv, kid = _SIGNER or load_user_key()
     if row["type"] == "key.registered":
         p = json.loads(row["payload"])
         if p.get("certified_by") != kid:
             raise SignatureError("key.registered must be signed by its certifying key (the local user key)")
+    if row["type"] == "key.registered" and p.get("key_id") == kid:
+        pass                                  # self-signed first registration (register_user_key)
     elif not local_key_registered(db, kid):
         raise SignatureError(f"user key {kid} is not registered in this vault; run `vault keys init-user`")
-    elif row["type"] != "key.revoked":
+    else:
         k = registered_keys(db)[0].get(kid)
-        if not k or (k["revoked_hlc"] and row["hlc"] >= k["revoked_hlc"]):
-            raise SignatureError(f"user key {kid} is revoked or invalid in this vault")
+        if not k or k["revoked_seq"] is not None or not k["active"]:
+            raise SignatureError(f"key {kid} is revoked, pending or invalid in this vault (after `vault keys rotate`, point "
+                                 "VAULT_USER_KEY at the new key file)")
+        if k["role"] != "user" and row["type"] not in ("key.registered", "key.revoked"):
+            raise SignatureError(f"{k['role']} key {kid} may only sign key.registered / key.revoked")
     return kid, b64(priv.sign(sig_message(row, parents, kid)))
 
 
@@ -308,8 +417,12 @@ def classify(db, ranges=None, keys=None):
                 st = "signed"
             elif not _verify(k["pub"], r["ssig"], sig_message(r, _parents_all(db, r["id"]), r["skid"])):
                 st = "bad-signature"
-            elif k["revoked_hlc"] and r["hlc"] >= k["revoked_hlc"]:
-                st = "revoked-key"
+            elif not targets_match(db, r["id"]):
+                st = "targets-mismatch"
+            elif not _sig_valid(k, r):
+                st = "revoked-key" if k["revoked_seq"] is not None else "unknown-key"   # pending keys never sign
+            elif k["role"] != "user" and r["type"] not in ("key.registered", "key.revoked"):
+                st = "wrong-role-key"
             else:
                 st = "signed"
         elif ep is None or r["seq"] < ep:
@@ -325,7 +438,7 @@ def classify(db, ranges=None, keys=None):
     return out
 
 
-BAD = ("bad-signature", "unknown-key", "revoked-key", "unsigned")
+BAD = ("targets-mismatch", "bad-signature", "unknown-key", "revoked-key", "wrong-role-key", "unsigned")
 
 
 def unsigned_after_epoch(db):
@@ -379,6 +492,172 @@ def sign_legacy(db, confirm, actor=None, chunk=200):
     return out
 
 
+# ---------- rotation, revocation, offline recovery code (docs/adr/0012-key-lifecycle.md) ----------
+def _append_signed(db, signer, type_, subject, payload, actor, commit=True):
+    """Append one key.* event signed by `signer` (priv, key_id) instead of the VAULT_USER_KEY file."""
+    import vault
+    global _SIGNER
+    prev, _SIGNER = _SIGNER, signer
+    try:
+        if not commit:
+            return vault.append(db, type_, subject, payload, actor, "verified", commit=False, _rebuild=False)[0]
+        return vault.append(db, type_, subject, payload, actor, "verified")[0]
+    finally:
+        _SIGNER = prev
+
+
+def _priv_kid(priv, role="user"):
+    return priv, key_id_for(pub_raw(priv), role)
+
+
+def _register(db, signer, priv, role, actor, commit=True, recovery_key_id=None):
+    kid = key_id_for(pub_raw(priv), role)
+    p = {"key_id": kid, "alg": "ed25519", "role": role, "pubkey_b64": b64(pub_raw(priv)), "certified_by": signer[1]}
+    if recovery_key_id:
+        p["recovery_key_id"] = recovery_key_id
+    _append_signed(db, signer, "key.registered", f"key:{kid}", p, actor, commit=commit)
+    return kid
+
+
+def _revoke(db, signer, kid, reason, actor, commit=True, recovery_key_id=None):
+    import vault
+    # "now" = the revocation event's own HLC: signatures by `kid` from here on are invalid, earlier ones stay valid
+    p = {"key_id": kid, "effective_hlc": "now", "reason": reason, "compromised": False}
+    if recovery_key_id:
+        p["recovery_key_id"] = recovery_key_id
+    return _append_signed(db, signer, "key.revoked", f"key:{kid}", p, actor, commit=commit)
+
+
+def _new_code():
+    raw = os.urandom(20)
+    code = base64.b32encode(raw).decode()
+    return "-".join(code[i:i + 4] for i in range(0, len(code), 4))
+
+
+def _anchor_or_warn(db, key=None):
+    """Write the anchor after a key change; say so loudly if it was skipped (e.g. the new key is not usable here)."""
+    if write_anchor(db, key=key) is None and HAVE_CRYPTO:
+        print("warning: external anchor NOT refreshed after the key change (no usable active user key in this "
+              "process); run a human command with the new VAULT_USER_KEY", file=sys.stderr)
+
+
+def _current_user_key(db):
+    priv, kid = load_user_key()
+    k = registered_keys(db)[0].get(kid)
+    if not k or k["role"] != "user" or not k["active"]:
+        raise SignatureError(f"local key {kid} is not the active user key of this vault")
+    return priv, kid
+
+
+def rotate_user_key(db, new_path, actor=None):
+    """key.registered(new, pending, certified by old) + key.rotated (signed by old, new_key_sig by new). The rotation
+    activates the new key and revokes the old one plus every non-recovery key it certified (pending/device keys). The
+    recovery key stays live. The new key is written to `new_path` (O_EXCL). Returns (old_kid, new_kid)."""
+    import vault
+    actor = actor or vault.HUMAN
+    old = _current_user_key(db)
+    if os.path.abspath(new_path) == os.path.abspath(key_path()):
+        raise SignatureError("--new-key must be a new path, not the current VAULT_USER_KEY")
+    generate_user_key(new_path)
+    new = load_user_key(new_path)
+    _register(db, old, new[0], "user", actor)
+    _append_signed(db, old, "key.rotated", f"key:{new[1]}", {"old_key_id": old[1], "new_key_id": new[1],
+                   "new_key_sig": b64(new[0].sign(rotation_message(old[1], new[1])))}, actor)
+    vault.audit(db, actor, "key_rotate", "accepted", f"user key {old[1]} rotated to {new[1]}")
+    _anchor_or_warn(db, key=new)
+    return old[1], new[1]
+
+
+def revoke_key(db, kid, reason, actor=None):
+    """Revoke a device key certified by the active user key. Not retroactive. (Recovery keys are replaced with the old
+    code via new_recovery_code; the user key itself is replaced via rotate.)"""
+    import vault
+    actor = actor or vault.HUMAN
+    me = _current_user_key(db)
+    keys = registered_keys(db)[0]
+    if kid == me[1]:
+        raise SignatureError("refusing to revoke the local key itself; use `vault keys rotate`")
+    if kid not in keys or keys[kid]["revoked_seq"] is not None:
+        raise SignatureError(f"{kid} is not a registered, unrevoked key")
+    if keys[kid]["role"] != "device" or keys[kid]["certified_by"] != me[1]:
+        raise SignatureError("the user key may only revoke device keys it certified; replace a recovery code with "
+                             "`vault keys recovery-code --replace` (needs the old code)")
+    eid = _revoke(db, me, kid, reason, actor)
+    vault.audit(db, actor, "key_revoke", "accepted", f"key {kid} revoked", eid)
+    return eid
+
+
+def _recovery_priv(code):
+    norm = "".join(ch for ch in code.upper() if ch.isalnum())
+    try:
+        raw = base64.b32decode(norm)
+    except Exception:
+        raise SignatureError("malformed recovery code") from None
+    if len(raw) != 20:
+        raise SignatureError("malformed recovery code")
+    return Ed25519PrivateKey.from_private_bytes(hashlib.sha256(RECOVERY_DOMAIN + raw).digest())
+
+
+def new_recovery_code(db, actor=None, old_code=None):
+    """Replace the live recovery code: the OLD recovery key revokes itself and the active user key registers the new
+    recovery key, in ONE transaction (ADR 0012). Without the old code nothing happens; a user key alone can never add
+    a recovery key. Returns (new code shown ONCE, new recovery key id)."""
+    import vault
+    _need()
+    actor = actor or vault.HUMAN
+    me = _current_user_key(db)
+    live = [kid for kid, k in registered_keys(db)[0].items() if k["role"] == "recovery" and k["revoked_seq"] is None]
+    if not old_code:
+        raise SignatureError("replacing the recovery code needs the old code (--replace). A lost live code cannot be "
+                             "replaced; vaults without any recovery key must be re-initialised (ADR 0012)")
+    rec = _priv_kid(_recovery_priv(old_code), "recovery")
+    if rec[1] not in live:
+        raise SignatureError("old recovery code does not match the live recovery key")
+    code = _new_code()
+    try:
+        _revoke(db, rec, rec[1], "replaced by a new recovery code", actor, commit=False,
+                recovery_key_id=key_id_for(pub_raw(_recovery_priv(code)), "recovery"))
+        kid = _register(db, me, _recovery_priv(code), "recovery", actor, commit=False)
+        db.commit()
+    except BaseException:
+        db.rollback(); raise
+    vault.audit(db, actor, "key_recovery_code", "accepted", f"recovery key {rec[1]} replaced by {kid}")
+    _anchor_or_warn(db)
+    return code, kid
+
+
+def recover_with_code(db, code, new_path, actor=None):
+    """Lost user key: the recovery key registers a NEW user key (written to new_path). That event atomically revokes
+    every other user key, the keys they certified, and the recovery key itself (one-time); the same transaction
+    registers a fresh recovery key. Returns (new user key id, new recovery code shown ONCE)."""
+    import vault
+    _need()
+    actor = actor or vault.HUMAN
+    rec = _priv_kid(_recovery_priv(code), "recovery")
+    k = registered_keys(db)[0].get(rec[1])
+    if not k or k["role"] != "recovery" or k["revoked_seq"] is not None:
+        raise SignatureError("recovery code does not match a registered, unused recovery key")
+    generate_user_key(new_path)
+    new = load_user_key(new_path)
+    code = _new_code()
+    try:   # one transaction: new user key (revokes the rest) + a fresh recovery key, no window without recovery
+        _register(db, rec, new[0], "user", actor, commit=False,
+                  recovery_key_id=key_id_for(pub_raw(_recovery_priv(code)), "recovery"))
+        rk = _register(db, new, _recovery_priv(code), "recovery", actor, commit=False)
+        db.commit()
+    except BaseException:
+        db.rollback()
+        _CACHE.pop(os.path.abspath(new_path), None)
+        try:
+            os.remove(new_path)           # the transaction failed: do not leave an unregistered key file behind
+        except OSError:
+            pass
+        raise
+    vault.audit(db, actor, "key_recover", "accepted", f"recovered: new user key {new[1]}, new recovery key {rk}")
+    _anchor_or_warn(db, key=new)
+    return new[1], code
+
+
 # ---------- external anchor ----------
 def anchor_path(db_path):
     db_path = os.path.abspath(db_path)
@@ -386,6 +665,16 @@ def anchor_path(db_path):
     if os.environ.get("VAULT_ANCHOR_PATH") and env_db and os.path.abspath(env_db) == db_path:
         return os.environ["VAULT_ANCHOR_PATH"]
     return os.path.join(config_dir(), "anchors", hashlib.sha256(db_path.encode()).hexdigest()[:16] + ".anchor.json")
+
+
+def anchor_paths(db_path):
+    """Primary anchor plus the optional, user-chosen second location VAULT_ANCHOR_PATH2 (same VAULT_DB rule)."""
+    out = [anchor_path(db_path)]
+    env_db = os.environ.get("VAULT_DB")
+    p2 = os.environ.get("VAULT_ANCHOR_PATH2")
+    if p2 and env_db and os.path.abspath(env_db) == os.path.abspath(db_path) and os.path.abspath(p2) != os.path.abspath(out[0]):
+        out.append(p2)
+    return out
 
 
 def _heads(db):
@@ -398,26 +687,33 @@ def _db_path(db):
     return db.execute("PRAGMA database_list").fetchone()[2]
 
 
-def write_anchor(db):
+def write_anchor(db, key=None):
     """Write the signed chain heads atomically (0600) next to the config dir. Silently skipped when the user key is not
     available in this process (e.g. the MCP server) or not registered in this vault. Returns the path or None."""
     p = _db_path(db)
     if not p or not HAVE_CRYPTO:
         return None
-    k = try_user_key()
+    k = key or try_user_key()
     if not k:
         return None
     priv, kid = k
     try:
-        if not local_key_registered(db, kid):
-            return None
+        rk = registered_keys(db)[0].get(kid)
+        if not rk or rk["role"] != "user" or not rk["active"]:
+            return None    # unregistered, revoked (rotated away) or non-user key: never anchors
     except Exception:
         return None
     ev, au = _heads(db)
     body = {"v": 1, "db": os.path.abspath(p), "events": ev, "audit": au, "key_id": kid,
             "written_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     body["sig"] = b64(priv.sign(ANCHOR_DOMAIN + canon(body).encode()))
-    path = anchor_path(p)
+    paths = anchor_paths(p)
+    for path in paths:
+        _write_atomic(path, body)
+    return paths[0]
+
+
+def _write_atomic(path, body):
     d = os.path.dirname(os.path.abspath(path))
     os.makedirs(d, mode=0o700, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=".anchor.", dir=d)
@@ -434,14 +730,13 @@ def write_anchor(db):
         if os.path.exists(tmp):
             os.remove(tmp)
         raise
-    return path
 
 
 def remove_anchor(db_path):
     """Human-approved reset (restore of an older backup is an intentional rollback)."""
-    p = anchor_path(db_path)
-    if os.path.exists(p):
-        os.remove(p)
+    for p in anchor_paths(db_path):
+        if os.path.exists(p):
+            os.remove(p)
 
 
 def check_anchor(db, keys=None):
@@ -449,7 +744,18 @@ def check_anchor(db, keys=None):
     p = _db_path(db)
     if not p:
         return [], []
-    path = anchor_path(p)
+    if keys is None:
+        keys, _ = registered_keys(db)
+    errors, warnings = [], []
+    for i, path in enumerate(anchor_paths(p)):
+        e, w = _check_one_anchor(db, p, path, keys)
+        if i and w and not e and os.path.exists(anchor_paths(p)[0]):
+            w = [f"VAULT_ANCHOR_PATH2 is set but {path} is missing (it will be written on the next commit)"]
+        errors += e; warnings += w
+    return errors, warnings
+
+
+def _check_one_anchor(db, p, path, keys):
     if not os.path.exists(path):
         return [], [f"no external anchor at {path} (first open, or the anchor was deleted); truncation/rollback "
                     "cannot be detected until one is written"]
@@ -459,8 +765,6 @@ def check_anchor(db, keys=None):
         sig = a.pop("sig")
     except (OSError, ValueError, KeyError) as e:
         return [f"anchor {path} unreadable ({type(e).__name__})"], []
-    if keys is None:
-        keys, _ = registered_keys(db)
     k = keys.get(a.get("key_id"))
     pub = None
     local = try_user_key() if not USER_KEY_DISABLED else None
@@ -473,6 +777,8 @@ def check_anchor(db, keys=None):
         return [f"anchor signed by key {a.get('key_id')} which is not registered in this vault"], []
     if HAVE_CRYPTO and not _verify(pub, sig, ANCHOR_DOMAIN + canon(a).encode()):
         return ["anchor signature invalid"], []
+    if k and (k["role"] != "user" or not k["active"]):
+        return [f"anchor {path} is signed by a revoked or non-user key {a.get('key_id')}"], []
     if a.get("db") != os.path.abspath(p):
         errors.append(f"anchor belongs to {a.get('db')}, not this vault")
     for table, key, h in (("events", "seq", a.get("events", {})), ("audit", "id", a.get("audit", {}))):

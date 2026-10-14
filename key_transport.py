@@ -13,7 +13,10 @@ versioned `vaultkeys/0.1` bundle next to the unchanged `vaultsync/0.1` event pac
   subject, the encrypted event ids, sender and recipient device ids, recipient KA fingerprint and the signing key id.
 * The whole bundle (including every ciphertext) is signed by the user key (BUNDLE_DOMAIN). No unsigned field is used.
 * The recipient re-wraps each DEK under its own KEK. Shredded or pending-destroy keys are never sent and never
-  accepted; a synced, applied `subject.shredded` event destroys the local copy (apply_remote_shreds).
+  accepted; a synced, applied `subject.shredded` puts the local copy into pending_destroy with the local grace
+  period (apply_remote_shreds), unless its origin is revoked for key transport.
+* The sender device id is NOT cryptographically authenticated: every device holding the user key can sign a
+  certificate for any device id. Device-level authentication needs per-device signing keys (vaultsync/0.2).
 * Anything that does not verify is recorded in `sync_key_quarantine` (ids and reasons only, no key material) and
   not imported (fail closed).
 """
@@ -51,6 +54,9 @@ CREATE TABLE IF NOT EXISTS sync_key_quarantine (      -- ids and reasons only; n
 CREATE TABLE IF NOT EXISTS sync_key_imports (
   bundle_sha256 TEXT NOT NULL, key_id TEXT NOT NULL, sender_device TEXT NOT NULL,
   at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), PRIMARY KEY (bundle_sha256, key_id));
+CREATE TABLE IF NOT EXISTS sync_shred_handled (       -- synced subject.shredded events already acted on (once each)
+  event_id TEXT PRIMARY KEY, key_id TEXT, action TEXT NOT NULL,
+  at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
 CREATE TRIGGER IF NOT EXISTS sync_ka_peers_no_update BEFORE UPDATE ON sync_ka_peers BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER IF NOT EXISTS sync_ka_peers_no_delete BEFORE DELETE ON sync_ka_peers BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER IF NOT EXISTS sync_ka_revoked_no_update BEFORE UPDATE ON sync_ka_revoked BEGIN SELECT RAISE(ABORT,'append-only'); END;
@@ -453,32 +459,52 @@ def import_keys(db, path, actor=vault.HUMAN):
 
 
 # ---------------------------------------------------------------- shred propagation
+def shred_grace_days():
+    return float(os.environ.get("VAULT_SHRED_GRACE_DAYS", "7"))   # same default as `vault shred --confirm`
+
+
 def apply_remote_shreds(db):
-    """Destroy local DEKs named by applied `subject.shredded` events (e.g. synced from a paired device). Only events
-    in the log count (quarantined ones are not in `events`). Returns the destroyed key ids."""
-    if not HAVE_CRYPTO:
+    """Handle applied `subject.shredded` events that came from another device (sync_imported). Each is handled once
+    (sync_shred_handled, vault.db):
+    * origin device revoked for key transport -> ignored, recorded in sync_key_quarantine (key stays live);
+    * otherwise the local DEK is put into `pending_destroy` with the local grace period. It is NOT destroyed here:
+      `vault shred-finalize <subject>` (ops.shred_finalize) destroys it after the grace period and writes the usual
+      redactions row; `vault shred-cancel` keeps it.
+    Runs after the events are committed (keys.db is a separate database); it is idempotent and re-run on every
+    sync-import / quarantine release, so an interrupted run is completed by the next one. Returns the scheduled key ids."""
+    if not HAVE_CRYPTO or not db.execute("SELECT 1 FROM sqlite_master WHERE name='sync_imported'").fetchone():
         return []
-    ids = _shredded_ids(db)
-    if not ids:
+    ensure_schema(db)
+    todo = [(r[0], r[1], r[2], json.loads(r[3]).get("key_id")) for r in db.execute(
+        "SELECT e.id, e.subject, i.origin_device, e.payload FROM events e JOIN sync_imported i ON i.event_id=e.id "
+        "WHERE e.type='subject.shredded' AND e.id NOT IN (SELECT event_id FROM sync_shred_handled) ORDER BY e.seq")]
+    if not todo:
         return []
     import crypto_keys
     try:
         ks = vault.keystore(db)
     except (crypto_keys.KeystoreMissing, FileNotFoundError):
-        return []
-    live = [r[0] for r in ks.db.execute("SELECT key_id FROM subject_keys WHERE wrapped_dek IS NOT NULL")
-            if r[0] in ids]
-    if not live:
-        return []
-    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        ks = None
+    revoked, scheduled, handled = _revoked(db), [], []
+    for eid, subj, origin, kid in todo:
+        if origin in revoked:
+            handled.append((eid, kid, "ignored: origin revoked"))
+            _q(db, "-", origin, kid, "subject.shredded from a device revoked for key transport: ignored")
+            continue
+        row = ks.db.execute("SELECT subject, state, wrapped_dek IS NOT NULL FROM subject_keys WHERE key_id=?", (kid,)).fetchone() \
+            if ks else None
+        if row and row[2] and row[1] == "active":
+            ks.schedule_destroy(row[0], shred_grace_days(), f"sync:{origin}")   # commits keys.db
+            scheduled.append(kid); handled.append((eid, kid, "pending_destroy"))
+        else:
+            handled.append((eid, kid, "no live local key" if not row or not row[2] else f"already {row[1]}"))
     try:
-        for kid in live:
-            ks.db.execute("UPDATE subject_keys SET wrapped_dek=NULL, state='destroyed', shredded_at=?, "
-                          "requested_by='sync:subject.shredded' WHERE key_id=?", (now, kid))
-        ks.db.commit()
+        for eid, kid, action in handled:
+            db.execute("INSERT OR IGNORE INTO sync_shred_handled(event_id, key_id, action) VALUES(?,?,?)", (eid, kid, action))
+        db.commit()
     except Exception:
-        ks.db.rollback(); raise
-    ks.db.execute("VACUUM")
-    vault.rebuild(db)
-    vault.audit(db, vault.HUMAN, "sync_shred_applied", "accepted", f"{len(live)} key(s) destroyed after synced shred")
-    return live
+        db.rollback(); raise
+    if scheduled:
+        vault.audit(db, vault.HUMAN, "sync_shred_scheduled", "accepted",
+                    f"{len(scheduled)} key(s) pending destroy after synced shred (grace {shred_grace_days()}d)")
+    return scheduled

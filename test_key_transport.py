@@ -172,11 +172,57 @@ class KeyTransportTest(unittest.TestCase):
         self.assertEqual(s["keys"], 1); self.assertEqual(s["skipped"][0]["key_id"], kid)
         self.assertNotIn(kid, open(p).read().split('"entries"')[1])
         r = self.sync_events(self.A, self.B)          # signed subject.shredded from a paired device is applied
-        self.assertEqual(r["destroyed_keys"], [kid])
+        self.assertEqual(r["pending_destroy_keys"], [kid])  # not destroyed at once: local grace period
+        ksb = vault.keystore(self.B)
+        self.assertEqual(ksb.info("person:ayse")["state"], "pending_destroy")
+        self.assertEqual(self.payload(self.B, e1)[0]["pin"], "4711-gizli")   # still readable during the grace period
+        self.assertEqual(self.sync_events(self.A, self.B).get("pending_destroy_keys"), None)   # handled once
+        with self.assertRaisesRegex(ValueError, "grace"):
+            ops.shred_finalize(self.B, "person:ayse")
+        ksb.db.execute("UPDATE subject_keys SET destroy_after=0 WHERE key_id=?", (kid,)); ksb.db.commit()
+        self.assertEqual(ops.shred_finalize(self.B, "person:ayse"), kid)   # the existing local mechanism destroys it
         self.assertEqual(self.payload(self.B, e1), (None, "redacted"))
         self.assertEqual(self.payload(self.B, e2)[0]["pin"], "9999-gizli")
-        ksb = vault.keystore(self.B)
         self.assertIsNone(ksb.db.execute("SELECT wrapped_dek FROM subject_keys WHERE key_id=?", (kid,)).fetchone()[0])
+        rows = self.B.execute("SELECT kind, key_id FROM redactions").fetchall()   # same records as a local shred
+        self.assertEqual([tuple(r) for r in rows], [("shred", kid)])
+        self.assertEqual(ops.doctor(self.B)["checks"]["shredded_but_readable"], 0)
+
+    def test_remote_shred_can_be_cancelled_locally(self):
+        self.secret(); self.sync_events(self.A, self.B); self.ready(); kt.import_keys(self.B, self.bundle())
+        ops.shred_confirm(self.A, "person:ayse", 0); time.sleep(0.01); ops.shred_finalize(self.A, "person:ayse")
+        self.sync_events(self.A, self.B)
+        ops.shred_cancel(self.B, "person:ayse")
+        self.sync_events(self.A, self.B)              # not re-scheduled: each synced shred is handled once
+        self.assertEqual(vault.keystore(self.B).info("person:ayse")["state"], "active")
+
+    def test_shred_from_revoked_origin_ignored(self):
+        """Regression (review M1): a revoked device's shred must not touch the receiver's keys."""
+        eid = self.secret(subject="person:ayse")
+        self.sync_events(self.A, self.B); self.ready()
+        kid = kt.import_keys(self.B, self.bundle())["imported"][0]
+        kt.revoke_peer(self.B, self.da, "lost phone")
+        ops.shred_confirm(self.A, "person:ayse", 0); time.sleep(0.01); ops.shred_finalize(self.A, "person:ayse")
+        rep = self.sync_events(self.A, self.B)
+        self.assertNotIn("destroyed_keys", rep); self.assertNotIn("pending_destroy_keys", rep)
+        row = vault.keystore(self.B).db.execute("SELECT wrapped_dek IS NOT NULL, state FROM subject_keys WHERE key_id=?",
+                                                (kid,)).fetchone()
+        self.assertEqual(tuple(row), (1, "active"))
+        self.assertEqual(self.payload(self.B, eid)[0]["pin"], "4711-gizli")
+        self.assertTrue(any("revoked" in q["reason"] and q["key_id"] == kid for q in kt.quarantined(self.B)))
+
+    def test_interrupted_shred_handling_is_retried(self):
+        self.secret(); self.sync_events(self.A, self.B); self.ready(); kt.import_keys(self.B, self.bundle())
+        ops.shred_confirm(self.A, "person:ayse", 0); time.sleep(0.01); ops.shred_finalize(self.A, "person:ayse")
+        from unittest import mock
+        p = self.path("p.vaultsync"); sync.export(self.A, p)
+        with mock.patch.object(kt, "apply_remote_shreds", side_effect=RuntimeError("crash")):
+            with self.assertRaises(RuntimeError):
+                sync.import_package(self.B, p)        # events committed, shred handling did not run
+        self.assertEqual(vault.keystore(self.B).info("person:ayse")["state"], "active")
+        r = sync.import_package(self.B, p)            # next import (all duplicates) completes it
+        self.assertEqual(r["duplicate"], r["events"]); self.assertEqual(len(r["pending_destroy_keys"]), 1)
+        self.assertEqual(vault.keystore(self.B).info("person:ayse")["state"], "pending_destroy")
 
     def test_shredded_key_never_reimported(self):
         self.secret(); self.sync_events(self.A, self.B); self.ready()

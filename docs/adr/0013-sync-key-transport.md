@@ -25,7 +25,7 @@ weakening crypto-shredding or the quarantine model (ADR 0008, 0011, 0012).
    An all-zero shared secret is refused. AAD = `lattice-key-wrap-aad/v1\n || canon({v, bundle_id, key_id, subject,
    event_ids, sender_device, recipient_device, recipient_ka_fp, signer_key_id})`. Because DEKs are per subject, the
    "event id" binding is the exact list of encrypted events the key is sent for. This is not RFC 9180 wire format;
-   the library's HPKE API is not available at our minimum `cryptography>=42`.
+   it is built from long-stable primitives (minimum `cryptography>=49`); moving to RFC 9180 HPKE is possible later.
 5. **Everything signed.** The whole bundle (all metadata, the sender's certificate, every ephemeral key and ciphertext)
    is signed by the active user key over `lattice-key-bundle-sig/v1\n || canon(bundle without signature)`. The
    importer verifies the signature before reading any other field, then requires: recipient device and KA fingerprint
@@ -40,11 +40,24 @@ weakening crypto-shredding or the quarantine model (ADR 0008, 0011, 0012).
    is skipped. Both are recorded in `sync_key_quarantine` (bundle hash, sender, key id, reason; never key material).
    Re-importing the same bundle later (e.g. after the events have been synced) re-evaluates it.
 8. **Revocation / unpaired.** `export` refuses a recipient that is not paired, is revoked (`vault sync-keys
-   revoke-peer`, append-only table) or has no valid certificate. `import` refuses bundles from such senders.
+   revoke-peer`, append-only table) or has no valid certificate. `import` refuses bundles that *name* such a sender.
+   The sender device id is **not cryptographically authenticated**: the bundle and the sender certificate are signed
+   by the user key, which every device holds, so any holder of the user key can claim any paired device id. A DEK is
+   still only accepted if it opens the listed events and its key id is not already present. Device-level
+   authentication needs per-device signing keys (vaultsync/0.2). `revoke-peer` is therefore **not** a protection
+   against a compromised user key (e.g. a lost device): rotate the user key (`vault keys rotate`); signatures by the
+   revoked key are then refused.
 9. **Shredding.** Export skips keys that are destroyed, `pending_destroy` or named by a `subject.shredded` event.
-   When a user-signed `subject.shredded` from a paired device is applied by `sync-import` (or released from quarantine),
-   the receiver destroys its copy of that DEK immediately (no second grace period; the origin already had one), and an
-   old bundle can never bring it back. A pending (not finalized) shred on the origin does not propagate.
+   A user-signed `subject.shredded` from another device that is applied by `sync-import` (or released from quarantine)
+   does **not** destroy the receiver's DEK. It moves the key to `pending_destroy` with the local grace period
+   (`VAULT_SHRED_GRACE_DAYS`, default 7, as `vault shred --confirm`). The existing local mechanism finishes it:
+   `vault shred-finalize SUBJECT` after the grace period (destroys the DEK, writes the `redactions` row and a local
+   `subject.shredded`, as for a local shred), or `vault shred-cancel SUBJECT`. Each synced shred event is handled
+   once (`sync_shred_handled`), so a cancel is not undone by the next import. A shred whose origin device is revoked for
+   key transport is ignored and recorded in `sync_key_quarantine`. An old bundle can never bring a shredded key back.
+   Shred handling runs right after the events are committed (keys.db is a separate database, so one transaction is not
+   possible); it is idempotent and re-run on every `sync-import` and quarantine release, so an interrupted run is
+   completed by the next one (tested). A pending (not finalized) shred on the origin does not propagate.
 10. **CLI.** `vault sync-keys init|cert|add-peer|revoke-peer|export|import|quarantine`; all but `quarantine` are
     human-only (TTY). Output contains ids and fingerprints only.
 

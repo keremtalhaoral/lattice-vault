@@ -4,6 +4,10 @@
 > **Prototype — do not use in production.** This is an experimental, single-user, local-only research
 > prototype. It has not been audited, its on-disk format will change, and several security controls are
 > *detection only* or *planned*. See [SECURITY.md](SECURITY.md) before storing anything you care about.
+>
+> **No independent security audit has been performed** on this prototype. Store real personal data only
+> after you have completed a successful restore drill (`./vault backup` → `./vault restore … --to` a
+> fresh path, verified; see [docs/backup-restore.md](docs/backup-restore.md)).
 
 Lattice Vault is a local, append-only memory vault for one person that several AI assistants can read
 and *propose* additions to over the [Model Context Protocol](https://modelcontextprotocol.io) (MCP).
@@ -164,14 +168,26 @@ via `/proc/<pid>/environ` by the same OS user. Never commit MCP client configs.
 | `VAULT_ALLOW_NONTTY` | **tests only**: bypasses the TTY gate for human commands |
 
 ## Status and limits
-Implemented vs planned is tracked per decision in [docs/adr/](docs/adr/). Not built: multi-device sync,
-signed events/approvals, external integrity anchor, OS-keychain key storage. Known limits are in
+Implemented vs planned is tracked per decision in [docs/adr/](docs/adr/).
+
+**Multi-device sync — experimental, CLI-only, file-based** (`sync.py`, [docs/sync.md](docs/sync.md)):
+`./vault sync-pair` registers another device of the owner, `./vault sync-export --out FILE` writes new
+events to a `.vaultsync` package, and `./vault sync-import FILE` verifies and merges one. You move the
+package yourself; there is **no network transport and no automatic/background sync**. Per-device
+signatures and key (`keys.db`/KEK) synchronization are **not built yet**, so do not rely on it for real
+data across several devices.
+
+Not built: network/automatic sync, per-device signing and key sync, signed events/approvals, external
+integrity anchor, OS-keychain key storage. Known limits are in
 [SECURITY.md](SECURITY.md). Changes: [CHANGELOG.md](CHANGELOG.md).
 
 ## Türkçe özet
 Lattice Vault, tek kullanıcılı, yerel, yalnız-ekleme (append-only) bir hafıza kasası prototipidir. AI
 asistanlar MCP üzerinden okur ve yalnız *öneri* yazar; doğrulanmış içerik yalnız insan onayıyla oluşur.
-Arama Türkçe karakter katlamalıdır (`ı/i`, `ş/s` …). **Prototiptir; üretimde kullanmayın.**
+Arama Türkçe karakter katlamalıdır (`ı/i`, `ş/s` …). **Prototiptir; üretimde kullanmayın.** Bağımsız bir güvenlik denetiminden **geçmemiştir**; gerçek kişisel veriyi
+yalnızca başarılı bir geri yükleme tatbikatından (restore drill) sonra saklayın. Çok cihazlı senkronizasyon
+deneysel, yalnızca CLI ve dosya tabanlıdır (`.vaultsync`); ağ/otomatik senkronizasyon yok, cihaz başına
+imza ve anahtar senkronizasyonu henüz yok.
 
 ## License
 Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).

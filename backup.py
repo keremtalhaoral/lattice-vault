@@ -42,6 +42,24 @@ def _sqlite_copy(src_path, dst_path):
     os.chmod(dst_path, 0o600)
 
 
+def _strip_derived(path):
+    """Drop derived tables (decrypted plaintext of sensitive fields) from a backup copy and VACUUM it, so a vault
+    backup holds only ciphertext for encrypted fields and a later shred is not undone by it (docs/adr/0014)."""
+    c = sqlite3.connect(path)
+    try:
+        c.execute("PRAGMA secure_delete=ON")
+        for t in vault.PROJ_TABLES + ["url_cache"]:
+            c.execute(f"DROP TABLE IF EXISTS {t}")
+        # review_queue holds human verdicts that are NOT in the log, so it is kept. Entry rows hold the stored event
+        # payload (sensitive fields are {"$enc": key_id} placeholders there); claim rows hold text the user passed in
+        # (e.g. a context pack, which may contain decrypted values): their text is dropped, item/verdict are kept.
+        if c.execute("SELECT 1 FROM sqlite_master WHERE name='review_queue'").fetchone():
+            c.execute("UPDATE review_queue SET text=NULL WHERE kind='claim'")
+        c.commit(); c.execute("VACUUM")
+    finally:
+        c.close()
+
+
 def integrity(conn):
     return {"integrity_check": [r[0] for r in conn.execute("PRAGMA integrity_check")],
             "quick_check": [r[0] for r in conn.execute("PRAGMA quick_check")]}
@@ -181,6 +199,7 @@ def backup(db, out_dir, include_keys=False):
         db.commit()
         vpath = os.path.join(out_dir, "vault.db")
         _sqlite_copy(src, vpath)
+        _strip_derived(vpath)   # projections / caches hold decrypted plaintext: never in a backup (restore rebuilds)
         files = {"vault.db": _sha256_file(vpath)}
         c = sqlite3.connect(vpath)
         n = c.execute("SELECT count(*) FROM events").fetchone()[0]

@@ -242,6 +242,24 @@ class KeyStore:
         self.db.execute("VACUUM")
         return i["key_id"]
 
+    # -- used by shredding.reconcile (the log decides; these only apply the decision, each in one transaction)
+    def destroy(self, kid):
+        """Destroy one DEK now (wrapped_dek NULL, state destroyed), then VACUUM (secure_delete is ON)."""
+        self.db.execute("UPDATE subject_keys SET wrapped_dek=NULL, state='destroyed', shredded_at=COALESCE(shredded_at, ?) "
+                        "WHERE key_id=?", (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), kid))
+        self.db.commit()
+        self.db.execute("VACUUM")
+
+    def set_pending(self, kid, destroy_after, requested_by):
+        self.db.execute("UPDATE subject_keys SET state='pending_destroy', destroy_after=?, requested_by=? "
+                        "WHERE key_id=? AND wrapped_dek IS NOT NULL", (destroy_after, requested_by, kid))
+        self.db.commit()
+
+    def set_active(self, kid):
+        self.db.execute("UPDATE subject_keys SET state='active', destroy_after=NULL, requested_by=NULL "
+                        "WHERE key_id=? AND wrapped_dek IS NOT NULL AND state='pending_destroy'", (kid,))
+        self.db.commit()
+
     def all_keys(self):
         return [dict(zip(("key_id", "subject", "state", "has_dek"), r)) for r in
                 self.db.execute("SELECT key_id, subject, state, wrapped_dek IS NOT NULL FROM subject_keys")]

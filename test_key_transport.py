@@ -231,7 +231,7 @@ class KeyTransportTest(unittest.TestCase):
         self.assertEqual(self.payload(self.B, eid)[0]["pin"], "4711-gizli")
         d = ops.doctor(self.B)
         self.assertTrue(d["ok"], d["problems"])
-        a = self.B.execute("SELECT actor FROM audit WHERE action='sync_shred_reconciled'").fetchall()
+        a = self.B.execute("SELECT actor FROM audit WHERE action='shred_reconciled'").fetchall()
         self.assertEqual({r[0] for r in a}, {kt.SYSTEM_ACTOR})
 
     def test_crash_between_finalize_and_redactions_row_healed(self):
@@ -278,7 +278,10 @@ class KeyTransportTest(unittest.TestCase):
         self.assertEqual(self.payload(self.B, eid)[0]["pin"], "4711-gizli")
         self.assertTrue(any("revoked" in q["reason"] and q["key_id"] == kid for q in kt.quarantined(self.B)))
         self.sync_events(self.A, self.B)
-        self.assertEqual(sum("revoked" in q["reason"] for q in kt.quarantined(self.B)), 1)   # noted once
+        n = sum("revoked" in q["reason"] for q in kt.quarantined(self.B))
+        self.assertEqual(n, 2)          # schedule + shred from the revoked device, each noted once
+        self.sync_events(self.A, self.B); vault.connect(os.path.join(self.d, "b", "v.db")).close()
+        self.assertEqual(sum("revoked" in q["reason"] for q in kt.quarantined(self.B)), n)
         self.assertEqual(kt.shred_problems(self.B), [])
 
     def test_interrupted_shred_handling_is_retried(self):

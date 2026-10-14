@@ -70,12 +70,14 @@ access to an unlocked machine, a compromised Python interpreter or dependency.
   Measured on a 10k-event synthetic vault (`bench_open.py`, median of 15): steady-state open 1.3 ms before
   this change, 14.1 ms with K=4, 6.9 ms with K=0, 40 ms with K=16. Doctor went from 0.66 s to 0.93 s.
 - **Signed human-only events.** `event.approved/rejected/reverted/redacted`, `import.batch_approved`,
-  `subject.shredded`, `conflict.resolved`, and the key/attestation events (`key.registered`, `key.rotated`,
+  `subject.shredded`, `conflict.resolved`, the shred lifecycle events (`subject.shred_scheduled`,
+  `subject.shred_cancelled`), and the key/attestation events (`key.registered`, `key.rotated`,
   `key.revoked`, `attestation.recorded`) are signed with the owner's Ed25519 key (contract in
   docs/adr/0011-signing-keys.md). The private key is a PKCS8 PEM file outside the DB (`VAULT_USER_KEY`, mode 0600,
   owned by you, no symlinks; optional `VAULT_USER_KEY_PASSPHRASE`). Create and register it with `vault keys init-user`,
   which confirms the fingerprint on the TTY. An OS-keychain backend is **(planned)**. New unsigned human-only events are
-  refused by `append()`, by a trigger, and on open. Events written before the first key registration are
+  refused by `append()`, by a trigger, and on open (the two shred lifecycle types are not in the trigger SQL; their
+  signatures are checked in code, see docs/adr/0014-crypto-shredding.md). Events written before the first key registration are
   `legacy-unsigned`: accepted, but flagged by doctor. `vault sign-legacy` (interactive TTY only) re-attests them with
   new signed `attestation.recorded` events. Old rows are never rewritten. The MCP server and `vault propose`
   never load the user key.
@@ -115,9 +117,13 @@ access to an unlocked machine, a compromised Python interpreter or dependency.
   Signed bundle sequence numbers (N2) and the age vs HPKE-style decision (N3) must be closed before real user data. `sync-keys revoke-peer` is not a protection
   against a compromised user key (the sender device id is not cryptographically authenticated); rotation is required.
 - Sync: the real device id is written into `replica_id` at write time (until then, verify against `origin_row`).
-  Device keys are certified by the user key. Retroactive revocation needs `compromised:true`, a user signature and a
+  Device key-agreement (X25519) keys are certified by the user key (implemented, ADR 0013); per-device signing keys
+  are **(planned)** (vaultsync/0.2). Retroactive revocation needs `compromised:true`, a user signature and a
   human decision. Anchors are kept per device / per origin chain. `vaultsync/0.2` carries `key.*` events; until
-  then, unsigned remote human-only events are to be quarantined (today, those from paired devices are only flagged).
+  then, `key.*` events are never applied via sync. Remote human-only events are applied only with a valid signature
+  from a user key registered on this vault and a paired origin device; unsigned `user:*` events and anything else that
+  fails verification are quarantined (`sync_quarantine`), also from paired devices. `vault sync-quarantine --release`
+  re-verifies them.
 
 ## Known limitations
 - **Same-OS-user tampering is detectable, not preventable.** An attacker who can read the user key file can

@@ -89,7 +89,7 @@ class ImportTest(unittest.TestCase):
         # events themselves stay unverified; 'verified' is derived
         self.assertEqual(self.db.execute("SELECT trust FROM events WHERE id=?", (first,)).fetchone()[0], "unverified")
         with self.assertRaises(sqlite3.DatabaseError):   # only a human can batch-approve
-            vault.append(self.db, "import.batch_approved", "x", {}, "import:markdown", "unverified", target_ids=[first])
+            vault.append(self.db, "import.batch_approved", "x", {"import_id": "x", "confirmed_block_ids": []}, "import:markdown", "unverified", target_ids=[first])
 
     def test_partial_import_rolls_back(self):
         real = vault.append; calls = {"n": 0}

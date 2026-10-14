@@ -3,6 +3,12 @@ All notable changes to this project are documented here. Format: [Keep a Changel
 
 ## [Unreleased]
 ### Added
+- Event schema registry + upcasters (`schemas.py`, docs/schema-evolution.md). Every emitted type has a
+  current `schema_version` and a declarative validator. `append()` validates and stamps the version, and MCP
+  `propose_event` refuses invalid payloads and unknown types with a `schema: …` error. Upcasters run in memory on
+  read (rebuild, history, pack, export-context, show, `get_event`), and stored events are never rewritten.
+  Events newer than the code are tolerated, excluded from projections (status `unknown_version`) and reported
+  by `vault doctor`. The human CLI may still add unregistered types, with a warning.
 - `vault export-context`: MCP-fallback Context Pack (`lattice-context/v1`, Markdown + YAML front matter) of
   approved facts only, with `[encrypted]`/`[redacted]` placeholders, deterministic output, token budget and a
   `vault_update` template. See docs/context-pack.md. `vault pack` is unchanged.

@@ -533,6 +533,12 @@ def rebuild(db):
             c = plain[e["id"]]
             if r in plain and "field" in c:
                 eff.setdefault(r, dict(plain[r]))[c["field"]] = c.get("new_value")
+    # forked correction chains (only possible after a sync merge; local writes refuse double supersede): flag, never LWW
+    kids = {}
+    for e in events:
+        if e["type"] == "event.corrected" and active(e["id"]) and e["id"] in root_of:
+            kids.setdefault(root_of[e["id"]], []).append(e["id"])
+    forked_roots = {root(p) for p, ks in kids.items() if len(ks) > 1}
     # superseded-by-active set (heads)
     superseded = set()
     for e in events:
@@ -546,6 +552,9 @@ def rebuild(db):
     for tbl, col in (("proj_preferences", "subject, key"), ("proj_decisions", "decision_id")):
         db.execute(f"""UPDATE {tbl} SET conflict=1 WHERE ({col}) IN
                        (SELECT {col} FROM {tbl} GROUP BY {col} HAVING COUNT(*) > 1)""")
+    for r in sorted(forked_roots):
+        for tbl in ("proj_preferences", "proj_decisions"):
+            db.execute(f"UPDATE {tbl} SET conflict=1 WHERE event_id=?", (r,))
     last = events[-1]["seq"] if events else 0
     for name, v in sorted(PROJ_VERSIONS.items()):
         db.execute("INSERT INTO proj_meta VALUES(?,?,?)", (name, v, last))
@@ -721,7 +730,7 @@ def pack(db, profile="full", max_chars=None, include_unverified=False):
 
 # ---------- CLI ----------
 HUMAN_CMDS = {"add", "approve", "reject", "correct", "revert", "import-approve", "revert-import", "redact",
-              "shred-cancel", "shred-finalize", "agent-add", "agent-revoke", "review-verdict", "migrate"}
+              "shred-cancel", "shred-finalize", "agent-add", "agent-revoke", "review-verdict", "migrate", "sync-pair"}
 
 
 def _tip(db, event_id):
@@ -781,6 +790,13 @@ def main(argv=None):
     rv.add_argument("item"); rv.add_argument("verdict", choices=["supported", "unsupported"])
     rq = sp.add_parser("review-enqueue", help="citation check: run citation check and queue flagged + sample (human CLI only)")
     rq.add_argument("--sample-pct", type=float)
+    sx = sp.add_parser("sync-export", help="write new events to a .vaultsync package"); sx.add_argument("--out", required=True)
+    sx.add_argument("--since-peer", help="only events that DEVICE has not yet sent/acknowledged (watermark)")
+    si = sp.add_parser("sync-import", help="verify + merge a .vaultsync package"); si.add_argument("file")
+    si.add_argument("--dry-run", action="store_true")
+    sp.add_parser("device-id", help="show (create on first use) this vault's stable device id")
+    spr = sp.add_parser("sync-pair", help="register another device of the owner (human-only)")
+    spr.add_argument("device"); spr.add_argument("--name", required=True)
     args = ap.parse_args(argv)
     try:
         if args.cmd in HUMAN_CMDS or (args.cmd == "shred" and args.confirm):
@@ -885,6 +901,16 @@ def main(argv=None):
         elif args.cmd == "shred-finalize":
             import ops
             print(json.dumps({"destroyed_key": ops.shred_finalize(db, args.subject)}))
+        elif args.cmd in ("sync-export", "sync-import", "device-id", "sync-pair"):
+            import sync
+            if args.cmd == "device-id":
+                print(sync.device_id(db))
+            elif args.cmd == "sync-pair":
+                sync.pair(db, args.device, args.name); print(f"paired {args.device}")
+            elif args.cmd == "sync-export":
+                print(json.dumps(sync.export(db, args.out, args.since_peer), ensure_ascii=False))
+            else:
+                print(json.dumps(sync.import_package(db, args.file, dry_run=args.dry_run), ensure_ascii=False))
         elif args.cmd in ("review-queue", "review-verdict", "review-enqueue"):
             import citation_check as cc
             if args.cmd == "review-enqueue":
@@ -897,7 +923,7 @@ def main(argv=None):
     except Exception as e:
         if type(e).__name__ not in ("Refused", "ValueError", "OperationalError", "IntegrityError", "DatabaseError",
                                     "JSONDecodeError", "TamperError", "SecretRefused", "HumanRequired", "KeyError",
-                                    "FileExistsError", "Shredded", "CryptoUnavailable", "PermissionError"):
+                                    "FileExistsError", "Shredded", "SyncError", "CryptoUnavailable", "PermissionError"):
             raise
         print(f"error: {e}", file=sys.stderr); return 1
     return 0

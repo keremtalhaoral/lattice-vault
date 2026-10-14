@@ -1,6 +1,6 @@
 # ADR 0008 (D-008): Multi-device sync via file-based packages
 - **Status:** Proposed
-- **Implementation:** Planned, not implemented (schema tables `replicas`, `sync_peer_state` reserved)
+- **Implementation:** Prototype on branch feat/sync-prototype (see docs/sync.md); signing, encryption, key sync planned
 
 ## Context
 The vault should eventually be usable from a second device without running a server.

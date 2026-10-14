@@ -11,7 +11,8 @@ History must be complete and tamper-evident, and approvals/corrections must neve
 deterministically. Approval, rejection, revert and correction are separate events (`event.approved`,
 `event.rejected`, `event.reverted`, `event.corrected`) linked via `event_targets` / `event_parents`
 (no foreign keys). Events and audit rows are hash-chained and verified on open.
-Journal mode is DELETE with `secure_delete=ON` (not WAL).
+Journal mode is DELETE with `secure_delete=ON` (not WAL), `synchronous=FULL`, `busy_timeout=5000`
+(re-confirmed 2026-10-14, see docs/backup-restore.md).
 
 ## Alternatives
 Mutable rows with a status column; WAL mode (rejected for now: a `-wal` file can retain redacted pages).

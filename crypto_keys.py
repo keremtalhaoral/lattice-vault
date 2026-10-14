@@ -55,6 +55,7 @@ class KeyStore:
         self.kek_path = os.environ.get("VAULT_KEK_FILE", os.path.join(base, "keys.kek"))
         self.db = sqlite3.connect(self.path)
         _secure_file(self.path)
+        self.db.execute("PRAGMA busy_timeout=5000"); self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("PRAGMA journal_mode=DELETE"); self.db.execute("PRAGMA secure_delete=ON")
         self.db.executescript(SCHEMA)
         self.kek, self.kek_id = self._kek()

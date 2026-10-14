@@ -95,7 +95,10 @@ export VAULT_DB=$HOME/.local/share/lattice-vault/vault.db
 ./vault redact <event_id> --out redacted.db --reason ...   # copy-to-new-file; source left untouched
 ./vault shred user:ada --preview; ./vault shred user:ada --confirm --grace-days 7
 ./vault shred-cancel user:ada; ./vault shred-finalize user:ada
-./vault doctor                           # triggers, hash chains, projection drift, keys, blocklist
+./vault doctor                           # triggers, hash chains, integrity_check, projection drift, keys, blocklist
+./vault backup --out DIR                 # vault.db + manifest, never keys.db (docs/backup-restore.md)
+./vault backup-keys --out DIR2           # keys.db only (wrapped); keep apart from vault backups
+./vault restore DIR --to PATH [--keys DIR2] [--force]  # verified restore drill
 ./vault migrate old.db new.db            # schema migration by copy
 ```
 Run `./vault -h` and `./vault <command> -h` for all options.

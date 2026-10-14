@@ -46,7 +46,8 @@ projections with an in-memory rebuild and checks keys and the blocklist. This de
 
 Storage settings: `journal_mode=DELETE` and `secure_delete=ON` (not WAL), so no `-wal` file keeps old pages
 after a redaction or shred. Files are created with umask 077 / mode 0600. Schema changes are applied by
-copying to a new file: `vault migrate old.db new.db`.
+copying to a new file: `vault migrate old.db new.db`. `busy_timeout=5000`, `synchronous=FULL`;
+backup/restore: [backup-restore.md](backup-restore.md).
 
 Notes:
 - There is no `status` column; status is derived into `proj_status`

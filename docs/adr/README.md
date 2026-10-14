@@ -11,3 +11,4 @@ Numbers match the project's internal decision log (D-003 … D-010); earlier num
 | [0008](0008-multi-device-sync.md) | Multi-device sync via file packages | Proposed | Planned, not implemented |
 | [0009](0009-markdown-import-trust.md) | Markdown import trust rules | Accepted | Implemented |
 | [0010](0010-unsupported-claim-check.md) | Unsupported-claim (citation) check | Accepted | Partially implemented |
+| [0011](0011-signing-keys.md) | User signing key, signed human-only events, external anchor; device keys reserved | Accepted (user key) / Proposed (device keys) | Partially implemented (no device keys / package signing) |

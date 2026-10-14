@@ -1,7 +1,8 @@
 # Security Policy
 
 > **Prototype — do not use in production.** This document describes what the code in this repository
-> actually does today. Items marked **(planned)** do not exist yet.
+> actually does today. Items marked **(planned)** do not exist yet. The project has **not** had an independent
+> security audit.
 
 ## Reporting a vulnerability
 - Please report privately via **GitHub private vulnerability reporting** (repository → *Security* →
@@ -52,9 +53,29 @@ access to an unlocked machine, a compromised Python interpreter or dependency.
   humans can override with `--force` (audited). The filter is heuristic; entropy-based detection is planned.
 - **Files.** umask 077; database, keys, agents, snapshots and ops log are created 0600.
 - **Integrity (detection, not prevention).** Every event and audit row is SHA-256 hash-chained (encrypted
-  fields are hashed as ciphertext). On every open, `connect()` verifies triggers and both chains and
-  **raises** instead of silently repairing; `vault doctor` reports drift, orphan keys and blocklist violations.
-- **Human gate.** Approve/reject/correct/revert/import-approve/redact/shred require an interactive TTY.
+  fields are hashed as ciphertext; an event's Ed25519 signature is bound into its hash). On every open, `connect()`
+  verifies the triggers, the chains from the last verified checkpoint to the head, **K random older segments**
+  (`VAULT_VERIFY_SAMPLE_K`, default 4 × `VAULT_VERIFY_SEGMENT`=64 rows), the signatures in those ranges, a
+  whole-log check that no post-epoch human-only event lacks a signature, the key registry, and the external anchor.
+  It **raises** instead of silently repairing. `vault doctor` verifies everything from genesis, records
+  `last_full_verify`, and open warns when that is older than `VAULT_FULL_VERIFY_DAYS` (default 30).
+  Measured on a 10k-event synthetic vault (`bench_open.py`, median of 15): steady-state open 1.3 ms before
+  this change, 14.1 ms with K=4, 6.9 ms with K=0, 40 ms with K=16. Doctor went from 0.66 s to 0.93 s.
+- **Signed human-only events.** `event.approved/rejected/reverted/redacted`, `import.batch_approved`,
+  `subject.shredded`, `conflict.resolved`, and the key/attestation events (`key.registered`, `key.rotated`,
+  `key.revoked`, `attestation.recorded`) are signed with the owner's Ed25519 key (contract in
+  docs/adr/0011-signing-keys.md). The private key is a PKCS8 PEM file outside the DB (`VAULT_USER_KEY`, mode 0600,
+  owned by you, no symlinks; optional `VAULT_USER_KEY_PASSPHRASE`). Create and register it with `vault keys init-user`,
+  which confirms the fingerprint on the TTY. An OS-keychain backend is **(planned)**. New unsigned human-only events are
+  refused by `append()`, by a trigger, and on open. Events written before the first key registration are
+  `legacy-unsigned`: accepted, but flagged by doctor. `vault sign-legacy` (interactive TTY only) re-attests them with
+  new signed `attestation.recorded` events. Old rows are never rewritten. The MCP server and `vault propose`
+  never load the user key.
+- **External anchor.** After each append/audit commit, the events and audit chain heads plus the `key_id` are signed
+  and written atomically (0600) outside the DB (`VAULT_ANCHOR_PATH`, default
+  `<config dir>/anchors/<id>.anchor.json`). On open, a DB that is behind the anchor (truncation or rollback) or has a
+  different hash at the anchored position is an error. A missing anchor is a warning. `vault restore` resets the
+  anchor (an intentional rollback).
 - **Encryption and crypto-shredding.** Fields marked sensitive are encrypted with AES-256-GCM using a
   per-subject data key (AAD = `event_id|key_id`) stored wrapped in a separate `keys.db`; sensitive fields
   never enter full-text search, `text_norm` or audit reasons. The key-encryption key is a 0600 file
@@ -69,18 +90,30 @@ access to an unlocked machine, a compromised Python interpreter or dependency.
 - **Ops log.** JSON lines to a 0600 file with an allowlist of fields; never vault content or tokens.
 
 ## Known limitations
-- **Same-OS-user tampering is detectable, not preventable.** Anyone who can write the files as you can
-  rewrite the database and **recompute the hash chain**; there is no keyed MAC or external anchor.
-- **Tail truncation.** Removing the newest events (and audit rows) leaves a valid shorter chain and is not
-  detected. An external anchor is **(planned)**.
-- **TTY gate bypass.** `VAULT_ALLOW_NONTTY=1` (for tests) disables the TTY check, and any same-user process
-  can allocate a pseudo-terminal. The TTY gate is a speed bump, not authentication. Ed25519-signed human
-  approvals are **(planned)**.
+- **Same-OS-user tampering is detectable, not preventable.** An attacker who can read the user key file can
+  sign anything, including approvals and a fresh anchor, so they can rewrite the DB and re-sign both consistently.
+  Without the key, a rewrite is detected through the anchor and the signatures, unless the anchor is deleted (then
+  open only warns).
+- **Rollback of both files together** (DB + anchor restored from the same older copy) is **not detected**
+  (test `test_known_limit_rollback_of_both_files_undetected`). The anchor is local: it is neither synced nor remote.
+- **Anchor lag.** The anchor is written only by processes that hold the user key. Events written by the MCP server
+  after the last human command are not anchored, so they can be truncated undetected until the next human command.
+- **Open-time check is probabilistic below the checkpoint.** A modified row below the checkpoint that falls outside
+  the K sampled segments is not caught at open, only by `vault doctor` (test
+  `test_known_limit_unsampled_tamper_not_caught_on_open`). The checkpoint, `last_full_verify` and the key registry live
+  in the DB.
+- **Legacy events and TOFU.** Human-only events from before signing are accepted (flagged). The first user key is
+  trusted on first use. Someone with DB write access *before* `keys init-user` could plant events that look legacy,
+  or register their own key first. Check the fingerprint shown by `keys init-user`.
+- **Sync-imported human-only events** are stored unsigned (`remote-unsigned`, flagged). Package/device signing is
+  **(planned)** (ADR 0011).
+- **Key rotation** has no CLI yet (`key.rotated` verification exists). Losing the key file blocks new human-only events.
+- **TTY gate.** Any same-user process can allocate a pseudo-terminal.
 - **DNS rebinding.** The citation check resolves and validates addresses, then lets `urllib` connect;
   the connection is not pinned to the validated address, so a rebinding DNS server could race it.
 - **`/proc/<pid>/environ`.** Tokens or passphrases passed via environment variables are visible to the same user.
-- **No signed sync.** Multi-device sync (`.vaultsync` packages), package signing/encryption, and
-  cross-device propagation of redactions are **(planned)**; sync tables exist in the schema but are unused.
+- **No signed sync.** Package signing (device keys, ADR 0011), package encryption, and
+  cross-device propagation of redactions are **(planned)**.
 - **KDF.** Passphrases use scrypt because Argon2id is not in the Python standard library or the
   `cryptography` baseline used here; Argon2id is **(planned)**. The KEK file is a stand-in for an OS
   keychain **(planned)**.

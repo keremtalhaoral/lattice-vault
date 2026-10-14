@@ -3,6 +3,15 @@ All notable changes to this project are documented here. Format: [Keep a Changel
 
 ## [Unreleased]
 ### Security
+- Human-only events are signed with a user Ed25519 key (`vault keys init-user`, `VAULT_USER_KEY`). Signatures are
+  stored in `event_sigs` and bound into the event hash. New unsigned human-only events are refused. Older ones are
+  flagged as `legacy-unsigned`, and `vault sign-legacy` re-attests them. See docs/adr/0011-signing-keys.md.
+- A signed external anchor (chain heads + key_id) is written after each commit. A rollback, truncation or hash
+  mismatch fails the open.
+- Open also verifies K sampled segments below the checkpoint and nudges you to run `vault doctor` after 30 days.
+- `VAULT_ALLOW_NONTTY` works only inside the test harness.
+- `vault verify` and `vault doctor` also report signatures (signed / legacy / remote-unsigned), the key registry
+  and the anchor. `restore` resets the anchor of the target path; a fresh signed anchor is written on its first commit.
 - Restore drill 2026-10-14 fixes. `restore --keys` trial-decrypts with the target KEK (every live DEK + one
   event per key) and refuses on mismatch instead of exiting 0 with silently unreadable fields.
 - `vault doctor` checks decryptability (DEKs unwrap; sampled events, or all with `--decrypt-all`).

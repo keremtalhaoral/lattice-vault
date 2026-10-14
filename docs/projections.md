@@ -28,7 +28,10 @@ Review: DDIA review 2026-10-14, issue #2.
 - In `rebuild()`, targets and parents now load in two queries instead of one query per event (N+1).
 
 ## Limitations
-- If a row **below** the verified checkpoint is tampered with, the open-time check does not catch it. `vault doctor` catches it.
+- **Sampled segments.** Open also verifies `VAULT_VERIFY_SAMPLE_K` (default 4) random segments of `VAULT_VERIFY_SEGMENT`
+  (64) rows below the checkpoint, the signatures in the verified ranges, and the external anchor (SECURITY.md).
+  A row **below** the checkpoint and outside the sampled segments is not caught at open; `vault doctor` catches it.
+  10k events: open 1.3 ms → 14.1 ms (K=4) / 6.9 ms (K=0) (`bench_open.py`).
   The checkpoint lives in the same DB, so it is not a defense against someone who can rewrite the whole file.
   External head anchoring is review issue #6.
 - The `projection_hash` in the checkpoint is refreshed on rebuild, not on every incremental apply, because hashing all

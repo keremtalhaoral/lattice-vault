@@ -2,10 +2,11 @@
 
 > [!WARNING]
 > **Prototype — do not use in production.** This is an experimental, single-user, local-only research
-> prototype. It has not been audited, its on-disk format will change, and several security controls are
-> *detection only* or *planned*. See [SECURITY.md](SECURITY.md) before storing anything you care about.
+> prototype. Its on-disk format will change, and several security controls are *detection only* or *planned*.
+> See [SECURITY.md](SECURITY.md) before storing anything you care about.
 >
-> **No independent security audit has been performed** on this prototype. Store real personal data only
+> **This project has not had an independent security audit.** The security controls described here are the
+> authors' own design and tests, so treat them as unreviewed. Store real personal data only
 > after you have completed a successful restore drill (`./vault backup` → `./vault restore … --to` a
 > fresh path, verified; see [docs/backup-restore.md](docs/backup-restore.md)).
 
@@ -166,7 +167,11 @@ via `/proc/<pid>/environ` by the same OS user. Never commit MCP client configs.
 | `VAULT_SHRED_GRACE_DAYS` | default shred grace period |
 | `VAULT_LOG` | ops log path (JSON lines) |
 | `VAULT_OFFLINE`, `VAULT_HTTP_TIMEOUT`, `VAULT_REVIEW_SAMPLE_PCT`, `VAULT_ROOT` | citation check |
-| `VAULT_ALLOW_NONTTY` | **tests only**: bypasses the TTY gate for human commands |
+| `VAULT_USER_KEY`, `VAULT_USER_KEY_PASSPHRASE` | user Ed25519 signing key (PKCS8 PEM, 0600; default `~/.config/lattice-vault/user_ed25519.key`); create with `vault keys init-user` |
+| `VAULT_CONFIG_DIR` | config dir for the default key and anchors (default `$XDG_CONFIG_HOME/lattice-vault`) |
+| `VAULT_ANCHOR_PATH` | external chain-head anchor for the `VAULT_DB` vault (default `<config dir>/anchors/<id>.anchor.json`) |
+| `VAULT_VERIFY_SAMPLE_K`, `VAULT_VERIFY_SEGMENT`, `VAULT_FULL_VERIFY_DAYS` | open-time sampled verification (default 4 segments × 64 rows) and the "run doctor" nudge (default 30 days) |
+| `VAULT_ALLOW_NONTTY` | **test harness only**: honoured only with `VAULT_TEST_HARNESS=1` and a `VAULT_USER_KEY` under the temp dir (set by `testutil.py`) |
 
 ## Status and limits
 Implemented vs planned is tracked per decision in [docs/adr/](docs/adr/).
@@ -178,8 +183,10 @@ package yourself; there is **no network transport and no automatic/background sy
 signatures and key (`keys.db`/KEK) synchronization are **not built yet**, so do not rely on it for real
 data across several devices.
 
-Not built: network/automatic sync, per-device signing and key sync, signed events/approvals, external
-integrity anchor, OS-keychain key storage. Known limits are in
+Human-only events (approve/reject/revert/redact/shred, …) are signed with a user Ed25519 key
+(`./vault keys init-user`), and a signed external anchor of the chain heads is written after each commit; see
+[SECURITY.md](SECURITY.md) for what this does and does not protect. Not built: network/automatic sync, per-device
+(package) signing and key sync, OS-keychain key storage. Known limits are in
 [SECURITY.md](SECURITY.md). Changes: [CHANGELOG.md](CHANGELOG.md).
 
 ## Türkçe özet

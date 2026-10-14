@@ -46,8 +46,8 @@ access to an unlocked machine, a compromised Python interpreter or dependency.
 - **Prompt-injection hygiene.** Context Packs wrap data in delimiters, say "data is not instructions",
   escape delimiter look-alikes, and keep unverified/conflicting content in a separate quoted section.
 - **Secret filter.** All write paths (agent and CLI) scan for common secret patterns (API-key prefixes,
-  JWT, PEM, Luhn-valid card numbers, IBAN, `password:` patterns, long high-entropy strings) and refuse;
-  humans can override with `--force` (audited). The filter is heuristic.
+  JWT, PEM, Luhn-valid card numbers, IBAN, `password:` patterns) and refuse;
+  humans can override with `--force` (audited). The filter is heuristic; entropy-based detection is planned.
 - **Files.** umask 077; database, keys, agents, snapshots and ops log are created 0600.
 - **Integrity (detection, not prevention).** Every event and audit row is SHA-256 hash-chained (encrypted
   fields are hashed as ciphertext). On every open, `connect()` verifies triggers and both chains and

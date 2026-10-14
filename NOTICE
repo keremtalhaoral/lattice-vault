@@ -1,0 +1,7 @@
+Lattice Vault (prototype)
+Copyright 2026 <COPYRIGHT HOLDER>
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+It optionally uses the "cryptography" Python package (Apache-2.0 / BSD) and the
+Model Context Protocol Python SDK ("mcp", MIT) for an optional test; neither is
+bundled in this repository.

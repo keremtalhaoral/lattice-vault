@@ -1,0 +1,3 @@
+-r requirements.txt
+# Optional: official MCP SDK smoke test (test_mcp_server.TestSDKSmoke; expects ./.venv-sdk)
+mcp

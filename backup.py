@@ -45,12 +45,16 @@ def _sqlite_copy(src_path, dst_path):
 def _strip_derived(path):
     """Drop derived tables (decrypted plaintext of sensitive fields) from a backup copy and VACUUM it, so a vault
     backup holds only ciphertext for encrypted fields and a later shred is not undone by it (docs/adr/0014)."""
-    from ops import SNAP_DROP
     c = sqlite3.connect(path)
     try:
         c.execute("PRAGMA secure_delete=ON")
-        for t in SNAP_DROP:
+        for t in vault.PROJ_TABLES + ["url_cache"]:
             c.execute(f"DROP TABLE IF EXISTS {t}")
+        # review_queue holds human verdicts that are NOT in the log, so it is kept. Entry rows hold the stored event
+        # payload (sensitive fields are {"$enc": key_id} placeholders there); claim rows hold text the user passed in
+        # (e.g. a context pack, which may contain decrypted values): their text is dropped, item/verdict are kept.
+        if c.execute("SELECT 1 FROM sqlite_master WHERE name='review_queue'").fetchone():
+            c.execute("UPDATE review_queue SET text=NULL WHERE kind='claim'")
         c.commit(); c.execute("VACUUM")
     finally:
         c.close()

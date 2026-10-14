@@ -148,6 +148,8 @@ def reconcile(db, now=None):
     db.executescript(SCHEMA)
     try:
         ks = vault.keystore(db)
+        if getattr(ks, "db", None) is None:
+            raise crypto_keys.KeystoreMissing("no usable keystore")
     except (crypto_keys.KeystoreMissing, FileNotFoundError):
         # no keys here: nothing to destroy. Mark the events seen so open stays quiet; a later key import runs a full
         # reconcile (plan() always reads the whole log), and import refuses keys named by a shred.
@@ -205,9 +207,9 @@ def reconcile(db, now=None):
     except Exception:
         db.rollback(); raise
     if rep["destroyed"] or rep["pending"] or rep["cancelled"] or rep["records"]:
+        vault.rebuild(db)              # rebuild first (projections drop the plaintext), then VACUUM (I3)
         if rep["destroyed"]:
             db.execute("VACUUM")
-        vault.rebuild(db)
         vault.audit(db, SYSTEM_ACTOR, "shred_reconciled", "accepted",
                     f"{len(rep['pending'])} pending, {len(rep['destroyed'])} destroyed, {len(rep['cancelled'])} cancelled, "
                     f"{len(rep['records'])} record(s) written")
@@ -223,6 +225,8 @@ def problems(db, now=None):
     try:
         ks = vault.keystore(db)
     except Exception:
+        return errs, warns
+    if getattr(ks, "db", None) is None:
         return errs, warns
     now = now if now is not None else time.time()
     dec, _ = plan(db, ks, now)

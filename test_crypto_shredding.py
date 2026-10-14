@@ -107,6 +107,21 @@ class CryptoShreddingTest(_tkt.KeyTransportTest if HAVE_CRYPTO else unittest.Tes
         self.assertEqual(self.state(self.A), "active")
         self.assertEqual(self.payload(self.A, eid)[0]["value"], CANARY)
 
+    def test_backup_keeps_review_verdicts_without_plaintext(self):
+        """Review I2: review verdicts are not in the log, so backups keep them; no sensitive plaintext rides along."""
+        import citation_check as cc
+        eid = self.canary_event()
+        cc.queue_for_review(self.A, pct=100, text=f"- claim with {CANARY}")
+        cc.record_verdict(self.A, eid, "supported")
+        bk = os.path.join(self.d, "bk"); backup.backup(self.A, bk)
+        self.assertEqual(self.files_with(bk), [])
+        to = os.path.join(self.d, "r", "v.db"); os.makedirs(os.path.dirname(to))
+        backup.restore(bk, to, allow_no_keys=True)
+        vault._KEYSTORE.clear()
+        r = vault.connect(to); self.addCleanup(r.close)
+        self.assertEqual(r.execute("SELECT verdict, reviewer FROM review_queue WHERE item=?", (eid,)).fetchone()[0], "supported")
+        self.assertIsNone(r.execute("SELECT text FROM review_queue WHERE kind='claim'").fetchone()[0])
+
     # ------------------------------------------------------------------ multi-device
     def two(self):   # agent content syncs without a user signature; the sensitive field is encrypted the same way
         eid = vault.append(self.A, "learning.captured", SUBJ, {"text": "not", "value": CANARY}, "agent:bot", "unverified",

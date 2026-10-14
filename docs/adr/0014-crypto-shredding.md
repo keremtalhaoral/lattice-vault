@@ -37,7 +37,8 @@ projection tables, which hold decrypted plaintext of sensitive fields, so a late
 5. **No plaintext after finalize.** Sensitive fields are stored as ciphertext in events and are never indexed (FTS5
    uses `text_norm`, which excludes them). Their decrypted values exist only in derived projection tables, which are
    rebuilt (now `redacted`) and the file VACUUMed with `secure_delete=ON` and `journal_mode=DELETE` (no WAL). keys.db
-   gets the same. Snapshots (`pre-shred`) and now **vault backups** drop the derived tables (`SNAP_DROP`) and VACUUM, so
+   gets the same. Snapshots (`pre-shred`) drop the derived tables (`SNAP_DROP`); **vault backups** now drop the projections and
+   `url_cache` (keeping `review_queue` verdicts, see below) and VACUUM, so
    they hold only ciphertext; restore rebuilds projections. A test writes a canary into a sensitive field and scans
    every file in the vault directory (vault.db, keys.db, journals, snapshots) and a backup taken while pending.
 6. **Backups.** Restore re-applies every `subject.shredded` in the restored log to keys.db (existing), then reconcile
@@ -60,7 +61,12 @@ projection tables, which hold decrypted plaintext of sensitive fields, so a late
 - Unlinked journal/snapshot files may remain on the filesystem/SSD below SQLite (`secure_delete` covers database
   pages, not the device). Full-disk encryption is the mitigation.
 - Context Pack exports and other files the user wrote out are outside the vault and are not reached.
-- DB-level enforcement (trigger) for the two new signed types needs a schema/trigger version bump (deferred).
+- **Triggers for the two new event types come with the next schema bump.** Until then, `events_signed_types_human`
+  and `events_require_sig` do not cover `subject.shred_scheduled` / `subject.shred_cancelled`; the agent API refuses
+  `subject.*`, and reconcile, classify and the sync quarantine ignore unsigned or non-user ones (tested).
+- `review_queue` (human citation verdicts, not in the log) is kept in vault backups; entry rows hold only the stored
+  payload (placeholders for sensitive fields), claim rows lose their text in backups. In the live vault, claim text a
+  user queued from a context pack may contain decrypted values and is not removed by a shred (deferred).
 - Concurrent schedule/cancel on two devices resolves by `(hlc, id)`; no human conflict prompt yet.
 - A revoked origin's lifecycle events are ignored on receivers, but reads of a `subject.shredded` from it are refused
   until the device is revoked (ADR 0013 N9, safe direction).

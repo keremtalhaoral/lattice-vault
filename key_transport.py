@@ -514,6 +514,14 @@ def shred_problems(db):
     return out
 
 
+def _shred_record(db, eid, subj, kid, origin):
+    """redactions row for a synced shred. approved_by must be 'user:*' (table CHECK): it names the user who signed the
+    subject.shredded on the origin; the reason names the system actor that applied it here."""
+    signer = (db.execute("SELECT actor FROM events WHERE id=?", (eid,)).fetchone() or [vault.HUMAN])[0]
+    return (f"subject:{subj}", kid, signer if signer.startswith("user:") else vault.HUMAN,
+            f"crypto-shred (synced from {origin}; applied by {SYSTEM_ACTOR})")
+
+
 def reconcile_shreds(db, now=None):
     """Make every applied *synced* subject.shredded effective locally (ADR 0013 §9). Idempotent; runs on vault open,
     in doctor, after sync-import and after quarantine release. For each one:
@@ -553,7 +561,7 @@ def reconcile_shreds(db, now=None):
                         "SELECT 1 FROM redactions WHERE kind='shred' AND key_id=?", (kid,)).fetchone() and \
                         (ks.db.execute("SELECT requested_by FROM subject_keys WHERE key_id=?", (kid,)).fetchone()[0] or "").startswith("sync:"):
                     db.execute("INSERT INTO redactions(kind,scope,key_id,approved_by,reason) VALUES('shred',?,?,?,?)",
-                               (f"subject:{subj}", kid, vault.HUMAN, f"crypto-shred (synced from {origin})"))
+                               _shred_record(db, eid, subj, kid, origin))
                     rep["destroyed"].append(kid)
                 continue                                   # nothing live here
             if row[0] != subj:
@@ -570,7 +578,7 @@ def reconcile_shreds(db, now=None):
             elif row[1] == "pending_destroy" and row[2] is not None and row[2] <= now:
                 ks.finalize(subj, now=now)
                 db.execute("INSERT INTO redactions(kind,scope,key_id,approved_by,reason) VALUES('shred',?,?,?,?)",
-                           (f"subject:{subj}", kid, vault.HUMAN, f"crypto-shred (synced from {origin})"))
+                           _shred_record(db, eid, subj, kid, origin))
                 rep["destroyed"].append(kid)
         db.commit()
     except Exception:

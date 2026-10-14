@@ -247,6 +247,9 @@ class KeyTransportTest(unittest.TestCase):
         self.assertEqual([tuple(r) for r in self.B.execute("SELECT kind, key_id FROM redactions")], [("shred", kid)])
         kt.reconcile_shreds(self.B)
         self.assertEqual(self.B.execute("SELECT count(*) FROM redactions").fetchone()[0], 1)
+        by, why = self.B.execute("SELECT approved_by, reason FROM redactions").fetchone()
+        self.assertEqual(by, "user:owner")                 # the signer of the shred (table requires user:*)
+        self.assertIn(kt.SYSTEM_ACTOR, why)
 
     def test_shred_key_must_belong_to_its_subject(self):
         """Review N1: a shred naming another subject's key is not applied."""

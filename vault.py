@@ -87,7 +87,7 @@ CREATE INDEX ix_block_hash ON redacted_blocklist(content_hash);
 CREATE TABLE replicas (replica_id TEXT PRIMARY KEY, device_name TEXT NOT NULL,
   added_by TEXT NOT NULL CHECK (added_by LIKE 'user:%'), added_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
 CREATE TABLE sync_peer_state (peer_replica_id TEXT NOT NULL, origin_replica TEXT NOT NULL, max_replica_seq INTEGER NOT NULL,
-  PRIMARY KEY (peer_replica_id, origin_replica));  -- TODO(sync): signed packages; unused for now
+  PRIMARY KEY (peer_replica_id, origin_replica));  -- per-peer watermark (sync --since-peer); signed packages: docs/design/vaultsync-0.2-and-redaction-sigs.md
 CREATE TABLE import_runs (import_id TEXT PRIMARY KEY, root TEXT NOT NULL, manifest_sha256 TEXT NOT NULL,
   report TEXT NOT NULL CHECK (json_valid(report)), at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
 CREATE VIRTUAL TABLE events_fts USING fts5(
@@ -1211,7 +1211,9 @@ def main(argv=None):
     sx.add_argument("--since-peer", help="only events that DEVICE has not yet sent/acknowledged (watermark)")
     si = sp.add_parser("sync-import", help="file-based sync PROTOTYPE, not for real data: verify + merge a .vaultsync package"); si.add_argument("file")
     si.add_argument("--dry-run", action="store_true")
-    sp.add_parser("sync-quarantine", help="list synced events held in quarantine (unsigned user:*/approval events)")
+    sq = sp.add_parser("sync-quarantine", help="list synced events held in quarantine; --release re-verifies and applies those that now pass")
+    sq.add_argument("--release", nargs="*", metavar="EVENT_ID", help="re-verify (all held, or the given ids) and apply those that pass (TTY)")
+    sq.add_argument("--dry-run", action="store_true")
     sp.add_parser("device-id", help="show (create on first use) this vault's stable device id")
     spr = sp.add_parser("sync-pair", help="register another device of the owner (human-only)")
     spr.add_argument("device"); spr.add_argument("--name", required=True)
@@ -1452,7 +1454,12 @@ def main(argv=None):
             if args.cmd in ("sync-export", "sync-import", "sync-pair"):
                 print(sync.UNSUPPORTED_WARNING, file=sys.stderr)
             if args.cmd == "sync-quarantine":
-                print(json.dumps(sync.quarantined(db), ensure_ascii=False))
+                if args.release is None:
+                    print(json.dumps(sync.quarantined(db), ensure_ascii=False))
+                else:
+                    if not args.dry_run:
+                        require_human_tty("sync-quarantine --release")
+                    print(json.dumps(sync.release_quarantined(db, args.release or None, dry_run=args.dry_run), ensure_ascii=False, indent=2))
             elif args.cmd == "device-id":
                 print(sync.device_id(db))
             elif args.cmd == "sync-pair":

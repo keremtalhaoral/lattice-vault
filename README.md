@@ -200,7 +200,8 @@ package yourself; there is **no network transport and no automatic/background sy
 signatures and key (`keys.db`/KEK) synchronization are **not built yet**, so do not rely on it for real
 data across several devices. Incoming human-only events are applied only with a valid signature by a user key
 already registered on the receiving vault; everything else (unsigned, forged, unknown-key, `key.*`, `user:*`
-content, schema-invalid) is held in quarantine (`./vault sync-quarantine`) and there is no release path yet.
+content, schema-invalid) is held in quarantine (`./vault sync-quarantine`); `./vault sync-quarantine --release`
+re-verifies held events later (e.g. after the key is registered) and applies only those that now pass.
 
 Human-only events (approve/reject/revert/redact/shred, …) are signed with a user Ed25519 key
 (`./vault keys init-user`), and a signed external anchor of the chain heads is written after each commit; see

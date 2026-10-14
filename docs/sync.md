@@ -24,8 +24,10 @@ plus `origin_device`. Forwarded events (A→B→C) are re-exported from the stor
 2. For every event, recompute `event_hash(prev_hash, row)` (the same function as the local chain) and `content_hash`. Any mismatch rejects the package.
 3. Events signed with the user key carry `sig` in the body line, because the origin hash binds the signature
    (`vault.event_hash`). The receiver uses it to recompute the hash **and verifies it** (see Trust → Quarantine).
-   Accepted events are stored without a local `event_sigs` row, so doctor classifies them `remote-unsigned`
-   (docs/adr/0011-signing-keys.md); the origin row with `sig` stays in `sync_imported` and is re-exported as is.
+   Accepted events are stored without a local `event_sigs` row (the local copy's `replica_id` differs from the
+   origin's); the origin row with `sig` stays in `sync_imported` and is re-exported as is. `doctor`/`verify` re-verify
+   that origin signature and check that the origin row matches the chained local event (id, type, subject, actor,
+   hlc, payload hash, parents): `remote-signed` (ok), `remote-unsigned` (warning), `remote-mismatch` (error).
 4. **Not built:** Ed25519 package signing (`signature` is always null). SHA-256 detects corruption. It does **not** authenticate the sender:
    anyone who can write the file can recompute both hashes. Until signing exists, "paired device" is a label the
    user asserts, not something the vault proves (see the threat model / draft v0.4 K-6).
@@ -48,7 +50,9 @@ plus `origin_device`. Forwarded events (A→B→C) are re-exported from the stor
 * `replica_id='local'` is rewritten to the origin device id on import, so `(replica_id, replica_seq)` stays unique.
 * **Watermarks:** after importing from S, `sync_peer_state(peer=S, origin, max_seq)` = S's vector. `sync-export --since-peer S` sends only
   events above that. This is the knowledge "S already has these", learned from S's own package. Exports are not acknowledged, so a lost
-  package means doing a full export (always safe because import is idempotent).
+  package means doing a full export (always safe because import is idempotent). Watermarks describe what the *peer*
+  holds, so they may move past events this device quarantined; those are not lost: the full origin row is kept and
+  `vault sync-quarantine --release` re-verifies them later. Re-import reports them as `still_quarantined`.
 
 ## Conflicts (no LWW)
 These go through the existing DAG. Concurrent `preference.set` events on two devices produce two heads, so `conflict=1`, as before. Concurrent
@@ -58,8 +62,11 @@ whichever correction replays last, but the conflict flag keeps it out of the con
 
 ## Trust
 **Quarantine (until package signing exists).** Held events go to `sync_quarantine` (origin row + reason) and are
-**not** written to `events`: never projected, never verified, not re-exported. Re-import counts them as duplicates.
-List with `vault sync-quarantine`. Rules, in order:
+**not** written to `events`: never projected, not re-exported. Re-import counts them as duplicates
+(`still_quarantined`). List with `vault sync-quarantine`. **Release:** `vault sync-quarantine --release [ID ...]
+[--dry-run]` (TTY) re-runs every import check below against the *current* key registry and pairings (e.g. after
+`vault keys init-user` or `sync-pair`) and applies only the events that now pass; the quarantine row is never changed,
+the release is recorded in `sync_released` plus an audit row. There is no override for events that still fail. Rules, in order:
 * Human-only types (`vault.SIGNED_TYPES`: approve/reject/revert/batch-approve/redact/shred/conflict.resolved, `key.*`,
   `attestation.recorded`) are applied **only** if the event's `sig` verifies (`signing._verify` over
   `signing.sig_message` of the origin row) against a **user** key that is registered on this vault
@@ -103,6 +110,7 @@ vault sync-pair <device-id> --name laptop       # human-only: trust this device 
 vault sync-export --out a.vaultsync [--since-peer <device-id>]
 vault sync-import a.vaultsync [--dry-run]       # prints a JSON report (new/duplicate/quarantined/skipped)
 vault sync-quarantine                           # JSON list of held events (id, origin device, type, actor, reason)
+vault sync-quarantine --release [ID ...] [--dry-run]   # re-verify held events; apply those that now pass (TTY)
 ```
 New tables (all `CREATE TABLE IF NOT EXISTS`, created lazily by sync): `sync_device`, `sync_imported`, `sync_quarantine`, `sync_packages`.
 Reuses the reserved `replicas` and `sync_peer_state`. No existing table or trigger is changed.

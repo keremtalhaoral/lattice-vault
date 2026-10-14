@@ -1,5 +1,7 @@
 """File-based multi-device sync PROTOTYPE (`.vaultsync` packages moved by hand). See docs/sync.md.
 
+Quarantined events are kept with their full origin row and stay retryable: `vault sync-quarantine --release`
+re-verifies them against the current key registry/pairings (release_quarantined), independent of peer watermarks.
 Not for real data: packages are unsigned, there is no key sync, and redaction/shredding does not propagate.
 Human-only events are applied only with a valid user signature (signing.py, #10) from a key registered on this vault and
 a paired origin device; all other user:*/human-only events are quarantined (sync_quarantine), never applied.
@@ -28,6 +30,9 @@ CREATE TABLE IF NOT EXISTS sync_imported (            -- chain-of-imports record
 CREATE TABLE IF NOT EXISTS sync_quarantine (          -- held, NOT in events: never projected, never verified (no signing yet)
   event_id TEXT PRIMARY KEY, origin_device TEXT NOT NULL, type TEXT NOT NULL, actor TEXT NOT NULL,
   origin_row TEXT NOT NULL CHECK (json_valid(origin_row)), package_sha256 TEXT NOT NULL, reason TEXT NOT NULL,
+  at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+CREATE TABLE IF NOT EXISTS sync_released (           -- quarantine rows are never changed; a release is recorded here
+  event_id TEXT PRIMARY KEY, released_by TEXT NOT NULL CHECK (released_by LIKE 'user:%'),
   at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
 CREATE TABLE IF NOT EXISTS sync_packages (
   body_sha256 TEXT PRIMARY KEY, source_device TEXT NOT NULL, report TEXT NOT NULL CHECK (json_valid(report)),
@@ -99,11 +104,71 @@ def _quarantine_reason(db, e, row, parents_held, keys, paired):
     return _schema_problem(e)
 
 
-def quarantined(db):
+def _held_ids(db):
     if not _has(db, "sync_quarantine"):
+        return set()
+    rel = "WHERE event_id NOT IN (SELECT event_id FROM sync_released)" if _has(db, "sync_released") else ""
+    return {r[0] for r in db.execute(f"SELECT event_id FROM sync_quarantine {rel}")}
+
+
+def quarantined(db):
+    held = _held_ids(db)
+    if not held:
         return []
     return [dict(r) for r in db.execute(
-        "SELECT event_id, origin_device, type, actor, reason, package_sha256, at FROM sync_quarantine ORDER BY at, event_id")]
+        "SELECT event_id, origin_device, type, actor, reason, package_sha256, at FROM sync_quarantine ORDER BY at, event_id")
+        if r["event_id"] in held]
+
+
+def release_quarantined(db, event_ids=None, dry_run=False, actor=vault.HUMAN):
+    """Re-verify held events from their stored origin rows with the CURRENT key registry and paired devices, using the
+    same rules as import (hash, signature, pairing, parents, schema, blocklist). Only events that now pass are
+    applied; nothing is ever released without a valid check (no override). Returns a report."""
+    held = _held_ids(db)
+    want = held if not event_ids else set(event_ids)
+    unknown = sorted(want - held)
+    if unknown:
+        raise SyncError(f"not in quarantine (or already released): {unknown[0]}")
+    rows = [r for r in db.execute("SELECT * FROM sync_quarantine") if r["event_id"] in want]
+    evs = [({"origin_device": r["origin_device"], **json.loads(r["origin_row"])}, r["package_sha256"]) for r in rows]
+    evs.sort(key=lambda x: (x[0]["hlc"], x[0]["id"]))
+    me = device_id(db)
+    paired = {r[0] for r in db.execute("SELECT replica_id FROM replicas")} | {me}
+    have = {r[0] for r in db.execute("SELECT id FROM events")}
+    blocked = {r[0] for r in db.execute("SELECT content_hash FROM redacted_blocklist")} | \
+              {r[0] for r in db.execute("SELECT event_id FROM redacted_blocklist")}
+    still, keys, plan, rep = set(held), [], [], {"released": [], "still_held": {}, "dry_run": dry_run}
+    for e, pkg in evs:
+        try:
+            row = _verify_event(e)
+            why = _quarantine_reason(db, e, row, still - {e["id"]}, keys, paired)
+        except SyncError as x:
+            why = str(x)
+        if not why and any(p not in have for p, rel in e["parents"] if rel == "supersedes"):
+            why = "missing parent"
+        if not why and (e["content_hash"] in blocked or e["id"] in blocked):
+            why = "redaction blocklist"
+        if not why and e["origin_device"] not in paired and e["actor"].startswith("user:"):
+            why = "origin device is not paired"
+        if why:
+            rep["still_held"][e["id"]] = why; continue
+        still.discard(e["id"]); have.add(e["id"])
+        plan.append((e, row, pkg)); rep["released"].append(e["id"])
+    if dry_run or not plan:
+        return rep
+    try:
+        prev = (db.execute("SELECT hash FROM events ORDER BY seq DESC LIMIT 1").fetchone() or [vault.GENESIS])[0]
+        for e, row, pkg in plan:
+            local = dict(row); local.pop("_sig", None)
+            local["replica_id"] = e["origin_device"] if row["replica_id"] == "local" else row["replica_id"]
+            prev = _insert(db, e, local, prev, pkg, False)
+            db.execute("INSERT INTO sync_released(event_id, released_by) VALUES(?,?)", (e["id"], actor))
+        db.commit()
+    except Exception:
+        db.rollback(); raise
+    vault.rebuild(db)
+    vault.audit(db, actor, "sync_release", "accepted", f"released {len(plan)} re-verified event(s) from quarantine")
+    return rep
 
 
 def _has(db, name):
@@ -217,6 +282,25 @@ def _verify_event(e):
     return row
 
 
+def _insert(db, e, local, prev, package_sha256, q):
+    """Append one verified origin event locally (chained on the local log) + its sync_imported record. Returns new head."""
+    p_ = {k: v for k, v in json.loads(local["payload"]).items()}
+    local["text_norm"] = "" if local["enc_key_id"] else vault.tr_norm(
+        f"{local['type']} {local['subject']} {vault._flatten({k: v for k, v in p_.items() if k != 'provenance'})}")
+    local["prev_hash"] = prev
+    local["hash"] = prev = vault.event_hash(prev, local)
+    cols = list(vault.EVENT_HASH_FIELDS) + ["payload_ct", "text_norm", "prev_hash", "hash"]
+    db.execute(f"INSERT INTO events({','.join(cols)}) VALUES({','.join('?' * len(cols))})", [local[c] for c in cols])
+    for pid, rel in e["parents"]:
+        db.execute("INSERT OR IGNORE INTO event_parents VALUES(?,?,?)", (e["id"], pid, rel))
+    for t in e.get("targets", []):
+        db.execute("INSERT OR IGNORE INTO event_targets VALUES(?,?)", (e["id"], t))
+    orig = {k: v for k, v in e.items() if k != "origin_device"}
+    db.execute("INSERT INTO sync_imported(event_id, origin_device, origin_hash, origin_row, package_sha256, quarantined) "
+               "VALUES(?,?,?,?,?,?)", (e["id"], e["origin_device"], e["hash"], vault.canon(orig), package_sha256, int(q)))
+    return prev
+
+
 def import_package(db, path, dry_run=False, now_ms=None, _trust_unsigned=False):
     """Verify then merge a package. All-or-nothing; idempotent (union by event id).
 
@@ -227,7 +311,7 @@ def import_package(db, path, dry_run=False, now_ms=None, _trust_unsigned=False):
     me = device_id(db, create=not dry_run)
     paired = {r[0] for r in db.execute("SELECT replica_id FROM replicas")} | {me}
     have = {r[0] for r in db.execute("SELECT id FROM events")}
-    held = {r[0] for r in db.execute("SELECT event_id FROM sync_quarantine")} if _has(db, "sync_quarantine") else set()
+    held = _held_ids(db)
     rep = {"source_device": m["source_device"], "events": len(evs), "new": 0, "duplicate": 0, "quarantined": 0,
            "skipped": [], "dry_run": dry_run}
     todo, skew = [], []
@@ -236,7 +320,10 @@ def import_package(db, path, dry_run=False, now_ms=None, _trust_unsigned=False):
         if _hlc_ms(e["hlc"]) > now_ms + MAX_SKEW_MS:
             skew.append(e["id"])
         if e["id"] in have or e["id"] in held:
-            rep["duplicate"] += 1; continue
+            rep["duplicate"] += 1
+            if e["id"] in held:   # retryable: `vault sync-quarantine --release` re-verifies from the stored origin row
+                rep["still_quarantined"] = rep.get("still_quarantined", 0) + 1
+            continue
         todo.append((e, row))
     hold, rest, keys = [], [], []
     for e, row in todo:   # (hlc, id) order, so a parent is classified before its children
@@ -277,20 +364,7 @@ def import_package(db, path, dry_run=False, now_ms=None, _trust_unsigned=False):
     try:
         prev = (db.execute("SELECT hash FROM events ORDER BY seq DESC LIMIT 1").fetchone() or [vault.GENESIS])[0]
         for e, local, q in plan:
-            p_ = {k: v for k, v in json.loads(local["payload"]).items()}
-            local["text_norm"] = "" if local["enc_key_id"] else vault.tr_norm(
-                f"{local['type']} {local['subject']} {vault._flatten({k: v for k, v in p_.items() if k != 'provenance'})}")
-            local["prev_hash"] = prev
-            local["hash"] = prev = vault.event_hash(prev, local)
-            cols = list(vault.EVENT_HASH_FIELDS) + ["payload_ct", "text_norm", "prev_hash", "hash"]
-            db.execute(f"INSERT INTO events({','.join(cols)}) VALUES({','.join('?' * len(cols))})", [local[c] for c in cols])
-            for pid, rel in e["parents"]:
-                db.execute("INSERT OR IGNORE INTO event_parents VALUES(?,?,?)", (e["id"], pid, rel))
-            for t in e.get("targets", []):
-                db.execute("INSERT OR IGNORE INTO event_targets VALUES(?,?)", (e["id"], t))
-            orig = {k: v for k, v in e.items() if k != "origin_device"}
-            db.execute("INSERT INTO sync_imported(event_id, origin_device, origin_hash, origin_row, package_sha256, quarantined) "
-                       "VALUES(?,?,?,?,?,?)", (e["id"], e["origin_device"], e["hash"], vault.canon(orig), m["body_sha256"], int(q)))
+            prev = _insert(db, e, local, prev, m["body_sha256"], q)
         for e, why in hold:
             orig = {k: v for k, v in e.items() if k != "origin_device"}
             db.execute("INSERT OR IGNORE INTO sync_quarantine(event_id, origin_device, type, actor, origin_row, package_sha256, reason) "

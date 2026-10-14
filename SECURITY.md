@@ -116,8 +116,9 @@ access to an unlocked machine, a compromised Python interpreter or dependency.
 - **Legacy events and TOFU.** Human-only events from before signing are accepted (flagged). The first user key is
   trusted on first use. Someone with DB write access *before* `keys init-user` could plant events that look legacy,
   or register their own key first. Check the fingerprint shown by `keys init-user`.
-- **Sync-imported human-only events** are stored unsigned (`remote-unsigned`, flagged). Package/device signing is
-  **(planned)** (ADR 0011).
+- **Sync-imported human-only events** carry no local `event_sigs` row; doctor/verify re-verify the origin signature
+  kept in `sync_imported` (`remote-signed`). Package/device signing and redaction-stable signatures are **(planned)**
+  (docs/design/vaultsync-0.2-and-redaction-sigs.md).
 - **First key is TOFU and the key file is unencrypted by default.** Whoever registers the first self-signed user key
   becomes the root; check the fingerprint `keys init-user` shows, before anything else can write to the DB. The key
   file is a 0600 PEM, encrypted only if `VAULT_USER_KEY_PASSPHRASE` is set.

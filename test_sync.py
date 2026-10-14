@@ -288,7 +288,7 @@ class SyncTest(unittest.TestCase):
         self.assertEqual((r["new"], r["quarantined"]), (2, 2))   # agent event + approval; A's two key.registered held
         self.assertEqual(self.B.execute("SELECT status FROM proj_status WHERE event_id=?", (a,)).fetchone()[0], "active")
         self.assertNotIn(ap, self.held(self.B))
-        self.assertEqual(signing.classify(self.B)[ap][1], "remote-unsigned")   # stored unsigned locally (#10 semantics)
+        self.assertEqual(signing.classify(self.B)[ap][1], "remote-signed")   # origin signature re-verified from origin_row
         r = sync.import_package(self.B, p)                  # idempotent
         self.assertEqual((r["new"], r["quarantined"], r["duplicate"]), (0, 0, 4))
         self.assertEqual(len(sync.quarantined(self.B)), 2)
@@ -325,6 +325,85 @@ class SyncTest(unittest.TestCase):
         a, ap, p = self.approval_pkg()
         sync.import_package(C, p)
         self.assertEqual(self.held(C)[ap], "valid user signature but origin device is not paired")
+
+    # ---- step 2: re-verifiable quarantine release, remote-signed, retryable cursor ----
+    def st(self, db, eid):
+        return db.execute("SELECT status FROM proj_status WHERE event_id=?", (eid,)).fetchone()[0]
+
+    @unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
+    def test_release_after_key_registered(self):
+        a, ap, p = self.approval_pkg()
+        sync.import_package(self.B, p)
+        self.assertIn(ap, self.held(self.B))
+        r = sync.release_quarantined(self.B)                       # key still unknown: nothing released
+        self.assertEqual(r["released"], []); self.assertIn(ap, r["still_held"])
+        signing.register_user_key(self.B)
+        r = sync.release_quarantined(self.B, dry_run=True)
+        self.assertEqual(r["released"], [ap]); self.assertEqual(self.st(self.B, a), "proposed")
+        r = sync.release_quarantined(self.B)
+        self.assertEqual(r["released"], [ap])
+        self.assertTrue(any(v.startswith("key.* events") for v in r["still_held"].values()))   # A's key.registered stays held
+        self.assertEqual(self.st(self.B, a), "active")
+        self.assertNotIn(ap, self.held(self.B))
+        self.assertEqual(signing.classify(self.B)[ap][1], "remote-signed")
+        self.assertEqual(vault.verify_chains(self.B), [])
+        with self.assertRaises(sync.SyncError):                     # already released
+            sync.release_quarantined(self.B, [ap])
+        r = sync.import_package(self.B, p)                          # re-import stays a no-op
+        self.assertEqual(r["new"], 0)
+
+    @unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
+    def test_release_never_applies_unverified(self):
+        signing.register_user_key(self.B)
+        a, ap, p = self.approval_pkg()
+        self.rewrite(p, ap, lambda e: e.pop("sig"))
+        sync.import_package(self.B, p)
+        r = sync.release_quarantined(self.B, [ap])
+        self.assertEqual(r["released"], []); self.assertEqual(r["still_held"][ap], "unsigned human-only event")
+        self.assertEqual(self.st(self.B, a), "proposed")
+
+    @unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
+    def test_release_requires_paired_device(self):
+        C = self.mk("c"); signing.register_user_key(C)
+        a, ap, p = self.approval_pkg()
+        sync.import_package(C, p)
+        self.assertEqual(sync.release_quarantined(C, [ap])["released"], [])
+        sync.pair(C, self.da, "A")
+        self.assertEqual(sync.release_quarantined(C, [ap])["released"], [ap])
+
+    @unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
+    def test_reimport_reports_still_quarantined(self):
+        a, ap, p = self.approval_pkg()
+        sync.import_package(self.B, p)
+        r = sync.import_package(self.B, self.pkg(self.A, "again"))
+        self.assertGreaterEqual(r.get("still_quarantined", 0), 1)
+
+    @unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
+    def test_remote_signed_bound_to_local_row(self):
+        signing.register_user_key(self.B)
+        a, ap, p = self.approval_pkg()
+        sync.import_package(self.B, p)
+        self.assertEqual(signing.classify(self.B)[ap][1], "remote-signed")
+        import ops
+        self.assertFalse(any("remote" in w for w in ops.doctor(self.B).get("warnings", [])))
+        # origin_row is not hash-chained: editing it must not make a different event pass
+        orig = json.loads(self.B.execute("SELECT origin_row FROM sync_imported WHERE event_id=?", (ap,)).fetchone()[0])
+        orig["subject"] = "event:other"
+        self.B.execute("UPDATE sync_imported SET origin_row=? WHERE event_id=?", (vault.canon(orig), ap))
+        self.assertEqual(signing.classify(self.B)[ap][1], "remote-mismatch")
+        self.assertIn("remote-mismatch", signing.BAD)
+
+
+    @unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
+    def test_cli_release(self):
+        a, ap, p = self.approval_pkg()
+        sync.import_package(self.B, p); signing.register_user_key(self.B); self.B.commit()
+        env = {**os.environ, "VAULT_DB": os.path.join(self.d, "b", "v.db")}
+        run = lambda *x: subprocess.run([sys.executable, os.path.join(HERE, "vault.py"), *x], capture_output=True, text=True, env=env)
+        r = run("sync-quarantine", "--release", "--dry-run"); self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout)["released"], [ap])
+        r = run("sync-quarantine", "--release", ap); self.assertEqual(r.returncode, 0, r.stderr)
+        r = run("sync-quarantine"); self.assertNotIn(ap, r.stdout)
 
 
 if __name__ == "__main__":

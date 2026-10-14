@@ -393,7 +393,7 @@ def _attested(db, keys):
 
 def classify(db, ranges=None, keys=None):
     """{event_id: (seq, status)} for signed-type events; status in signed | bad-signature | unknown-key |
-    revoked-key | legacy-unsigned | legacy-attested | remote-unsigned | unsigned."""
+    revoked-key | wrong-role-key | legacy-unsigned | legacy-attested | remote-signed | remote-unsigned | remote-mismatch | unsigned."""
     import vault
     if keys is None:
         keys, _ = registered_keys(db)
@@ -429,16 +429,34 @@ def classify(db, ranges=None, keys=None):
             if att is None:
                 att = _attested(db, keys)
             st = "legacy-attested" if r["id"] in att else "legacy-unsigned"
-        elif r["replica_id"] != "local" and has_sync and db.execute(
-                "SELECT 1 FROM sync_imported WHERE event_id=?", (r["id"],)).fetchone():
-            st = "remote-unsigned"
+        elif r["replica_id"] != "local" and has_sync and (imp := db.execute(
+                "SELECT origin_row FROM sync_imported WHERE event_id=?", (r["id"],)).fetchone()):
+            st = remote_status(json.loads(imp[0]), keys, r, _parents_all(db, r["id"]))
         else:
             st = "unsigned"
         out[r["id"]] = (r["seq"], st)
     return out
 
 
-BAD = ("targets-mismatch", "bad-signature", "unknown-key", "revoked-key", "wrong-role-key", "unsigned")
+def remote_status(orig, keys, local=None, local_parents=None):
+    """Sync-imported event: re-verify the origin signature kept in sync_imported.origin_row (the local copy has a
+    rewritten replica_id, so the signature is checked over the origin row, as on import). 'remote-signed' or
+    'remote-unsigned'."""
+    sg = orig.get("sig") or {}
+    k = keys.get(sg.get("key_id"))
+    if not (HAVE_CRYPTO and sg.get("sig") and k and k["role"] == "user" and _live(k, orig["hlc"])):
+        return "remote-unsigned"
+    row = dict(orig)
+    row["payload_ct"] = base64.b64decode(orig["payload_ct"]) if orig.get("payload_ct") else None
+    parents = sorted({p for p, _ in orig.get("parents", [])})   # same message as sync._user_sig_problem
+    if local is not None:   # origin_row is not hash-chained: it must describe exactly the local (chained) event
+        if any(row[f] != local[f] for f in ("id", "type", "subject", "actor", "hlc")) or \
+                payload_hash(row) != payload_hash(local) or parents != sorted(local_parents or []):
+            return "remote-mismatch"
+    return "remote-signed" if _verify(k["pub"], sg["sig"], sig_message(row, parents, sg["key_id"])) else "remote-unsigned"
+
+
+BAD = ("targets-mismatch", "remote-mismatch", "bad-signature", "unknown-key", "revoked-key", "wrong-role-key", "unsigned")
 
 
 def unsigned_after_epoch(db):

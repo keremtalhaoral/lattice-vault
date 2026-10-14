@@ -255,8 +255,20 @@ class SecurityReview(unittest.TestCase):
         keys, probs = signing.registered_keys(self.db)
         self.assertEqual(probs, [])
         self.assertIsNotNone(keys[ek]["revoked_seq"])                   # transitively revoked with the old key
-        self.assertIsNotNone(keys[rk]["revoked_seq"])                   # old recovery key too: make a new code
+        self.assertIsNone(keys[rk]["revoked_seq"])                      # recovery key survives rotation
         self.assertEqual(sum(1 for k in keys.values() if k["role"] == "user" and k["active"]), 1)
+
+    def test_stolen_key_rotation_keeps_owner_recovery(self):
+        """Security re-review B1 (PoC test_stolen_key_rotation_kills_owner_recovery): a thief rotating with the stolen
+        user key must not kill the owner's offline recovery code; the owner recovers and the thief's key dies."""
+        code, rk = signing.new_recovery_code(self.db)
+        _, evil = signing.rotate_user_key(self.db, os.path.join(self.d, "evil.key"))
+        self.assertIsNone(signing.registered_keys(self.db)[0][rk]["revoked_seq"])
+        new = signing.recover_with_code(self.db, code, os.path.join(self.d, "owner.key"))
+        keys, probs = signing.registered_keys(self.db)
+        self.assertEqual(probs, [])
+        self.assertIsNotNone(keys[evil]["revoked_seq"]); self.assertIsNotNone(keys[rk]["revoked_seq"])
+        self.assertEqual([k for k, v in keys.items() if v["role"] == "user" and v["active"]], [new])
 
     def test_rotation_needs_pending_key_certified_by_signer(self):
         import cryptography.hazmat.primitives.asymmetric.ed25519 as ed

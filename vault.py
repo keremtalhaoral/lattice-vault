@@ -1279,9 +1279,8 @@ def main(argv=None):
                 if not args.new_key:
                     raise ValueError("keys rotate needs --new-key PATH")
                 old, new = signing.rotate_user_key(db, args.new_key)
-                print(f"rotated {old} -> {new}. Set VAULT_USER_KEY={args.new_key} now; the old key and every key it "
-                      "certified (incl. the recovery key) are revoked. Back up the new key file offline and run "
-                      "`vault keys recovery-code` for a new recovery code.")
+                print(f"rotated {old} -> {new}. Set VAULT_USER_KEY={args.new_key} now; the old key and the pending/device keys it "
+                      "certified are revoked. Your recovery code stays valid. Back up the new key file offline.")
             elif args.action == "revoke":
                 if not args.key_id or not args.reason:
                     raise ValueError("keys revoke needs KEY_ID and --reason")

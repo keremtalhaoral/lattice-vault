@@ -11,15 +11,17 @@ recovery code and an optional second anchor (`VAULT_ANCHOR_PATH2`) before any mu
   registered by the active user key is only *pending* and cannot sign until a dual-signed `key.rotated` activates it.
 - **Rotate** (`vault keys rotate --new-key PATH`, TTY): `key.registered{new, certified_by:old}` (pending) +
   `key.rotated{old,new,new_key_sig}` signed by the old key, `new_key_sig` by the new key. The rotation activates the
-  new key and revokes the old key **and, transitively, every key it certified** (pending keys an attacker may have
-  minted, device keys, the recovery key). Create a new recovery code afterwards.
+  new key and revokes the old key **and, transitively, every non-recovery key it certified** (pending keys an attacker
+  may have minted, device keys). The recovery key is **not** revoked by rotation: it dies only by self-revocation
+  (old code) or by `recover`, so a thief who rotates with a stolen user key cannot disable the owner's recovery.
 - **Revoke** (`vault keys revoke KEY_ID --reason R`, TTY): the active user key may revoke only device keys it
   certified. A recovery key may revoke only itself. The user key itself is replaced only via rotate/recover.
 - **Recovery code** (`vault keys recovery-code`, TTY on stdin **and stdout**): 160 random bits shown once as base32
   groups; recovery key seed = `SHA-256("lattice-recovery-seed/v1\n" || code bytes)`; only the public key is stored.
   Registered by the active user key only while no recovery key is live. Replacing a live code
   (`--replace`) needs the OLD code: the old recovery key revokes itself first. A stolen user key alone therefore
-  cannot swap the owner's code; if the code is lost, rotate (which revokes it) and create a new one.
+  cannot swap or kill the owner's code. Trade-off: a lost code cannot be replaced while it is live (no path without
+  the code); the vault keeps working with the user key.
 - **Recover** (`vault keys recover --new-key PATH`, code from the TTY): the live recovery key registers a new user key;
   that one event atomically revokes every other user key, everything they certified, and the recovery key.
 - **Revocation is bound to log position**: a revoked key's signature is valid only if the event's `seq < revoked_seq`

@@ -190,8 +190,9 @@ def registered_keys(db):
       (recover), which atomically revokes every user key and the recovery key itself.
     * a recovery key is registered by the active user key only while no recovery key is live (replacing one needs the
       old recovery key's self-revocation, i.e. the old code).
-    * key.revoked: the active user key may revoke device keys it certified (and its predecessor); a recovery key may
-      revoke only itself. Any revocation also revokes, transitively, every live key certified by the revoked key.
+    * key.revoked: the active user key may revoke only device keys it certified; a recovery key may revoke only
+      itself. Any revocation also revokes, transitively, every live non-recovery key certified by the revoked key.
+      A recovery key survives rotation; it dies only by self-revocation (old code) or by `recover`.
     * a revoked key's signature is valid only on events with seq < revoked_seq AND hlc < revoked_hlc (or on the
       revoking event itself), see _sig_valid."""
     import vault
@@ -203,7 +204,10 @@ def registered_keys(db):
         if k["revoked_seq"] is None:
             k.update(revoked_hlc=hlc, revoked_seq=r["seq"], revoked_by=r["id"], active=False)
         for c, ck in keys.items():
-            if ck["certified_by"] == kid and c != kid and c not in keep and ck["revoked_seq"] is None:
+            # recovery keys are never revoked transitively: they die only by self-revocation or by `recover`, so a
+            # thief who rotates the user key cannot kill the owner's offline recovery code
+            if ck["certified_by"] == kid and c != kid and c not in keep and ck["revoked_seq"] is None \
+                    and ck["role"] != "recovery":
                 revoke(c, r, hlc, keep)
 
     def active_user():
@@ -307,8 +311,8 @@ def register_user_key(db, actor=None, confirm=None):
     if local_key_registered(db, kid):
         return kid, False
     if db.execute("SELECT 1 FROM events WHERE type='key.registered'").fetchone():
-        raise SignatureError("a different user key is already registered in this vault; rotation (key.rotated, signed by "
-                             "both keys) has no CLI yet (docs/adr/0011-signing-keys.md)")
+        raise SignatureError("a different user key is already registered in this vault; use `vault keys rotate` (with the "
+                             "current key) or `vault keys recover` (with the recovery code), docs/adr/0012-key-lifecycle.md")
     pub = pub_raw(priv)
     if confirm is not None and not confirm(fingerprint(pub)):
         raise SignatureError("fingerprint not confirmed; nothing registered")
@@ -491,8 +495,8 @@ def _current_user_key(db):
 
 def rotate_user_key(db, new_path, actor=None):
     """key.registered(new, pending, certified by old) + key.rotated (signed by old, new_key_sig by new). The rotation
-    activates the new key and revokes the old one plus every key it certified (e.g. the recovery key: create a new
-    recovery code afterwards). The new key is written to `new_path` (O_EXCL). Returns (old_kid, new_kid)."""
+    activates the new key and revokes the old one plus every non-recovery key it certified (pending/device keys). The
+    recovery key stays live. The new key is written to `new_path` (O_EXCL). Returns (old_kid, new_kid)."""
     import vault
     actor = actor or vault.HUMAN
     old = _current_user_key(db)
@@ -521,7 +525,7 @@ def revoke_key(db, kid, reason, actor=None):
         raise SignatureError(f"{kid} is not a registered, unrevoked key")
     if keys[kid]["role"] != "device" or keys[kid]["certified_by"] != me[1]:
         raise SignatureError("the user key may only revoke device keys it certified; replace a recovery code with "
-                             "`vault keys recovery-code --replace` (needs the old code) or `vault keys rotate`")
+                             "`vault keys recovery-code --replace` (needs the old code)")
     eid = _revoke(db, me, kid, reason, actor)
     vault.audit(db, actor, "key_revoke", "accepted", f"key {kid} revoked", eid)
     return eid
@@ -549,8 +553,9 @@ def new_recovery_code(db, actor=None, old_code=None):
     live = [kid for kid, k in registered_keys(db)[0].items() if k["role"] == "recovery" and k["revoked_seq"] is None]
     if live:
         if not old_code:
-            raise SignatureError("a recovery code already exists; replacing it needs the old code (--replace), or "
-                                 "rotate the user key first (rotation revokes the old recovery key)")
+            raise SignatureError("a recovery code already exists; replacing it needs the old code (--replace). Rotation "
+                                 "does not revoke it; if the code is lost, `vault keys recover` is impossible until "
+                                 "a new code can be registered (see ADR 0012)")
         rec = _priv_kid(_recovery_priv(old_code), "recovery")
         if rec[1] not in live:
             raise SignatureError("old recovery code does not match the live recovery key")

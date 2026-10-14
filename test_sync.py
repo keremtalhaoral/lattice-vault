@@ -1,7 +1,7 @@
 import json, os, subprocess, sys, tempfile, time, unittest
 from unittest import mock
 os.environ.setdefault("VAULT_ALLOW_NONTTY", "1")
-import vault, sync
+import vault, sync, signing
 from testutil import HAVE_CRYPTO
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -200,9 +200,10 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(self.B.execute("SELECT status FROM proj_status WHERE event_id=?", (a,)).fetchone()[0], "proposed")
         vault.review(self.A, a, "approve", actor=U)
         r = sync.import_package(self.B, self.pkg(self.A, "a2", since_peer=self.db_))
-        self.assertEqual((r["new"], r["quarantined"]), (0, 1))
+        self.assertEqual((r["new"], r["quarantined"]), (0, 2))   # A's key.registered + the approval
         self.assertEqual(self.sem(self.B), before)
-        self.assertEqual(list(self.held(self.B).values()), ["unsigned user:* event"])
+        self.assertEqual(sorted(v.split(" (")[0] for v in self.held(self.B).values()),
+                         ["key.* events are not applied via sync", "unknown signing key " + signing.try_user_key()[1]])
 
     def test_approval_type_quarantined_regardless_of_actor(self):
         # a forged batch approval claiming a non-user actor (inserted around the human-only trigger, as a package writer could)
@@ -213,7 +214,7 @@ class SyncTest(unittest.TestCase):
         sync.import_package(self.B, self.pkg(self.A, "orig"))
         r = sync.import_package(self.B, p)
         self.assertEqual((r["new"], r["quarantined"]), (0, 1))
-        self.assertEqual(self.held(self.B), {"forged-1": "unsigned approval/human-only event"})
+        self.assertEqual(self.held(self.B), {"forged-1": "human-only event from a non-user actor"})
         self.assertEqual(self.B.execute("SELECT status FROM proj_status WHERE event_id=?", (a,)).fetchone()[0], "proposed")
 
     def forge(self, p, mutate):
@@ -255,6 +256,75 @@ class SyncTest(unittest.TestCase):
         h = vault.projection_hash(self.B); vault.rebuild(self.B)
         self.assertEqual(vault.projection_hash(self.B), h)
         self.assertEqual(vault.verify_chains(self.B), [])
+
+    # ---- #10 integration: user signatures on incoming human-only events ----
+    def approval_pkg(self, name="ap"):
+        a = vault.append(self.A, "learning.captured", "x", {"text": "ajan"}, "agent:bot", "unverified")[0]
+        ap = vault.review(self.A, a, "approve", actor=U)
+        return a, ap, self.pkg(self.A, name)
+
+    def rewrite(self, p, eid, mutate):
+        """Mutate one event in a package and re-seal hashes (sig is bound into event_hash v2)."""
+        import hashlib
+        lines = open(p, encoding="utf-8").read().splitlines(); out = []
+        for l in lines[1:]:
+            e = json.loads(l)
+            if e["id"] == eid:
+                mutate(e)
+                e["content_hash"] = vault.content_hash(e["type"], e["subject"], e["key"], json.loads(e["payload"]))
+                row = dict(e); row["payload_ct"] = None; row["_sig"] = (e.get("sig") or {}).get("sig")
+                e["hash"] = vault.event_hash(e["prev_hash"], row)
+            out.append(vault.canon(e))
+        body = ("\n".join(out) + "\n").encode()
+        m = json.loads(lines[0]); m.update(event_count=len(out), body_sha256=hashlib.sha256(body).hexdigest())
+        with open(p, "wb") as f:
+            f.write(vault.canon(m).encode() + b"\n" + body)
+
+    @unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
+    def test_valid_user_signature_applied(self):
+        signing.register_user_key(self.B)                  # receiver knows the same user key (key.registered on B)
+        a, ap, p = self.approval_pkg()
+        r = sync.import_package(self.B, p)
+        self.assertEqual((r["new"], r["quarantined"]), (2, 1))   # agent event + approval; A's key.registered held
+        self.assertEqual(self.B.execute("SELECT status FROM proj_status WHERE event_id=?", (a,)).fetchone()[0], "active")
+        self.assertNotIn(ap, self.held(self.B))
+        self.assertEqual(signing.classify(self.B)[ap][1], "remote-unsigned")   # stored unsigned locally (#10 semantics)
+        r = sync.import_package(self.B, p)                  # idempotent
+        self.assertEqual((r["new"], r["quarantined"], r["duplicate"]), (0, 0, 3))
+        self.assertEqual(len(sync.quarantined(self.B)), 1)
+
+    @unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
+    def test_signed_but_key_not_registered_on_receiver_quarantined(self):
+        a, ap, p = self.approval_pkg()
+        sync.import_package(self.B, p)
+        self.assertTrue(self.held(self.B)[ap].startswith("unknown signing key user/ed25519/"))
+        self.assertEqual(self.B.execute("SELECT status FROM proj_status WHERE event_id=?", (a,)).fetchone()[0], "proposed")
+
+    @unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
+    def test_forged_or_stripped_signature_quarantined(self):
+        signing.register_user_key(self.B)
+        a, ap, p = self.approval_pkg()
+        good = open(p, "rb").read()
+        def flip(e):
+            s = signing.unb64(e["sig"]["sig"]); e["sig"]["sig"] = signing.b64(bytes([s[0] ^ 1]) + s[1:])
+        for mutate, why in ((flip, "bad signature"), (lambda e: e.pop("sig"), "unsigned human-only event"),
+                            (lambda e: e.update(subject="event:other"), "bad signature")):
+            with open(p, "wb") as f:
+                f.write(good)
+            self.rewrite(p, ap, mutate)
+            C = self.mk(f"c{why[:3]}{id(mutate)}"); sync.pair(C, self.da, "A"); signing.register_user_key(C)
+            r = sync.import_package(C, p)
+            self.assertEqual(self.held(C).get(ap), why)
+            self.assertEqual(C.execute("SELECT status FROM proj_status WHERE event_id=?", (a,)).fetchone()[0], "proposed")
+            r2 = sync.import_package(C, p)
+            self.assertEqual((r2["new"], r2["quarantined"]), (0, 0))
+
+    @unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
+    def test_valid_signature_from_unpaired_device_quarantined(self):
+        C = self.mk("c"); signing.register_user_key(C)
+        a, ap, p = self.approval_pkg()
+        sync.import_package(C, p)
+        self.assertEqual(self.held(C)[ap], "valid user signature but origin device is not paired")
 
 
 if __name__ == "__main__":

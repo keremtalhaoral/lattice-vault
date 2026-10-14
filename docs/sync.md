@@ -23,9 +23,9 @@ plus `origin_device`. Forwarded events (A→B→C) are re-exported from the stor
 1. `sha256(body) == manifest.body_sha256`, and `event_count` matches. If either fails, the whole package is rejected.
 2. For every event, recompute `event_hash(prev_hash, row)` (the same function as the local chain) and `content_hash`. Any mismatch rejects the package.
 3. Events signed with the user key carry `sig` in the body line, because the origin hash binds the signature
-   (`vault.event_hash`). The receiver uses it to recompute the hash, but does **not** verify the signature yet. Locally
-   these events are stored unsigned (`remote-unsigned`, see docs/adr/0011-signing-keys.md). Signed-type events from
-   an unpaired device are skipped.
+   (`vault.event_hash`). The receiver uses it to recompute the hash **and verifies it** (see Trust → Quarantine).
+   Accepted events are stored without a local `event_sigs` row, so doctor classifies them `remote-unsigned`
+   (docs/adr/0011-signing-keys.md); the origin row with `sig` stays in `sync_imported` and is re-exported as is.
 4. **Not built:** Ed25519 package signing (`signature` is always null). SHA-256 detects corruption. It does **not** authenticate the sender:
    anyone who can write the file can recompute both hashes. Until signing exists, "paired device" is a label the
    user asserts, not something the vault proves (see the threat model / draft v0.4 K-6).
@@ -57,11 +57,21 @@ These go through the existing DAG. Concurrent `preference.set` events on two dev
 whichever correction replays last, but the conflict flag keeps it out of the context pack until the user resolves it.
 
 ## Trust
-**Quarantine (until package signing exists).** Any incoming event whose actor is `user:*`, or whose type is human-only
-(`event.approved`, `event.rejected`, `event.reverted`, `import.batch_approved`, `event.redacted`, `subject.shredded`,
-`conflict.resolved`), or whose parent is quarantined, is stored in `sync_quarantine` (origin row + reason) and **not**
-written to `events`: it is never projected, never verified, and not re-exported. Re-import counts it as a duplicate.
-List with `vault sync-quarantine`. Only agent/import events are applied (and they stay unverified/proposed).
+**Quarantine (until package signing exists).** Held events go to `sync_quarantine` (origin row + reason) and are
+**not** written to `events`: never projected, never verified, not re-exported. Re-import counts them as duplicates.
+List with `vault sync-quarantine`. Rules, in order:
+* Human-only types (`vault.SIGNED_TYPES`: approve/reject/revert/batch-approve/redact/shred/conflict.resolved, `key.*`,
+  `attestation.recorded`) are applied **only** if the event's `sig` verifies (`signing._verify` over
+  `signing.sig_message` of the origin row) against a **user** key that is registered on this vault
+  (`signing.registered_keys`), not revoked at the event's HLC, the actor is `user:*`, and the origin device is paired.
+  Otherwise the reason is one of: `unsigned human-only event`, `bad signature`, `unknown signing key <key_id> (no
+  key.registered for it on this device)`, `revoked key`, `human-only event from a non-user actor`,
+  `valid user signature but origin device is not paired`, `signature not verifiable here (cryptography not installed)`.
+* `key.*` events are always held (`key registry sync needs vaultsync/0.2`): the receiver's registry is never changed by a package.
+  To accept signed approvals, register the same user key on the receiver first (`vault keys init-user` with the same `VAULT_USER_KEY`).
+* `user:*` content events (preference/decision/…) are not user-signed in #10, so they are always held (`unsigned user:* event`).
+* Children of held events and payloads that fail schema validation are held too.
+Agent/import events are applied and stay unverified/proposed.
 The rules below describe the pre-quarantine paired-device behaviour, kept behind a test-only flag.
 
 * An event keeps its original actor/trust only if its `origin_device` is this device or a **paired** device (`vault sync-pair`, human-only,

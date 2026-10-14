@@ -1,7 +1,8 @@
 """File-based multi-device sync PROTOTYPE (`.vaultsync` packages moved by hand). See docs/sync.md.
 
 Not for real data: packages are unsigned, there is no key sync, and redaction/shredding does not propagate.
-Unsigned user:* and approval events are quarantined (sync_quarantine), never applied.
+Human-only events are applied only with a valid user signature (signing.py, #10) from a key registered on this vault and
+a paired origin device; all other user:*/human-only events are quarantined (sync_quarantine), never applied.
 Integration with main: incoming plaintext payloads are upcast (schemas.upcast) and validated against the current
 schema before they are applied (invalid ones are quarantined); stored bytes stay the origin's. Newer-schema events
 are stored as-is and kept out of projections by rebuild() (unknown_version). After a merge, projections are
@@ -12,7 +13,7 @@ Package = line 1: manifest JSON; lines 2..n: body JSONL (one origin event per li
 No network code. Additive schema only (CREATE TABLE IF NOT EXISTS); existing tables/triggers untouched.
 """
 import base64, hashlib, json, os, secrets, time
-import schemas, vault
+import schemas, signing, vault
 
 FORMAT = "vaultsync/0.1"
 MAX_SKEW_MS = int(os.environ.get("VAULT_SYNC_MAX_SKEW_MS", str(5 * 60 * 1000)))   # remote HLC may be ≤ 5 min ahead
@@ -39,7 +40,7 @@ class SyncError(ValueError):
 
 
 UNSUPPORTED_WARNING = ("WARNING: multi-device sync is an unsigned, file-based prototype. Do not use it with real data: no package signing, "
-                       "no key sync, no redaction/shred propagation. user:* and approval events are quarantined, not applied.")
+                       "no key sync, no redaction/shred propagation. Unsigned user:*/approval events are quarantined, not applied.")
 
 
 def _schema_problem(e):
@@ -57,12 +58,42 @@ def _schema_problem(e):
     return None
 
 
-def _quarantine_reason(e, parents_held):
-    """Until package signing exists, nothing that could carry the owner's authority is applied from a package."""
-    if e["actor"].startswith("user:"):
-        return "unsigned user:* event"
-    if e["type"] in vault.HUMAN_ONLY_TYPES:
-        return "unsigned approval/human-only event"
+def _user_sig_problem(db, e, row, keys):
+    """None if `e` (a user-signed type) carries a valid signature by a user key registered on THIS vault, else the
+    quarantine reason. Uses signing.sig_message/_verify over the origin row (replica_id as on the origin, see
+    docs/adr/0011 item 5); no crypto of our own. `keys` is a one-element cache for signing.registered_keys."""
+    sg = e.get("sig") or {}
+    if not sg.get("sig"):
+        return "unsigned human-only event"
+    if not signing.HAVE_CRYPTO:
+        return "signature not verifiable here (cryptography not installed)"
+    if not keys:
+        keys.append(signing.registered_keys(db)[0])
+    k = keys[0].get(sg.get("key_id"))
+    if not k or k["role"] != "user":
+        return f"unknown signing key {sg.get('key_id')} (no key.registered for it on this device)"
+    if sg.get("alg") != "ed25519" or not signing._verify(
+            k["pub"], sg["sig"], signing.sig_message(row, sorted({p for p, _ in e["parents"]}), sg["key_id"])):
+        return "bad signature"
+    if k["revoked_hlc"] and e["hlc"] >= k["revoked_hlc"]:
+        return "revoked key"
+    return None
+
+
+def _quarantine_reason(db, e, row, parents_held, keys, paired):
+    """Nothing that could carry the owner's authority is applied from a package unless a registered user key signed it."""
+    if e["type"] in vault.SIGNED_TYPES:
+        if e["type"] in signing.KEY_TYPES:
+            return "key.* events are not applied via sync (key registry sync needs vaultsync/0.2)"
+        if not e["actor"].startswith("user:"):
+            return "human-only event from a non-user actor"
+        why = _user_sig_problem(db, e, row, keys)
+        if why:
+            return why
+        if e["origin_device"] not in paired:
+            return "valid user signature but origin device is not paired"
+    elif e["actor"].startswith("user:"):
+        return "unsigned user:* event"   # content types are never user-signed (only SIGNED_TYPES are)
     if any(p in parents_held for p, _ in e["parents"]):
         return "parent quarantined"
     return _schema_problem(e)
@@ -207,10 +238,10 @@ def import_package(db, path, dry_run=False, now_ms=None, _trust_unsigned=False):
         if e["id"] in have or e["id"] in held:
             rep["duplicate"] += 1; continue
         todo.append((e, row))
-    hold, rest = [], []
+    hold, rest, keys = [], [], []
     for e, row in todo:   # (hlc, id) order, so a parent is classified before its children
         why = _schema_problem(e) or ("parent quarantined" if any(p in held for p, _ in e["parents"]) else None) \
-            if _trust_unsigned else _quarantine_reason(e, held)
+            if _trust_unsigned else _quarantine_reason(db, e, row, held, keys, paired)
         if why:
             held.add(e["id"]); hold.append((e, why))
         else:

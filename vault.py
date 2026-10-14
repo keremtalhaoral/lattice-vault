@@ -695,6 +695,8 @@ def apply_incremental(db, eid):
         return False
     if db.execute("SELECT 1 FROM events WHERE hlc>? OR (hlc=? AND id>?) LIMIT 1", (e["hlc"], e["hlc"], eid)).fetchone():
         return False   # sorts before existing events (merge case): replay order changes
+    if is_unknown_version(e):
+        return False   # newer-schema event: rebuild() marks it unknown_version and keeps it out of projections
     t = e["type"]
     targets, parents = _targets(db, e), _parents(db, eid)
     if t in META_TYPES and t not in REVIEW_TYPES + ("import.batch_approved",):
@@ -712,6 +714,8 @@ def apply_incremental(db, eid):
         if t != "event.rejected":
             for tid in targets:
                 te = db.execute("SELECT * FROM events WHERE id=?", (tid,)).fetchone()
+                if is_unknown_version(te):
+                    return False
                 if te["type"] not in _ORDER_FREE or _parents(db, tid) or \
                         db.execute("SELECT 1 FROM event_parents WHERE parent_id=? AND rel='supersedes'", (tid,)).fetchone():
                     return False

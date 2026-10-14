@@ -10,6 +10,12 @@ All notable changes to this project are documented here. Format: [Keep a Changel
   mismatch fails the open.
 - Open also verifies K sampled segments below the checkpoint and nudges you to run `vault doctor` after 30 days.
 - `VAULT_ALLOW_NONTTY` works only inside the test harness.
+- Sync prototype: incoming human-only events (`vault.SIGNED_TYPES`) are applied only with a valid signature by a user
+  key registered on the receiving vault (`signing.sig_message`/`registered_keys`) and from a paired device. Unsigned,
+  forged, unknown-key, revoked-key, non-user-actor and `key.*` events, plus every `user:*` content event, are
+  quarantined (`sync_quarantine` with a reason, not applied, idempotent); `vault sync-quarantine` lists them. This
+  replaces the accept-and-flag `remote-unsigned` path for unverified events. Sync commands warn that multi-device use
+  with real data is unsupported.
 - `vault verify` and `vault doctor` also report signatures (signed / legacy / remote-unsigned), the key registry
   and the anchor. `restore` resets the anchor of the target path; a fresh signed anchor is written on its first commit.
 - Restore drill 2026-10-14 fixes. `restore --keys` trial-decrypts with the target KEK (every live DEK + one

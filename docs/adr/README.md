@@ -15,3 +15,4 @@ Numbers match the project's internal decision log (D-003 … D-010); earlier num
 | [0012](0012-key-lifecycle.md) | User key rotation, revocation, offline recovery code, second anchor | Proposed | Implemented (review pending) |
 | [0013](0013-sync-key-transport.md) | Sync key transport: certified X25519 device keys, signed DEK bundles | Proposed | Prototype (review pending) |
 | [0014](0014-crypto-shredding.md) | Crypto-shredding lifecycle: signed schedule/cancel/shred events, reconcile, no plaintext after finalize | Proposed | Prototype (review pending) |
+| [0015](0015-context-pack-v2.md) | Context Pack v2: measured token estimates, vault_update import (unverified), context-pack/2 format | Proposed | Implemented (review pending) |

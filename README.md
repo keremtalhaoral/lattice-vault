@@ -67,7 +67,10 @@ Design details: [docs/design.md](docs/design.md). Decisions: [docs/adr/](docs/ad
 | `sync.py` | file-based `.vaultsync` export/import with quarantine (experimental) |
 | `backup.py` | `backup`, `backup-keys`, `backup-kek`, `restore` (manifest + trial-decrypt verification) |
 | `schemas.py` | event payload schemas and upcasters |
-| `context_export.py` | `export-context` (format `lattice-context/v1`, docs/context-pack.md) |
+| `context_export.py` | `export-context` (legacy `lattice-context/v1` via `--format 1`, docs/context-pack.md) |
+| `context_pack.py` | `export-context` default format `context-pack/2` (ADR 0015) |
+| `vault_update.py` | `import-update`: one `vault_update` block from AI output, lands unverified (ADR 0015) |
+| `tokens.py` | token estimates (optional tiktoken, calibrated TR/EN heuristic) |
 | `event_detail.py` | `show`: one event's detail and correction/supersede chain |
 | `examples/seed.py` | creates a synthetic demo vault |
 

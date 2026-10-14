@@ -1201,6 +1201,7 @@ def main(argv=None):
     p = sp.add_parser("pack"); p.add_argument("--profile", choices=["minimal", "full"], default="full")
     p.add_argument("--max-chars", type=int); p.add_argument("--include-unverified", action="store_true")
     import context_export; context_export.add_parser(sp)
+    import vault_update; vault_update.add_parser(sp)
     sp.add_parser("rebuild"); sp.add_parser("pending")
     dr = sp.add_parser("doctor"); dr.add_argument("--full", action="store_true",
         help="full hash-chain verify from genesis (always on for doctor; open-time checks are incremental)")
@@ -1282,7 +1283,7 @@ def main(argv=None):
             require_human_tty(args.cmd)
         if args.cmd == "sign-legacy":
             require_human_tty("sign-legacy", strict=True)   # never bypassable, not even in the test harness
-        if args.cmd == "propose":
+        if args.cmd in ("propose", "import-update"):
             import signing; signing.USER_KEY_DISABLED = True   # agent path: never load the user private key
         if args.cmd in ("keys", "sign-legacy"):
             import signing
@@ -1415,6 +1416,8 @@ def main(argv=None):
             sys.stdout.write(pack(db, args.profile, args.max_chars, args.include_unverified))
         elif args.cmd == "export-context":
             import context_export; context_export.run(db, args)
+        elif args.cmd == "import-update":
+            import vault_update; vault_update.run(db, args)
         elif args.cmd == "propose":
             import agent_api
             a_ = {"type": args.type, "subject": args.subject, "key": args.key, "payload": json.loads(args.payload),
@@ -1568,7 +1571,7 @@ def main(argv=None):
         if type(e).__name__ not in ("Refused", "ValueError", "OperationalError", "IntegrityError", "DatabaseError",
                                     "JSONDecodeError", "TamperError", "SecretRefused", "HumanRequired", "KeyError",
                                     "FileExistsError", "BackupError", "Shredded", "SyncError", "SchemaError", "CryptoUnavailable", "PermissionError",
-                                    "VaultNotFound", "KeystoreMissing", "SignatureError", "KeyTransportError"):
+                                    "VaultNotFound", "KeystoreMissing", "SignatureError", "KeyTransportError", "UpdateRefused"):
             raise
         print(f"error: {e}", file=sys.stderr); return 1
     return 0

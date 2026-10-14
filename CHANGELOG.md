@@ -2,6 +2,19 @@
 All notable changes to this project are documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
+### Added
+- Context Pack v2 (docs/adr/0015-context-pack-v2.md): `vault export-context` now writes `context-pack/2` by default
+  (`--format 1` keeps lattice-context/v1): [V]/[U] markers with author and date on every line, fixed section order,
+  counts and a token-estimate block in the front matter, JSON `vault_update/2` template.
+- `tokens.py`: token estimates via optional `tiktoken` (o200k_base / cl100k_base) or a heuristic calibrated on a
+  synthetic Turkish + English corpus (`tools/token_corpus.py`, `tools/calibrate_tokens.py`); budgets add a 15 %
+  safety margin. chars/4 under-counted Turkish text by up to ~44 % on cl100k_base.
+- `vault import-update FILE|-`: imports one `vault_update` block from pasted AI output. Strict JSON, content types
+  only, same checks as the agent API, preview + terminal confirmation (`--dry-run`, `--yes`), atomic, idempotent;
+  entries land unverified as `agent:<name>`.
+### Security
+- Context packs (v1 and v2) withhold every event of a shredded or shred-pending subject, including non-sensitive
+  plaintext fields.
 ### Security
 - Crypto-shredding lifecycle (docs/adr/0014-crypto-shredding.md): signed `subject.shred_scheduled` /
   `subject.shred_cancelled` events next to `subject.shredded`; pending shreds and cancellations propagate to paired

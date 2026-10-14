@@ -68,8 +68,25 @@ def _text(type_, subject, key, p):
     return f"{subject}: " + "; ".join(f"{k}={_val(v)}" for k, v in sorted(p.items()) if k not in ("provenance", "sources"))
 
 
+def shred_states(db):
+    """{subject: 'shredded' | 'shred pending'} from the lifecycle events in the log (ADR 0014). Any subject with an
+    applied shred, or a schedule not followed by a cancel, is withheld from context packs entirely (fail closed:
+    not only its encrypted fields, but also its plaintext fields and text)."""
+    out = {}
+    for r in db.execute("SELECT type, subject FROM events WHERE type IN ('subject.shredded','subject.shred_scheduled',"
+                        "'subject.shred_cancelled') ORDER BY seq"):
+        if r["type"] == "subject.shredded" or out.get(r["subject"]) == "shredded":
+            out[r["subject"]] = "shredded"
+        elif r["type"] == "subject.shred_scheduled":
+            out[r["subject"]] = "shred pending"
+        else:
+            out.pop(r["subject"], None)
+    return out
+
+
 def _items(db, since=None, types=None, unverified=False):
     events = db.execute("SELECT * FROM events ORDER BY hlc, id").fetchall()
+    shred = shred_states(db)
     st = {r["event_id"]: (r["status"], r["trust_eff"]) for r in db.execute("SELECT * FROM proj_status")}
     blocked = {r[0] for r in db.execute("SELECT event_id FROM redacted_blocklist")}
     status = lambda i: st.get(i, ("", None))[0]
@@ -113,11 +130,13 @@ def _items(db, since=None, types=None, unverified=False):
             continue
         p = vault.read_upcast(e)
         item = {"id": e["id"], "hlc": e["hlc"], "type": t, "date": e["ts"][:10], "supersedes": None,
-                "trust": tr, "actor": e["actor"], "status": s}
-        if s == "redacted" or p.get("redacted") is True or e["id"] in blocked:
-            item["text"] = "[redacted]"
+                "trust": tr, "actor": e["actor"], "status": s, "withheld": None}
+        if e["subject"] in shred:
+            item["text"], item["withheld"] = "[" + shred[e["subject"]] + "]", shred[e["subject"]]
+        elif s == "redacted" or p.get("redacted") is True or e["id"] in blocked:
+            item["text"], item["withheld"] = "[redacted]", "redacted"
         elif s == "undecryptable":
-            item["text"] = "[undecryptable]"
+            item["text"], item["withheld"] = "[undecryptable]", "undecryptable"
         else:
             last = None
             for c, cp in corr.get(e["id"], []):
@@ -211,13 +230,20 @@ def add_parser(sp):
     x.add_argument("--since", help="ISO date/time prefix, e.g. 2026-01-01"); x.add_argument("--types")
     x.add_argument("--max-tokens", type=int); x.add_argument("--include-unverified", action="store_true")
     x.add_argument("--fixed-time", help="override generated_at (tests); env LATTICE_FIXED_TIME also works")
+    x.add_argument("--format", choices=["1", "2"], default="2",
+                   help="2 = context-pack/2 (default, ADR 0015); 1 = legacy lattice-context/v1")
 
 
 def run(db, args):
     import sys
-    out = export_context(db, args.profile, args.since,
+    if getattr(args, "format", "2") == "2":
+        import context_pack
+        exp = context_pack.export
+    else:
+        exp = export_context
+    out = exp(db, args.profile, args.since,
                          [t.strip() for t in args.types.split(",") if t.strip()] if args.types else None,
-                         args.max_tokens, args.include_unverified, args.fixed_time)
+              args.max_tokens, args.include_unverified, args.fixed_time)
     if args.out == "-":
         sys.stdout.write(out)
     else:

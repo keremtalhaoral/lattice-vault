@@ -1,0 +1,55 @@
+# .gitignore for this prototype (runtime data, key material, tokens, ops output)
+# Python / venv
+.venv*/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+# Runtime databases (vault.py, crypto_keys.py, demo.sh)
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite*
+vault.db*
+keys.db*
+demo.db*
+# Key material / tokens (crypto_keys.py VAULT_KEK_FILE default keys.kek + .salt; agent tokens)
+*.kek
+*.kek.salt
+*.token
+*token*.txt
+agents.json
+agents.json.tmp
+agents.toml
+demo-agents.json
+*.vaultsync
+.env
+.env.*
+# MCP client configs (may contain tokens/paths)
+claude_desktop_config.json
+mcp.json
+.cursor/
+# Operational outputs (ops.py, obs.py, importer.py)
+snapshots/
+*.sha256
+vault-ops.jsonl
+*.jsonl
+redacted*.db
+*-redacted.*
+import-report*.json
+# Scratch
+w/
+scratch/
+tmp/
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/

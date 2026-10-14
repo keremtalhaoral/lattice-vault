@@ -1,6 +1,12 @@
 # Changelog
 All notable changes to this project are documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+### Added
+- `vault export-context`: MCP-fallback Context Pack (`lattice-context/v1`, Markdown + YAML front matter) of
+  approved facts only, with `[encrypted]`/`[redacted]` placeholders, deterministic output, token budget and a
+  `vault_update` template. See docs/context-pack.md. `vault pack` is unchanged.
+
 ## [0.1.0-prototype] - 2026-10-14
 First public prototype. **Not for production use.**
 ### Added

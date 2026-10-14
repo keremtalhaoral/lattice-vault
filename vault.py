@@ -756,6 +756,7 @@ def main(argv=None):
     s.add_argument("--limit", type=int, default=8)
     p = sp.add_parser("pack"); p.add_argument("--profile", choices=["minimal", "full"], default="full")
     p.add_argument("--max-chars", type=int); p.add_argument("--include-unverified", action="store_true")
+    import context_export; context_export.add_parser(sp)
     sp.add_parser("rebuild"); sp.add_parser("pending"); sp.add_parser("doctor")
     for v in ("approve", "reject"):
         r = sp.add_parser(v); r.add_argument("event_id", nargs="+"); r.add_argument("--reason")
@@ -805,6 +806,8 @@ def main(argv=None):
                 print(f"{r['score']:.3f}  {r['status']:<8} {r['trust']:<10} {r['type']:<18} {r['subject']}  {r['snip']}  vault://event/{r['id']}")
         elif args.cmd == "pack":
             sys.stdout.write(pack(db, args.profile, args.max_chars, args.include_unverified))
+        elif args.cmd == "export-context":
+            import context_export; context_export.run(db, args)
         elif args.cmd == "propose":
             import agent_api
             a_ = {"type": args.type, "subject": args.subject, "key": args.key, "payload": json.loads(args.payload),

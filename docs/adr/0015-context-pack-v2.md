@@ -77,12 +77,27 @@ text will differ, which is another reason for the margin.
 * Over budget: unverified items go first (oldest first, largest section first), then approved ones.
 * The update template is one line of JSON with `"format": "vault_update/2"`.
 
+### 4. Follow-ups after Security review
+* **Agent read surfaces.** `agent_api.export_context_pack` (MCP tool and `vault://pack/*`) renders through
+  `context_pack.export` instead of the projection-based `vault.pack`: sensitive fields stay `[encrypted]`,
+  shred-affected subjects are withheld, `max_chars` is enforced (MCP minimum 2000). `get_summary`, `search` and
+  `get_event` also omit subjects with a pending or applied shred. `vault pack` remains a human CLI command.
+* **Shred withholding source of truth.** `context_export.shred_states` is the union (fail closed) of the keystore
+  state (`pending_destroy`/`destroyed`), `shredding.plan()` decisions, and, for keys not held locally, the log in
+  `(hlc, id)` order where only a cancel that passes `shredding._valid` counts.
+* **Approved agent proposals** (status active, decided by a `user:` actor) count as approved facts in packs.
+* **Import path:** revoked registered names refused; rate limit shared with `propose_event` (audit action
+  `propose`, reason `via:import-update`); `key` without control characters; preview and messages strip C0/C1/bidi
+  characters, never echo unknown field names/values, and filter secret patterns (`[filtered]`); preview shows
+  `[encrypted]`/`[withheld]` for sensitive or shred-affected current values; `supersedes` only targets unverified
+  proposals; deep nesting, huge integers and non-finite numbers are refused before preview.
+
 ## Consequences
 * Packs are larger in the estimate (more conservative), so `--max-tokens` trims a little earlier, especially for
   Turkish text.
 * Pasted AI updates no longer need an agent token, but they cannot do more than a token-holding agent: same rules,
   same unverified landing, narrower type allowlist.
-* `vault pack` / MCP `export_context_pack` (spec 1.0.0) are unchanged.
+* The MCP pack format changes from `pack_spec 1.0.0` to `context-pack/2`.
 
 ## Deferred
 * Corrections (`event.corrected`) via import — refused for now; would need a preview of the corrected field.

@@ -127,3 +127,51 @@ class ContextPackV2Test(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+try:
+    import crypto_keys as _ck
+    _HAVE = _ck.HAVE_CRYPTO
+except Exception:
+    _HAVE = False
+if _HAVE:
+    import test_key_transport as _tkt
+    import key_transport as kt, ops, time as _time
+
+    class ShredStateMultiDeviceTest(_tkt.KeyTransportTest):
+        """Withholding follows the authoritative shred state ((hlc, id) order, validity checks), ADR 0014/0015."""
+        SUBJ = "person:ayse"
+
+        def mkdata(self):
+            vault.append(self.A, "learning.captured", self.SUBJ, {"text": "PLAIN_CANARY", "value": "SENS"}, "agent:bot",
+                         "unverified", sensitive=["value"])
+            self.sync_events(self.A, self.B); self.ready(); kt.import_keys(self.B, self.bundle())
+
+        def assert_withheld(self, db):
+            o = cp.export(db, fixed_time=FT, include_unverified=True)
+            for bad in ("PLAIN_CANARY", "SENS", self.SUBJ):
+                self.assertNotIn(bad, o)
+            self.assertEqual(ce.shred_states(db).get(self.SUBJ), "shred pending")
+
+        def test_concurrent_cancel_and_reschedule_uses_hlc_order(self):
+            self.mkdata()
+            ops.shred_confirm(self.A, self.SUBJ, 7); self.sync_events(self.A, self.B)
+            _time.sleep(0.01); ops.shred_cancel(self.A, self.SUBJ)
+            _time.sleep(0.01); ops.shred_cancel(self.B, self.SUBJ)
+            _time.sleep(0.01); ops.shred_confirm(self.A, self.SUBJ, 7)
+            self.sync_events(self.B, self.A)       # B's older cancel arrives last (higher seq, lower hlc)
+            self.assertEqual(vault.keystore(self.A).info(self.SUBJ)["state"], "pending_destroy")
+            self.assert_withheld(self.A)
+
+        def test_cancel_from_revoked_device_is_ignored(self):
+            self.mkdata()
+            ops.shred_confirm(self.B, self.SUBJ, 7)
+            self.sync_events(self.B, self.A)
+            kt.revoke_peer(self.B, self.da, "lost laptop")
+            ops.shred_cancel(self.A, self.SUBJ)
+            self.sync_events(self.A, self.B)
+            self.assertEqual(vault.keystore(self.B).info(self.SUBJ)["state"], "pending_destroy")
+            self.assert_withheld(self.B)
+
+    for _n in [n for n in dir(_tkt.KeyTransportTest) if n.startswith("test_")]:
+        setattr(ShredStateMultiDeviceTest, _n, None)

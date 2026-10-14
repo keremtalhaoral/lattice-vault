@@ -110,8 +110,12 @@ class VaultUpdateTest(unittest.TestCase):
         self.refused(block([dict(PREF, cites="x")]), "cites")
         self.refused(block([dict(PREF, cites=["nope"])]), "cites")
         own = tu.user(self.db, "preference.set", "user:owner", {"value": "çay"}, key="drink")
-        r = self.imp(block([dict(PREF, supersedes=own, cites=[own])]))
+        self.refused(block([dict(PREF, supersedes=own)]), "only target an unverified proposal")
+        prop = tu.agent(self.db, "preference.set", "user:owner", {"value": "su"}, key="drink")
+        r = self.imp(block([dict(PREF, supersedes=prop, cites=[own])]))
         self.assertEqual(r["new"], 1)
+        # the user's own later write is never blocked by an imported proposal
+        tu.user(self.db, "preference.set", "user:owner", {"value": "ayran"}, key="drink")
 
     # --- content filters
     def test_secret_filter(self):
@@ -185,8 +189,64 @@ class VaultUpdateTest(unittest.TestCase):
             self.imp(block([dict(PREF, type="key.registered")]))
         except vu.UpdateRefused:
             pass
-        row = self.db.execute("SELECT actor, outcome FROM audit WHERE action='import_update' ORDER BY id DESC").fetchone()
-        self.assertEqual(tuple(row), ("agent:pasted-ai", "refused"))
+        row = self.db.execute("SELECT actor, outcome, reason FROM audit WHERE action='propose' ORDER BY id DESC").fetchone()
+        self.assertEqual(tuple(row)[:2], ("agent:pasted-ai", "refused")); self.assertTrue(row[2].startswith("via:import-update"))
+        r = self.imp(block([LEARN]))
+        row = self.db.execute("SELECT actor, outcome, reason, event_id FROM audit WHERE action='propose' ORDER BY id DESC").fetchone()
+        self.assertEqual(tuple(row), ("agent:pasted-ai", "accepted", "via:import-update: ok", r["event_ids"][0]))
+
+    def test_registered_agent_revoked_and_rate_limited(self):
+        import agent_api
+        os.environ["VAULT_AGENTS"] = os.path.join(self.d, "agents.json"); self.addCleanup(os.environ.pop, "VAULT_AGENTS", None)
+        agent_api.add_agent("claude", rate_limit=2)
+        self.refused(block([PREF, LEARN, dict(LEARN, payload={"text": "üçüncü"})]), "rate limit", agent="claude")
+        self.assertEqual(self.imp(block([PREF, LEARN]), agent="claude")["new"], 2)
+        self.refused(block([dict(LEARN, payload={"text": "bir tane daha"})]), "rate limit", agent="claude")
+        agent_api.revoke_agent("claude")
+        self.refused(block([dict(LEARN, payload={"text": "x"})]), "revoked", agent="claude")
+        n = self.count()
+        for i in range(vu.DEFAULT_RATE):          # unregistered names get the default limit
+            self.imp(block([dict(LEARN, payload={"text": f"not {i}"})]), agent="anon")
+        self.refused(block([dict(LEARN, payload={"text": "one more"})]), "rate limit", agent="anon")
+        self.assertEqual(self.count(), n + vu.DEFAULT_RATE)
+
+    def test_preview_and_errors_are_terminal_safe(self):
+        out = io.StringIO()
+        evil = "a\x1b[2K\x1b[1Ab\x9bc\u202ed\x07"
+        vu.import_update(self.db, block([dict(LEARN, payload={"text": evil})]), dry_run=True, out=out)
+        pv = out.getvalue()
+        for ch in ("\x1b", "\x9b", "\u202e", "\x07"):
+            self.assertNotIn(ch, pv)
+        self.refused(block([dict(PREF, key="k\x1b[2K")]), "control characters")
+        tok = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1"
+        for t in (block([dict(PREF, **{"\x1b]0;X\x07" + tok: 1})]), block([PREF], format=tok),
+                  block([PREF], **{tok: 1})):
+            e = self.refused(t, "")
+            self.assertNotIn(tok, str(e)); self.assertNotIn("\x1b", str(e))
+        reasons = " ".join(r[0] for r in self.db.execute("SELECT reason FROM audit"))
+        self.assertNotIn(tok, reasons); self.assertNotIn("\x1b", reasons)
+
+    @unittest.skipUnless(tu.HAVE_CRYPTO, "cryptography not installed")
+    def test_dry_run_never_prints_sensitive_current_value(self):
+        import ops
+        tu.user(self.db, "preference.set", "user:owner", {"value": "PIN-4711-CANARY"}, key="pin", sensitive=["value"])
+        tu.user(self.db, "preference.set", "person:x", {"value": "PLAIN-CANARY"}, key="color")
+        tu.user(self.db, "preference.set", "person:x", {"value": "s"}, key="pin", sensitive=["value"])
+        out = io.StringIO()
+        vu.import_update(self.db, block([dict(PREF, key="pin", payload={"value": "x"}),
+                                         dict(PREF, subject="person:x", key="color", payload={"value": "y"})]),
+                         dry_run=True, out=out)
+        self.assertNotIn("PIN-4711-CANARY", out.getvalue()); self.assertIn("current: [encrypted]", out.getvalue())
+        ops.shred_confirm(self.db, "person:x", 7)
+        out = io.StringIO()
+        vu.import_update(self.db, block([dict(PREF, subject="person:x", key="color", payload={"value": "y"})]),
+                         dry_run=True, out=out)
+        self.assertNotIn("PLAIN-CANARY", out.getvalue()); self.assertIn("current: [withheld]", out.getvalue())
+
+    def test_parser_limits_fail_closed(self):
+        self.refused("```vault_update\n" + "[" * 30000 + "\n```", "not valid JSON")
+        self.refused("```vault_update\n{\"events\": [" + "9" * 5000 + "]}\n```", "not valid JSON")
+        self.refused('```vault_update\n{"events": [{"type": "learning.captured", "subject": "s", "payload": {"text": "x", "n": 1e999}}]}\n```', "non-finite")
 
     def test_cli_yes_and_dry_run(self):
         import signing

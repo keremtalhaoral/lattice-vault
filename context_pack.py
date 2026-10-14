@@ -43,11 +43,12 @@ def _sections(items):
 
 
 def _bullet(it):
-    mark = "[V]" if it["status"] in ("active", "redacted", "undecryptable") and it["trust"] == "verified" \
-        and not it.get("unverified_pool") else "[U]"
+    mark = "[U]" if it.get("unverified_pool") else "[V]"
     s = f"- {mark} {it['text']} — ev:{it['id'][-8:]} · {it['date']} · {md(it['actor'])}"
     if it.get("unverified_pool"):
         s += f" · {md(it['status'])}"
+    elif not it["actor"].startswith("user:"):
+        s += " · approved by the user"
     if it["supersedes"]:
         s += f" · supersedes ev:{it['supersedes'][-8:]}"
     return s
@@ -62,7 +63,7 @@ def update_template(seq, head):
 
 
 def export(db, profile="full", since=None, types=None, max_tokens=None, include_unverified=False, fixed_time=None,
-           margin=tokens.DEFAULT_MARGIN):
+           margin=tokens.DEFAULT_MARGIN, max_chars=None):
     fixed_time = fixed_time or os.environ.get("LATTICE_FIXED_TIME")
     gen = fixed_time or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     types = sorted(set(types)) if types else None
@@ -128,12 +129,12 @@ def export(db, profile="full", since=None, types=None, max_tokens=None, include_
         return est, out
 
     est, out = stable()
-    if max_tokens:
-        while est > max_tokens:
+    if max_tokens or max_chars:
+        while (max_tokens and est > max_tokens) or (max_chars and len(out) > max_chars):
             pool = unv if any(unv.values()) else appr      # unverified material is dropped first
             cands = [(len(v), k) for k, v in pool.items() if v]
             if not cands:
-                raise ValueError(f"max_tokens {max_tokens} too small for the pack skeleton (~{est} tokens incl. margin)")
+                raise ValueError(f"budget too small for the pack skeleton (~{est} tokens incl. margin, {len(out)} chars)")
             _, k = max(cands, key=lambda c: (c[0], c[1]))
             pool[k].pop(0)                                  # oldest first (HLC order)
             tk = k if pool is appr else f"{k} (unverified)"

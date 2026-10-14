@@ -69,18 +69,57 @@ def _text(type_, subject, key, p):
 
 
 def shred_states(db):
-    """{subject: 'shredded' | 'shred pending'} from the lifecycle events in the log (ADR 0014). Any subject with an
-    applied shred, or a schedule not followed by a cancel, is withheld from context packs entirely (fail closed:
-    not only its encrypted fields, but also its plaintext fields and text)."""
+    """{subject: 'shredded' | 'shred pending'}: subjects withheld from context packs entirely (ADR 0014/0015).
+
+    Fail closed: a subject is withheld if ANY of these says so (union):
+    1. the keystore state of its key (pending_destroy / destroyed),
+    2. shredding.plan() (the authoritative per-key decision: (hlc, id) order, validity checks),
+    3. the log itself, for keys this device does not hold: any subject.shredded, or a schedule whose latest
+       lifecycle event by (hlc, id) is not a *valid* cancel (shredding._valid).
+    Withholding never needs a signature; only a cancel (which would reveal data again) must be valid."""
+    import shredding
+    evs = shredding.lifecycle_events(db)
+    if not evs:
+        return {}
     out = {}
-    for r in db.execute("SELECT type, subject FROM events WHERE type IN ('subject.shredded','subject.shred_scheduled',"
-                        "'subject.shred_cancelled') ORDER BY seq"):
-        if r["type"] == "subject.shredded" or out.get(r["subject"]) == "shredded":
-            out[r["subject"]] = "shredded"
-        elif r["type"] == "subject.shred_scheduled":
-            out[r["subject"]] = "shred pending"
+
+    def mark(subj, st):
+        if subj and out.get(subj) != "shredded":
+            out[subj] = st
+    rows = {}
+    try:
+        ks = vault.keystore(db)
+        rows = {r[0]: (r[1], r[2]) for r in ks.db.execute("SELECT key_id, subject, state FROM subject_keys")}
+        for kid, (subj, state) in rows.items():
+            if state == "destroyed":
+                mark(subj, "shredded")
+            elif state == "pending_destroy":
+                mark(subj, "shred pending")
+        dec, _ = shredding.plan(db, ks)
+        for kid, (d, ev) in dec.items():
+            if d.startswith("destroy"):
+                mark(rows[kid][0], "shredded")
+            elif d == "schedule":
+                mark(rows[kid][0], "shred pending")
+    except Exception:
+        pass   # no keystore / no cryptography here: the log rule below still applies
+    revoked, cls, latest = shredding._revoked(db), {}, {}
+    for ev in evs:   # (hlc, id) order
+        eid, t, subj, kid = ev[:4]
+        if t == shredding.SHREDDED:
+            mark(subj, "shredded")
+        elif t == shredding.SCHEDULED:
+            latest[subj] = "schedule"
         else:
-            out.pop(r["subject"], None)
+            try:
+                ok = shredding._valid(db, ev, subj, revoked, cls) is None
+            except Exception:
+                ok = False
+            if ok and (kid is None or kid not in rows or rows[kid][0] == subj):
+                latest[subj] = "cancel"
+    for subj, last in latest.items():
+        if last == "schedule":
+            mark(subj, "shred pending")
     return out
 
 
@@ -88,6 +127,7 @@ def _items(db, since=None, types=None, unverified=False):
     events = db.execute("SELECT * FROM events ORDER BY hlc, id").fetchall()
     shred = shred_states(db)
     st = {r["event_id"]: (r["status"], r["trust_eff"]) for r in db.execute("SELECT * FROM proj_status")}
+    by = {r[0]: r[1] or "" for r in db.execute("SELECT event_id, decided_by FROM proj_status")}
     blocked = {r[0] for r in db.execute("SELECT event_id FROM redacted_blocklist")}
     status = lambda i: st.get(i, ("", None))[0]
     trust = lambda e: st.get(e["id"], ("", None))[1] or e["trust"]
@@ -118,7 +158,9 @@ def _items(db, since=None, types=None, unverified=False):
         if t in vault.META_TYPES or e["id"] in superseded:
             continue
         s, tr = status(e["id"]), trust(e)
-        approved = s == "active" and tr == "verified"
+        # approved = written by the user, batch-approved (trust_eff verified), or an agent proposal the user approved
+        # (status active, decided by a user: actor; agent events only become active through a user review)
+        approved = s == "active" and (tr == "verified" or by.get(e["id"], "").startswith("user:"))
         if unverified:
             if approved or s not in ("active", "proposed"):
                 continue
@@ -130,7 +172,7 @@ def _items(db, since=None, types=None, unverified=False):
             continue
         p = vault.read_upcast(e)
         item = {"id": e["id"], "hlc": e["hlc"], "type": t, "date": e["ts"][:10], "supersedes": None,
-                "trust": tr, "actor": e["actor"], "status": s, "withheld": None}
+                "trust": tr, "actor": e["actor"], "status": s, "withheld": None, "approved": approved}
         if e["subject"] in shred:
             item["text"], item["withheld"] = "[" + shred[e["subject"]] + "]", shred[e["subject"]]
         elif s == "redacted" or p.get("redacted") is True or e["id"] in blocked:

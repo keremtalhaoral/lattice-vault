@@ -12,7 +12,7 @@ human-only type; only the content types in IMPORT_TYPES are accepted.
 Idempotent: each entry's idempotency key is derived from its canonical content, so importing the same block twice
 writes nothing the second time (reported as duplicates).
 """
-import hashlib, json, re, sys
+import hashlib, json, re, sys, time
 
 import vault, schemas, agent_api
 
@@ -25,9 +25,22 @@ ENTRY_KEYS = {"type", "subject", "key", "payload", "supersedes", "cites"}
 FORMATS = ("vault_update/2",)
 MAX_BLOCK_BYTES = 65536
 MAX_EVENTS = 25
+DEFAULT_RATE = 20
 FENCE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})[ \t]*vault_update[ \t]*\r?$", re.M)
 UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 AGENT_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+VIA = "via:import-update"
+CONTROL = re.compile("[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]")
+KEY_RX = re.compile(r"[^\s\x00-\x1f\x7f-\x9f]+(?: [^\s\x00-\x1f\x7f-\x9f]+)*")
+
+
+def clean(text, n=160):
+    """Terminal-safe one-line text: control/bidi/zero-width characters removed, secret patterns filtered."""
+    s = " ".join(CONTROL.sub(" ", str(text)).split())
+    if vault.find_secrets(s):
+        return "[filtered]"
+    s = vault.esc(s)
+    return s if len(s) <= n else s[:n - 1] + "…"
 
 assert not any(t.startswith(NEVER_PREFIXES) or t in vault.SIGNED_TYPES or t in vault.HUMAN_ONLY_TYPES
                or t in vault.META_TYPES for t in IMPORT_TYPES)
@@ -41,13 +54,22 @@ def _no_dupes(pairs):
     d = {}
     for k, v in pairs:
         if k in d:
-            raise UpdateRefused(f"duplicate JSON key {k!r}")
+            raise UpdateRefused("duplicate JSON key")
         d[k] = v
     return d
 
 
 def _bad_const(c):
     raise UpdateRefused(f"non-finite number {c} not allowed")
+
+
+def _finite(v):
+    """Reject inf/nan anywhere (e.g. 1e999 parses to inf without going through parse_constant)."""
+    import math
+    if isinstance(v, float) and not math.isfinite(v):
+        raise UpdateRefused("non-finite number not allowed")
+    for x in (v.values() if isinstance(v, dict) else v if isinstance(v, list) else ()):
+        _finite(x)
 
 
 def extract_block(text):
@@ -80,15 +102,18 @@ def parse(text):
         doc = json.loads(body, object_pairs_hook=_no_dupes, parse_constant=_bad_const)
     except UpdateRefused:
         raise
-    except ValueError as e:
+    except json.JSONDecodeError as e:
         raise UpdateRefused(f"vault_update block is not valid JSON ({e.msg} at line {e.lineno})") from None
+    except (ValueError, RecursionError):
+        raise UpdateRefused("vault_update block is not valid JSON (too deep or number too large)") from None
+    _finite(doc)
     if not isinstance(doc, dict):
         raise UpdateRefused("vault_update block must be a JSON object")
     extra = sorted(set(doc) - BLOCK_KEYS)
     if extra:
-        raise UpdateRefused(f"unknown top-level field(s): {', '.join(extra)}")
+        raise UpdateRefused(f"{len(extra)} unknown top-level field(s); allowed: {', '.join(sorted(BLOCK_KEYS))}")
     if "format" in doc and doc["format"] not in FORMATS:
-        raise UpdateRefused(f"unsupported format {doc['format']!r} (supported: {', '.join(FORMATS)})")
+        raise UpdateRefused(f"unsupported format (supported: {', '.join(FORMATS)})")
     if "base_vault_seq" in doc and (type(doc["base_vault_seq"]) is not int or doc["base_vault_seq"] < 0):
         raise UpdateRefused("base_vault_seq must be a non-negative integer")
     if "idempotency_key" in doc and not (isinstance(doc["idempotency_key"], str) and 0 < len(doc["idempotency_key"]) <= 200):
@@ -119,7 +144,7 @@ def validate(db, doc):
             raise UpdateRefused(f"{where}: forbidden field(s): {', '.join(bad)}")
         extra = sorted(set(e) - ENTRY_KEYS)
         if extra:
-            raise UpdateRefused(f"{where}: unknown field(s): {', '.join(extra)}")
+            raise UpdateRefused(f"{where}: {len(extra)} unknown field(s); allowed: {', '.join(sorted(ENTRY_KEYS))}")
         typ, subject, key, payload = e.get("type"), e.get("subject"), e.get("key"), e.get("payload")
         if not isinstance(typ, str) or not re.fullmatch(r"[a-z_]+\.[a-z_]+", typ):
             raise UpdateRefused(f"{where}: invalid type")
@@ -129,15 +154,21 @@ def validate(db, doc):
             raise UpdateRefused(f"{where}: subject must be a non-empty string without whitespace (max 200)")
         if subject.startswith(("event:", "key:")):
             raise UpdateRefused(f"{where}: subject {subject.split(':')[0]}:* is not allowed here")
-        if key is not None and not (isinstance(key, str) and 0 < len(key) <= 200):
-            raise UpdateRefused(f"{where}: key must be a non-empty string (max 200)")
+        if key is not None and not (isinstance(key, str) and 0 < len(key) <= 200 and KEY_RX.fullmatch(key)):
+            raise UpdateRefused(f"{where}: key must be a non-empty string without control characters (max 200)")
         if not isinstance(payload, dict):
             raise UpdateRefused(f"{where}: payload must be an object")
         sup = e.get("supersedes")
         if sup is not None and not (isinstance(sup, str) and UUID.fullmatch(sup)):
             raise UpdateRefused(f"{where}: supersedes must be a full event id")
-        if sup is not None and not db.execute("SELECT 1 FROM events WHERE id=?", (sup,)).fetchone():
-            raise UpdateRefused(f"{where}: supersedes refers to an unknown event")
+        if sup is not None:
+            r = db.execute("SELECT actor, trust FROM events WHERE id=?", (sup,)).fetchone()
+            if not r:
+                raise UpdateRefused(f"{where}: supersedes refers to an unknown event")
+            st = db.execute("SELECT trust_eff FROM proj_status WHERE event_id=?", (sup,)).fetchone()
+            if r["actor"].startswith("user:") or r["trust"] == "verified" or (st and st[0] == "verified"):
+                # an AI proposal must never block the user's own later writes (double-supersede rule)
+                raise UpdateRefused(f"{where}: supersedes may only target an unverified proposal, not a verified or user fact")
         cites = e.get("cites", [])
         if not isinstance(cites, list) or len(cites) > 20 or not all(isinstance(c, str) and UUID.fullmatch(c) for c in cites):
             raise UpdateRefused(f"{where}: cites must be a list of full event ids (max 20)")
@@ -163,13 +194,13 @@ def validate(db, doc):
     return out
 
 
-def _one_line(v, n=160):
-    s = vault.esc(" ".join(str(v).split()))
-    return s if len(s) <= n else s[:n - 1] + "…"
+_one_line = clean
 
 
 def plan(db, entries, actor):
     """Annotate each entry: 'new' | 'duplicate' (already imported by this actor) | 'conflict'; plus 'current' text."""
+    import context_export
+    withheld = context_export.shred_states(db)
     seen = set()
     for e in entries:
         prev = db.execute("SELECT type, subject, payload FROM events WHERE actor=? AND idempotency_key=?",
@@ -185,9 +216,16 @@ def plan(db, entries, actor):
         e["current"] = None
         if e["type"] == "preference.set":
             k = e["key"] or e["payload"].get("key") or "_"
-            r = db.execute("SELECT value FROM proj_preferences WHERE subject=? AND key=? ORDER BY event_id LIMIT 1",
-                           (e["subject"], k)).fetchone()
-            e["current"] = r[0] if r else None
+            r = db.execute("SELECT p.value, e.enc_key_id FROM proj_preferences p JOIN events e ON e.id=p.event_id "
+                           "WHERE p.subject=? AND p.key=? ORDER BY p.event_id LIMIT 1", (e["subject"], k)).fetchone()
+            if r is None:
+                e["current"] = None
+            elif e["subject"] in withheld:
+                e["current"] = "[withheld]"
+            elif r[1]:
+                e["current"] = "[encrypted]"     # never print a decrypted sensitive value (no TTY needed here)
+            else:
+                e["current"] = r[0]
     return entries
 
 
@@ -204,8 +242,23 @@ def preview(entries, actor, stale=None):
             lines.append(f"    - current: {_one_line(e['current'])}")
         lines.append(f"    + {_one_line(vault._flatten(e['payload']))}")
         if e["supersedes"]:
-            lines.append(f"    supersedes {e['supersedes']}")
+            lines.append(f"    supersedes {e['supersedes']} (an unverified proposal)")
     return "\n".join(lines) + "\n"
+
+
+def _agent_limit(agent):
+    """Registered agents (agents.json): refused if revoked, their own hourly limit applies. Unregistered names get
+    the default limit. The rate counter is shared with the agent API (audit action 'propose')."""
+    try:
+        agents = agent_api._load_agents()
+    except agent_api.Refused as x:
+        raise UpdateRefused(str(x)) from None
+    for a in agents:
+        if a.get("id") == agent:
+            if a.get("revoked"):
+                raise UpdateRefused(f"agent:{agent} is revoked")
+            return int(a.get("rate_limit_per_hour", DEFAULT_RATE))
+    return DEFAULT_RATE
 
 
 def import_update(db, text, agent="pasted-ai", confirm=None, dry_run=False, out=None):
@@ -214,26 +267,33 @@ def import_update(db, text, agent="pasted-ai", confirm=None, dry_run=False, out=
     if not (isinstance(agent, str) and AGENT_NAME.fullmatch(agent)):
         raise UpdateRefused("agent name must match [a-z0-9][a-z0-9_-]*")
     actor = f"agent:{agent}"
+    audit = lambda outcome, reason, eid=None: vault.audit(db, actor, "propose", outcome, f"{VIA}: {clean(reason, 200)}", eid)
     try:
+        limit = _agent_limit(agent)
         doc = parse(text)
         entries = plan(db, validate(db, doc), actor)
     except UpdateRefused as x:
-        vault.audit(db, actor, "import_update", "refused", str(x)[:200])
+        audit("refused", str(x))
         raise
     seq = db.execute("SELECT COALESCE(MAX(seq),0) FROM events").fetchone()[0]
     base = doc.get("base_vault_seq")
     pv = preview(entries, actor, (base, seq) if isinstance(base, int) and base < seq else None)
     conflicts = [n for n, e in enumerate(entries, 1) if e["state"] == "conflict"]
     if conflicts:
-        vault.audit(db, actor, "import_update", "refused", "idempotency conflict")
+        audit("refused", "idempotency conflict")
         raise UpdateRefused(f"entries {conflicts}: same idempotency key, different content; nothing imported")
     new = [e for e in entries if e["state"] == "new"]
     res = {"actor": actor, "new": len(new), "duplicates": len(entries) - len(new), "event_ids": [], "dry_run": dry_run}
     out.write(pv)
     if dry_run or not new:
         return res
+    used = db.execute("SELECT count(*) FROM audit WHERE actor=? AND action='propose' AND outcome='accepted' AND epoch>?",
+                      (actor, time.time() - agent_api.RATE_WINDOW_S)).fetchone()[0]
+    if used + len(new) > limit:
+        audit("refused", f"rate limit {limit}/h")
+        raise UpdateRefused(f"rate limit for {actor}: {limit} proposals per hour ({used} used, {len(new)} new); nothing written")
     if confirm is None or not confirm(pv):
-        vault.audit(db, actor, "import_update", "refused", "not confirmed by the user")
+        audit("refused", "not confirmed by the user")
         raise UpdateRefused("import not confirmed; nothing written")
     try:
         for e in new:
@@ -245,12 +305,12 @@ def import_update(db, text, agent="pasted-ai", confirm=None, dry_run=False, out=
     except Exception as x:
         db.rollback()
         reason = "secret pattern detected" if isinstance(x, vault.SecretRefused) else str(x).split(";")[0][:160]
-        vault.audit(db, actor, "import_update", "refused", reason)
+        audit("refused", reason)
         raise UpdateRefused(f"import failed, nothing written: {reason}") from None
     vault.rebuild(db)
     vault._after_commit(db)
     for eid in res["event_ids"]:
-        vault.audit(db, actor, "import_update", "accepted", "ok", eid)
+        audit("accepted", "ok", eid)
     return res
 
 

@@ -1,7 +1,8 @@
 # Context Pack export (`vault export-context`)
 
-MCP-fallback for LLMs without MCP (ChatGPT/Gemini/DeepSeek paste-in) and for humans. Complements, and does not
-replace, `vault pack` / MCP `export_context_pack` (spec 1.0.0), which are unchanged. Design: ADR 0015.
+Paste-in pack for LLMs without MCP and for humans. The MCP `export_context_pack` tool and `vault://pack/*`
+resources return the same `context-pack/2` format (approved facts only; `max_chars` ≥ 2000). The human CLI
+`vault pack` (spec 1.0.0) is unchanged. Design: ADR 0015.
 
 ```
 vault export-context [--out FILE|-] [--format 2|1] [--profile minimal|full] [--since DATE] [--types t1,t2]
@@ -33,7 +34,8 @@ Legend …
 ```
 ~~~
 
-* **Content.** Approved = `proj_status.status = active` and effective trust `verified`. Proposed, rejected,
+* **Content.** Approved = `proj_status.status = active` and either effective trust `verified` (user-written or
+  batch-approved) or an agent proposal approved by the user (marked `· approved by the user`). Proposed, rejected,
   reverted, superseded, meta and infrastructure (`key.*`, `attestation.*`, `subject.*` …) events are never in the
   approved section; `--include-unverified` adds the separate unverified section. `minimal` drops Learnings.
 * **Never in a pack:** decrypted fields (`[encrypted]`), redacted events (`[redacted]`), anything matching the secret
@@ -54,6 +56,9 @@ one block per input. Every entry is validated (allowed content types only; no `s
 other `event.*`; no `trust`/`status`/`actor`/`source` fields; schema, size, secret and instruction-like-text
 checks). You see a preview, then type `yes` on the terminal. Entries land **unverified** as `agent:<name>`; approve
 each with `vault approve`. Re-importing the same block does nothing. Any problem refuses the whole block.
+`supersedes` may only point at an unverified proposal, so an import never blocks your own later writes to a fact.
+The preview strips terminal control characters and shows `[encrypted]` / `[withheld]` instead of sensitive or
+shred-affected current values. A revoked agent name is refused; the hourly limit is shared with `propose_event`.
 
 ## Format `lattice-context/v1` (`--format 1`)
 

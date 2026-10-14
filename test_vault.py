@@ -1,7 +1,7 @@
-import os as _os; _os.environ.setdefault("VAULT_ALLOW_NONTTY", "1")  # test-only TTY bypass
+import testutil  # noqa: F401  test harness: harness key, config dir, TTY bypass (SECURITY.md)
 import io, os, sqlite3, subprocess, sys, tempfile, unittest
 from contextlib import redirect_stdout
-import vault
+import vault, signing
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -10,6 +10,7 @@ class Base(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(); self.path = os.path.join(self.tmp, "v.db")
         os.environ["VAULT_DB"] = self.path
         self.db = vault.connect(self.path)
+        signing.register_user_key(self.db)   # as `vault keys init-user`; the CLI subprocesses sign with the harness key
     def cli(self, *args):
         r = subprocess.run([sys.executable, os.path.join(HERE, "vault.py"), *args], capture_output=True, text=True,
                            env={**os.environ, "VAULT_DB": self.path})
@@ -84,7 +85,7 @@ class T(Base):
         a, d1 = vault.append(self.db, "note.added", "x", {"text": "a"}, "agent:c", "unverified", idempotency_key="k1")
         b, d2 = vault.append(self.db, "note.added", "x", {"text": "a"}, "agent:c", "unverified", idempotency_key="k1")
         self.assertEqual(a, b); self.assertFalse(d1); self.assertTrue(d2)
-        self.assertEqual(self.db.execute("SELECT count(*) FROM events").fetchone()[0], 1)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM events WHERE type<>'key.registered'").fetchone()[0], 1)
         with self.assertRaises(sqlite3.IntegrityError):
             self.db.execute("INSERT INTO events(id,replica_id,replica_seq,hlc,ts,type,subject,payload,actor,trust,idempotency_key,content_hash,prev_hash,hash) "
                             "VALUES('z','local',99,'99','t','note.added','x','{}','agent:c','unverified','k1','c','p','h')")

@@ -75,6 +75,10 @@ def _origin_rows(db, me):
             row["parents"] = [[p[0], p[1]] for p in db.execute(
                 "SELECT parent_id, rel FROM event_parents WHERE event_id=? ORDER BY rel, parent_id", (r["id"],))]
             row["targets"] = [t[0] for t in db.execute("SELECT target_id FROM event_targets WHERE event_id=? ORDER BY target_id", (r["id"],))]
+            sg = db.execute("SELECT key_id, alg, sig FROM event_sigs WHERE event_id=?", (r["id"],)).fetchone() \
+                if _has(db, "event_sigs") else None
+            if sg:   # the origin hash binds the signature (vault.event_hash v2); the receiver needs it to verify the hash.
+                row["sig"] = {"key_id": sg[0], "alg": sg[1], "sig": sg[2]}   # NOT verified on import yet (ADR 0011)
         out.append((dev, row))
     return out
 
@@ -125,6 +129,7 @@ def _parse(path):
 def _verify_event(e):
     row = dict(e)
     row["payload_ct"] = base64.b64decode(e["payload_ct"]) if e.get("payload_ct") else None
+    row["_sig"] = (e.get("sig") or {}).get("sig")
     if vault.event_hash(e["prev_hash"], row) != e["hash"]:
         raise SyncError(f"event {e['id']}: hash mismatch (tampered)")
     if vault.content_hash(e["type"], e["subject"], e["key"], json.loads(e["payload"])) != e["content_hash"]:
@@ -162,11 +167,11 @@ def import_package(db, path, dry_run=False, now_ms=None):
     for e, row in todo:
         if e["content_hash"] in blocked or e["id"] in blocked:
             rep["skipped"].append({"id": e["id"], "reason": "redaction blocklist"}); continue
-        local = dict(row)
+        local = dict(row); local.pop("_sig", None)   # local copy is stored without the origin signature (remote-unsigned)
         local["replica_id"] = e["origin_device"] if row["replica_id"] == "local" else row["replica_id"]
         quarantine = e["origin_device"] not in paired and e["actor"].startswith("user:")
         if quarantine:
-            if e["type"] in vault.HUMAN_ONLY_TYPES:
+            if e["type"] in vault.SIGNED_TYPES:
                 rep["skipped"].append({"id": e["id"], "reason": "human-only event from unpaired device"}); continue
             local["actor"], local["trust"] = f"import:sync-{e['origin_device']}", "unverified"
             rep["quarantined"] += 1

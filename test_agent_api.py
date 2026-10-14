@@ -1,4 +1,4 @@
-import os as _os; _os.environ.setdefault("VAULT_ALLOW_NONTTY", "1")  # test-only TTY bypass
+import testutil  # noqa: F401  test harness: harness key, config dir, TTY bypass (SECURITY.md)
 import json, os, sqlite3, stat, subprocess, sys, tempfile, time, unittest
 import vault, agent_api
 from agent_api import Refused
@@ -217,6 +217,7 @@ class TestAudit(AgentBase):
         rows = self.audit_rows()
         self.assertEqual([(x[0], x[1], x[2]) for x in rows],
                          [("agent:alpha", "propose", "accepted"), ("unauthenticated", "propose", "refused"),
+                          ("user:owner", "key_register", "accepted"),   # harness: first signed event registers the user key
                           ("user:owner", "reject", "accepted")])
         ts = sqlite3.connect(self.dbp).execute("SELECT ts FROM audit").fetchall()
         self.assertTrue(all(t[0] for t in ts))

@@ -21,10 +21,11 @@ injection attempts.
 - Secrets: pre-write filter on every write path; AES-256-GCM per-subject field encryption with
   crypto-shredding; human-approved redaction to a new file with a persistent blocklist.
 - Human commands require an interactive TTY; files are created 0600.
+- Human-only events are signed with a user Ed25519 key, and a signed external anchor holds the chain heads
+  (ADR 0011).
 
 ## Not implemented
-Signed (Ed25519) human approvals, OS-keychain key storage, Argon2id KDF, external integrity anchor,
-separate OS account for the vault. See [SECURITY.md](../../SECURITY.md).
+OS-keychain key storage, Argon2id KDF, device keys / signed sync packages, separate OS account for the vault. See [SECURITY.md](../../SECURITY.md).
 
 ## Consequences
 Defends against misbehaving agents and accidents within a single-user machine; does not defend against

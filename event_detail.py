@@ -79,7 +79,7 @@ def safe_payload(e, status=None):
 
 def _chain_check(db, e):
     prev, out = vault.GENESIS, {"ok": True, "detail": "hash chain verified up to this event"}
-    for r in db.execute("SELECT * FROM events WHERE seq<=? ORDER BY seq", (e["seq"],)):
+    for r in db.execute(vault.events_sql(db) + " WHERE e.seq<=? ORDER BY e.seq", (e["seq"],)):
         if r["prev_hash"] != prev or vault.event_hash(prev, r) != r["hash"]:
             return {"ok": False, "detail": f"event chain broken at seq {r['seq']}"}
         prev = r["hash"]

@@ -1,6 +1,6 @@
-import os as _os; _os.environ.setdefault("VAULT_ALLOW_NONTTY", "1")  # test-only TTY bypass
+import testutil  # noqa: F401  test harness: harness key, config dir, TTY bypass (SECURITY.md)
 import json, os, subprocess, sys, tempfile, unittest
-import vault, agent_api
+import vault, agent_api, signing
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SDK_PY = os.path.join(HERE, ".venv-sdk", "bin", "python")
@@ -42,6 +42,7 @@ class Base(unittest.TestCase):
         self.dbp = os.path.join(self.tmp, "v.db"); self.agp = os.path.join(self.tmp, "agents.json")
         os.environ["VAULT_DB"] = self.dbp; os.environ["VAULT_AGENTS"] = self.agp
         db = vault.connect(self.dbp)
+        signing.register_user_key(db)   # as `vault keys init-user` (CLI approvals in these tests sign)
         vault.append(db, "decision.made", "decision:D-003", {"decision_id": "D-003", "title": "Vault", "decision": "Mimari kararı alındı"},
                      "user:owner", "verified")
         db.close()
@@ -140,7 +141,7 @@ class TestTools(Base):
                 self.assertTrue(r["isError"]); self.assertIn("forbidden", r["content"][0]["text"])
         r = s.call("propose_event", {"type": "event.approved", "subject": "x", "payload": {}, "idempotency_key": "z"})
         self.assertTrue(r["isError"])
-        n = vault.connect(self.dbp).execute("SELECT count(*) FROM events").fetchone()[0]
+        n = vault.connect(self.dbp).execute("SELECT count(*) FROM events WHERE type<>'key.registered'").fetchone()[0]
         self.assertEqual(n, 1)
 
     def test_no_token_reads_ok_propose_refused(self):

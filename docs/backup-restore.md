@@ -97,3 +97,10 @@ a pre-shred keys backup brings the subject back as readable.
 WAL+NORMAL would be faster but a `-wal` file can retain redacted/shredded pages, and backup/redaction would
 need explicit `wal_checkpoint(TRUNCATE)` handling. Revisit with sync at scale. The backup API is
 journal-mode agnostic, so switching later does not change the backup format.
+
+## Signing key and anchor (ADR 0011)
+The user signing key (`VAULT_USER_KEY`) is **not** part of any backup: not `backup`, not `backup-keys` and not
+`backup-kek`. Back it up yourself, offline. Without it, a restored vault verifies, but you cannot write new
+human-only events. `restore` deletes the external anchor of the target path, because restoring an older backup is an
+intentional rollback. The restore audit row then writes a fresh signed anchor if the user key is available.
+`vault verify` reports signature and anchor results too.

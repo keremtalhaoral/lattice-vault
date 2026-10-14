@@ -27,6 +27,11 @@ SAMPLES = {
     "event.redacted": {"redaction_id": "r", "reason": "x"},
     "subject.shredded": {"key_id": "k"},
     "conflict.resolved": {"reason": "x"},
+    "key.registered": {"key_id": "user/ed25519/0011223344556677", "alg": "ed25519", "pubkey_b64": "AAAA", "role": "user",
+                       "certified_by": "user/ed25519/0011223344556677"},
+    "key.rotated": {"old_key_id": "a", "new_key_id": "b", "new_key_sig": "c"},
+    "key.revoked": {"key_id": "a", "effective_hlc": "0-0-local", "reason": "lost", "compromised": False},
+    "attestation.recorded": {"target_event_ids": ["e"], "statement": "mine"},
 }
 
 

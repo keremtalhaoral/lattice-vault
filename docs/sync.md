@@ -19,7 +19,11 @@ plus `origin_device`. Forwarded events (A→B→C) are re-exported from the stor
 ## Integrity
 1. `sha256(body) == manifest.body_sha256`, and `event_count` matches. If either fails, the whole package is rejected.
 2. For every event, recompute `event_hash(prev_hash, row)` (the same function as the local chain) and `content_hash`. Any mismatch rejects the package.
-3. **Not built:** Ed25519 signing (`signature` is always null). SHA-256 detects corruption. It does **not** authenticate the sender:
+3. Events signed with the user key carry `sig` in the body line, because the origin hash binds the signature
+   (`vault.event_hash`). The receiver uses it to recompute the hash, but does **not** verify the signature yet. Locally
+   these events are stored unsigned (`remote-unsigned`, see docs/adr/0011-signing-keys.md). Signed-type events from
+   an unpaired device are skipped.
+4. **Not built:** Ed25519 package signing (`signature` is always null). SHA-256 detects corruption. It does **not** authenticate the sender:
    anyone who can write the file can recompute both hashes. Until signing exists, "paired device" is a label the
    user asserts, not something the vault proves (see the threat model / draft v0.4 K-6).
 

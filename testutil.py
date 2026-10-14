@@ -1,6 +1,32 @@
 import os, shutil, sqlite3, tempfile
+# ---- test harness (see SECURITY.md "Test harness") ----
+# VAULT_ALLOW_NONTTY is honoured only together with VAULT_TEST_HARNESS=1 and a VAULT_USER_KEY under the temp dir.
+_HARNESS = tempfile.mkdtemp(prefix="vault-harness-")
+os.environ["VAULT_TEST_HARNESS"] = "1"
 os.environ.setdefault("VAULT_ALLOW_NONTTY", "1")
-import vault
+os.environ["VAULT_CONFIG_DIR"] = os.path.join(_HARNESS, "config")       # anchors land here, never in ~/.config
+os.environ["VAULT_USER_KEY"] = os.path.join(_HARNESS, "user_ed25519.key")
+os.environ.pop("VAULT_ANCHOR_PATH", None); os.environ.pop("VAULT_USER_KEY_PASSPHRASE", None)
+import vault, signing
+if signing.HAVE_CRYPTO:
+    signing.generate_user_key(os.environ["VAULT_USER_KEY"])
+
+_append = vault.append
+AUTO_REGISTER = True
+
+
+def _harness_append(db, type_, subject, payload, actor, trust, *a, **kw):
+    """Harness only: the first signed (human-only) append in a test vault registers the harness user key first,
+    as `vault keys init-user` would. Vaults that never write human-only events get no extra rows."""
+    if (AUTO_REGISTER and signing.HAVE_CRYPTO and type_ in vault.SIGNED_TYPES and type_ not in signing.KEY_TYPES
+            and actor.startswith("user:")):
+        vault.ensure_sig_schema(db)
+        if signing.epoch_seq(db) is None:
+            signing.register_user_key(db)
+    return _append(db, type_, subject, payload, actor, trust, *a, **kw)
+
+
+vault.append = _harness_append
 
 try:
     import crypto_keys

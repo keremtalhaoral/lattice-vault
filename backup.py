@@ -383,6 +383,9 @@ def restore(backup_dir, to_path, force=False, allow_missing_keys=False, keys_dir
     finally:
         shutil.rmtree(stage, ignore_errors=True)
     vault._KEYSTORE.pop(to_path, None)
+    import signing
+    signing.remove_anchor(to_path)       # restoring an older backup is an intentional (human-approved) rollback;
+                                         # the first commit below (restore audit row) writes a fresh signed anchor
     if not has_keys:
         vault._KEYSTORE[to_path] = _NoKeyStore()   # never auto-create keys.db / a fresh KEK on a keyless restore
     try:

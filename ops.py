@@ -49,11 +49,20 @@ def _copy(src, dst_path, transform_event=None, transform_audit=None):
     dst = vault.connect(dst_path)
     cols = [c[1] for c in dst.execute("PRAGMA table_info(events)") if c[1] not in ("seq", "recorded_at", "prev_hash", "hash")]
     prev = vault.GENESIS
+    sigs = {}
+    if src.execute("SELECT 1 FROM sqlite_master WHERE name='event_sigs'").fetchone():
+        # signatures do not cover prev_hash, so they stay valid in the copy; they are re-bound into the new chain.
+        # (Known limit: a redacted signed-type event keeps a signature over its old payload -> flagged bad by doctor.)
+        rows = src.execute("SELECT event_id, key_id, alg, sig FROM event_sigs").fetchall()
+        dst.executemany("INSERT INTO event_sigs(event_id,key_id,alg,sig) VALUES(?,?,?,?)", [tuple(x) for x in rows])
+        sigs = {x[0]: x[3] for x in rows}
     for r in src.execute("SELECT * FROM events ORDER BY seq"):
         row = {c: (r[c] if c in r.keys() else None) for c in cols}
         if transform_event:
             row = transform_event(row)
+        row["_sig"] = sigs.get(row["id"])
         row["prev_hash"] = prev; row["hash"] = vault.event_hash(prev, row); prev = row["hash"]
+        row.pop("_sig")
         ks = list(row)
         dst.execute(f"INSERT INTO events({','.join(ks)}) VALUES({','.join('?'*len(ks))})", [row[k] for k in ks])
     for t in ("event_parents", "event_targets", "redactions", "redacted_blocklist", "replicas"):
@@ -226,16 +235,46 @@ def _projection_pair(db):
     return before, after
 
 
+def signature_report(db):
+    """Signatures (full log), key registry and external anchor. Read-only. Returns (problems, warnings, checks)."""
+    import signing
+    problems, warnings, checks = [], [], {}
+    keys, kp = signing.registry_problems(db)
+    problems += kp
+    cls = signing.classify(db, None, keys)
+    summ = signing.summarize(cls)
+    checks["signatures"] = summ
+    checks["registered_keys"] = sorted(keys)
+    bad = sorted((seq, st) for seq, st in cls.values() if st in signing.BAD)
+    if bad:
+        problems.append(f"{len(bad)} signed-type event(s) failed signature verification (first: seq {bad[0][0]} {bad[0][1]})")
+    if summ.get("legacy-unsigned"):
+        warnings.append(f"{summ['legacy-unsigned']} legacy-unsigned human-only event(s) predate signing; accepted but "
+                        "flagged. Re-attest with `vault sign-legacy` (TTY).")
+    if summ.get("remote-unsigned"):
+        warnings.append(f"{summ['remote-unsigned']} human-only event(s) imported via sync are unsigned locally "
+                        "(package/device signing is planned, ADR 0011)")
+    if signing.epoch_seq(db) is None:
+        warnings.append("no user signing key registered in this vault: run `vault keys init-user`")
+    aerr, awarn = signing.check_anchor(db, keys)
+    problems += aerr; warnings += awarn
+    checks["anchor"] = "ok" if not aerr and not awarn else (aerr or awarn)[0]
+    return problems, warnings, checks
+
+
 def verify(db):
     """`vault verify`: full event + audit hash-chain verify and projection hash vs a fresh rebuild. No writes."""
     problems = vault.check_triggers(db) + vault.verify_chains(db)
+    sp, sw, sc = signature_report(db)
+    problems += sp
     before, after = _projection_pair(db)
     if before != after:
         problems.append("projections differ from a fresh rebuild of the log")
     n = db.execute("SELECT count(*) FROM events").fetchone()[0]
     head = (db.execute("SELECT hash FROM events ORDER BY seq DESC LIMIT 1").fetchone() or [vault.GENESIS])[0]
-    return {"ok": not problems, "problems": problems, "event_count": n, "chain_head": head,
-            "projection_hash": before, "projection_matches_log": before == after}
+    return {"ok": not problems, "problems": problems, "warnings": sw, "event_count": n, "chain_head": head,
+            "projection_hash": before, "projection_matches_log": before == after,
+            "signatures": sc["signatures"], "registered_keys": sc["registered_keys"], "anchor": sc["anchor"]}
 
 
 def doctor(db, decrypt_all=False):
@@ -244,6 +283,8 @@ def doctor(db, decrypt_all=False):
     Returns {ok, problems, checks}."""
     problems = vault.check_triggers(db) + vault.verify_chains(db)
     checks = {"triggers_and_chains": not problems}
+    sp, sig_warnings, sc = signature_report(db)
+    problems += sp; checks.update(sc)
     ic = [r[0] for r in db.execute("PRAGMA integrity_check")]
     qc = [r[0] for r in db.execute("PRAGMA quick_check")]
     checks["integrity_check"] = ic[0] if ic == ["ok"] else ic[:5]
@@ -314,7 +355,7 @@ def doctor(db, decrypt_all=False):
     checks["blocklisted_but_present"] = blocked
     if blocked:
         problems.append(f"{blocked} blocklisted event(s) still carry content")
-    warnings = []
+    warnings = sig_warnings
     lp = obs._path()
     try:
         fd = os.open(lp, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600); os.close(fd)
@@ -329,4 +370,7 @@ def doctor(db, decrypt_all=False):
     if unknown:
         problems.append(f"{len(unknown)} event(s) have a schema_version newer than this code; excluded from "
                         f"projections until upgrade (first: {unknown[0]})")
+    if not problems:
+        vault.set_last_full_verify(db)
+    checks["last_full_verify"] = vault.last_full_verify(db)
     return {"ok": not problems, "problems": problems, "warnings": warnings, "checks": checks}

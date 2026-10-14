@@ -8,6 +8,17 @@ All notable changes to this project are documented here. Format: [Keep a Changel
   `vault_update` template. See docs/context-pack.md. `vault pack` is unchanged.
 - `vault show <id|suffix> [--json] [--tree]`: read-only event detail with review/audit history and the full
   correction/supersede chain (effective head, reverts, conflict flagging); never decrypts. See docs/event-detail.md.
+- `vault backup --out DIR [--no-keys]` / `vault restore DIR --to PATH [--force] [--allow-missing-keys]`:
+  online sqlite3-backup of vault.db + wrapped keys.db with sha256 manifest; restore verifies hashes,
+  integrity_check, triggers, hash chains and key coverage, re-applies logged shreds, renames atomically and
+  rebuilds projections. A backup with keys.db defeats later crypto-shredding (warned). See docs/backup-restore.md.
+### Changed
+- `connect()` sets `busy_timeout=5000` and `synchronous=FULL`; journal mode stays DELETE (decision in
+  docs/backup-restore.md).
+- `vault doctor` reports `PRAGMA integrity_check`/`quick_check` and warns when the ops log is not writable.
+### Fixed
+- `vault doctor` in-memory rebuild could not find the vault's keystore (`''` vs `:memory:` key), so encrypted
+  events could be reported as projection drift.
 
 ## [0.1.0-prototype] - 2026-10-14
 First public prototype. **Not for production use.**

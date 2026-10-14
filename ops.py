@@ -206,17 +206,31 @@ def doctor(db):
     """Append-only integrity, projection vs log, orphan keys, shredded-but-still-readable. Returns {ok, problems, checks}."""
     problems = vault.check_triggers(db) + vault.verify_chains(db)
     checks = {"triggers_and_chains": not problems}
+    ic = [r[0] for r in db.execute("PRAGMA integrity_check")]
+    qc = [r[0] for r in db.execute("PRAGMA quick_check")]
+    checks["integrity_check"] = ic[0] if ic == ["ok"] else ic[:5]
+    checks["quick_check"] = qc[0] if qc == ["ok"] else qc[:5]
+    if ic != ["ok"] or qc != ["ok"]:
+        problems.append("sqlite integrity_check/quick_check failed")
     mem = sqlite3.connect(":memory:"); mem.row_factory = sqlite3.Row
     db.backup(mem)
     before = vault.projection_hash(db)
-    vault._KEYSTORE[":memory:"] = vault._KEYSTORE.get(db_path(db))
+    ks = vault._KEYSTORE.get(db_path(db))
+    if ks is None and db.execute("SELECT 1 FROM events WHERE enc_key_id IS NOT NULL LIMIT 1").fetchone():
+        try:
+            ks = vault.keystore(db)       # load the vault's own keystore so the in-memory rebuild decrypts the same way
+        except Exception:
+            ks = None
+    mem_keys = (":memory:", "")          # PRAGMA database_list reports '' for an in-memory DB
     try:
-        if vault._KEYSTORE[":memory:"] is None:
-            vault._KEYSTORE.pop(":memory:")
+        if ks is not None:
+            for k in mem_keys:
+                vault._KEYSTORE[k] = ks
         vault.rebuild(mem)
         after = vault.projection_hash(mem)
     finally:
-        vault._KEYSTORE.pop(":memory:", None)
+        for k in mem_keys:
+            vault._KEYSTORE.pop(k, None)
     checks["projection_matches_log"] = before == after
     if before != after:
         problems.append("projections differ from a fresh rebuild of the log")
@@ -250,4 +264,12 @@ def doctor(db):
     checks["blocklisted_but_present"] = blocked
     if blocked:
         problems.append(f"{blocked} blocklisted event(s) still carry content")
-    return {"ok": not problems, "problems": problems, "checks": checks}
+    warnings = []
+    lp = obs._path()
+    try:
+        fd = os.open(lp, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600); os.close(fd)
+        checks["ops_log_writable"] = True
+    except OSError as e:
+        checks["ops_log_writable"] = False
+        warnings.append(f"ops log {lp} is not writable ({type(e).__name__}); obs.log() drops records silently")
+    return {"ok": not problems, "problems": problems, "warnings": warnings, "checks": checks}

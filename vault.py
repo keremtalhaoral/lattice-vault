@@ -17,6 +17,7 @@ os.umask(0o077)
 
 PACK_SPEC = "1.0.0"
 SCHEMA_VERSION = "2"
+BUSY_TIMEOUT_MS = 5000
 GENESIS = "0" * 64
 REVIEW_TYPES = ("event.approved", "event.rejected")
 HUMAN_ONLY_TYPES = ("event.approved", "event.rejected", "event.reverted", "import.batch_approved",
@@ -278,7 +279,9 @@ def connect(path=None, verify=True):
     new = not os.path.exists(path) or os.path.getsize(path) == 0
     db = sqlite3.connect(path)
     db.row_factory = sqlite3.Row
+    db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
     db.execute("PRAGMA journal_mode=DELETE"); db.execute("PRAGMA secure_delete=ON")
+    db.execute("PRAGMA synchronous=FULL")   # DELETE journal: FULL is the only setting that is durable on power loss
     _secure_files(path)
     if new:
         create_schema(db)
@@ -730,7 +733,7 @@ def pack(db, profile="full", max_chars=None, include_unverified=False):
 
 # ---------- CLI ----------
 HUMAN_CMDS = {"add", "approve", "reject", "correct", "revert", "import-approve", "revert-import", "redact",
-              "shred-cancel", "shred-finalize", "agent-add", "agent-revoke", "review-verdict", "migrate", "sync-pair"}
+              "shred-cancel", "shred-finalize", "agent-add", "agent-revoke", "review-verdict", "migrate", "sync-pair", "backup", "restore"}
 
 
 def _tip(db, event_id):
@@ -800,6 +803,12 @@ def main(argv=None):
     sp.add_parser("device-id", help="show (create on first use) this vault's stable device id")
     spr = sp.add_parser("sync-pair", help="register another device of the owner (human-only)")
     spr.add_argument("device"); spr.add_argument("--name", required=True)
+    bk = sp.add_parser("backup", help="consistent online copy of vault.db + keys.db (wrapped) with manifest.json")
+    bk.add_argument("--out", required=True); bk.add_argument("--no-keys", action="store_true",
+                                                             help="omit keys.db (keeps crypto-shredding effective)")
+    rs = sp.add_parser("restore", help="verify a backup and restore it to a new path")
+    rs.add_argument("backup_dir"); rs.add_argument("--to", required=True); rs.add_argument("--force", action="store_true")
+    rs.add_argument("--allow-missing-keys", action="store_true", help="restore even if keys.db lacks keys the log references")
     args = ap.parse_args(argv)
     try:
         if args.cmd in HUMAN_CMDS or (args.cmd == "shred" and args.confirm):
@@ -810,7 +819,16 @@ def main(argv=None):
         if args.cmd == "show":   # read-only path: does not use connect() (which writes); see docs/event-detail.md
             import event_detail
             sys.stdout.write(event_detail.show(args.event_id, args.json, args.tree)); return 0
+        if args.cmd == "restore":   # does not open the live vault
+            import backup
+            print(json.dumps(backup.restore(args.backup_dir, args.to, args.force, args.allow_missing_keys), ensure_ascii=False, indent=2)); return 0
         db = connect()
+        if args.cmd == "backup":
+            import backup
+            rep = backup.backup(db, args.out, include_keys=not args.no_keys)
+            if rep["warning"]:
+                print("WARNING: " + rep["warning"], file=sys.stderr)
+            print(json.dumps(rep["manifest"], ensure_ascii=False, indent=2)); return 0
         if args.cmd == "add":
             payload = json.loads(args.payload) if args.payload else {"text": args.text}
             if args.source != "user":
@@ -929,7 +947,7 @@ def main(argv=None):
     except Exception as e:
         if type(e).__name__ not in ("Refused", "ValueError", "OperationalError", "IntegrityError", "DatabaseError",
                                     "JSONDecodeError", "TamperError", "SecretRefused", "HumanRequired", "KeyError",
-                                    "FileExistsError", "Shredded", "SyncError", "CryptoUnavailable", "PermissionError"):
+                                    "FileExistsError", "BackupError", "Shredded", "SyncError", "CryptoUnavailable", "PermissionError"):
             raise
         print(f"error: {e}", file=sys.stderr); return 1
     return 0

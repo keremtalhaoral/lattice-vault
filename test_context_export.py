@@ -91,7 +91,7 @@ class ContextExportTest(unittest.TestCase):
 
     def test_vault_update_block_and_cli(self):
         p = os.path.join(self.d, "ctx.md")
-        self.assertEqual(vault.main(["export-context", "--out", p, "--fixed-time", FT]), 0)
+        self.assertEqual(vault.main(["export-context", "--format", "1", "--out", p, "--fixed-time", FT]), 0)
         o = open(p, encoding="utf-8").read()
         self.assertEqual(o, self.out())
         m = re.search(r"```vault_update\n(.*?)```", o, re.S)

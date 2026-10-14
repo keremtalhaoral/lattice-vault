@@ -97,7 +97,7 @@ class TestProtocol(Base):
         uris = [r["uri"] for r in s.req("resources/list")["result"]["resources"]]
         self.assertIn("vault://pack/minimal", uris)
         txt = s.req("resources/read", {"uri": "vault://pack/minimal"})["result"]["contents"][0]["text"]
-        self.assertIn("pack_spec: 1.0.0", txt)
+        self.assertIn('format: "context-pack/2"', txt)
         eid = json.loads(s.call("search", {"query": "karari"})["content"][0]["text"])[0]["source"]
         ev = json.loads(s.req("resources/read", {"uri": eid})["result"]["contents"][0]["text"])
         self.assertEqual(ev["status"], "active")
@@ -190,3 +190,47 @@ asyncio.run(main())
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestPackNeverDecrypts(Base):
+    """MCP read surfaces use the context_pack export path: sensitive fields stay [encrypted], shred-pending and
+    shredded subjects are withheld (ADR 0015)."""
+
+    def test_sensitive_and_shredded_canaries_over_jsonrpc(self):
+        import crypto_keys, time
+        if not crypto_keys.HAVE_CRYPTO:
+            self.skipTest("cryptography not installed")
+        import ops
+        db = vault.connect(self.dbp)
+        vault.append(db, "preference.set", "user:owner", {"key": "pin", "value": "PIN-CANARY-4711"}, "user:owner",
+                     "verified", sensitive=["value"])
+        vault.append(db, "learning.captured", "user:owner", {"text": "HEALTH-CANARY"}, "user:owner", "verified",
+                     sensitive=["text"])
+        vault.append(db, "preference.set", "person:x", {"key": "color", "value": "PLAIN-SHRED-CANARY"}, "user:owner", "verified")
+        vault.append(db, "preference.set", "person:x", {"key": "pin", "value": "SENS-SHRED-CANARY"}, "user:owner",
+                     "verified", sensitive=["value"])
+        canaries = ("PIN-CANARY-4711", "HEALTH-CANARY", "PLAIN-SHRED-CANARY", "SENS-SHRED-CANARY")
+
+        def surfaces(s):
+            out = [s.call("export_context_pack", {"profile": p})["content"][0]["text"] for p in ("minimal", "full")]
+            out += [s.req("resources/read", {"uri": f"vault://pack/{p}"})["result"]["contents"][0]["text"]
+                    for p in ("minimal", "full")]
+            out.append(s.call("get_summary")["content"][0]["text"])
+            out.append(s.req("resources/read", {"uri": "vault://summary"})["result"]["contents"][0]["text"])
+            for q in ("canary", "PLAIN", "color"):
+                out.append(s.call("search", {"query": q})["content"][0]["text"])
+            return out
+
+        ops.shred_confirm(db, "person:x", 7)
+        for tok in (self.tok, None):                      # with and without an agent token
+            s = self.server(tok); s.init()
+            for txt in surfaces(s):
+                for c in canaries:
+                    self.assertNotIn(c, txt)
+            self.assertIn("[encrypted]", surfaces(s)[1])
+        ops.shred_finalize(db, "person:x", now=time.time() + 30 * 86400)
+        db.close()
+        s = self.server(); s.init()
+        for txt in surfaces(s):
+            for c in canaries:
+                self.assertNotIn(c, txt)

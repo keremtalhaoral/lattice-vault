@@ -109,6 +109,12 @@ def _audit(actor, outcome, reason, event_id=None):
 
 
 # ---------------- reads ----------------
+def _withheld(db):
+    """Subjects with an applied or pending crypto-shred: no plaintext of theirs on any agent read surface."""
+    import context_export
+    return context_export.shred_states(db)
+
+
 def get_summary(token=None):
     """Canonical summary: active events only (proposed/unverified/rejected excluded). Reads allowed without auth."""
     db = _ro()
@@ -116,16 +122,22 @@ def get_summary(token=None):
         rows = db.execute("""SELECT e.id, e.type, e.subject, e.payload, e.trust FROM events e JOIN proj_status s
                              ON s.event_id = e.id WHERE s.status='active' AND e.type NOT LIKE 'event.%' ORDER BY e.seq""").fetchall()
         as_of = db.execute("SELECT COALESCE(MAX(seq),0) FROM events").fetchone()[0]
+        wh = _withheld(db)
         return {"as_of_seq": as_of, "items": [{"source": f"vault://event/{r['id']}", "type": r["type"], "subject": r["subject"],
-                "text": vault.esc(vault._flatten(json.loads(r["payload"])))} for r in rows]}
+                "text": vault.esc(vault._flatten(json.loads(r["payload"])))} for r in rows if r["subject"] not in wh]}
     finally:
         db.close()
 
 
 def export_context_pack(token=None, profile="minimal", max_chars=None, include_unverified=False):
+    """context-pack/2 (context_pack.export): sensitive fields stay `[encrypted]` (never decrypted for agents),
+    redacted/shredded/shred-pending subjects are withheld, secret patterns filtered. ADR 0015."""
+    import context_pack
+    if max_chars is not None and (type(max_chars) is not int or max_chars <= 0):
+        raise ValueError("max_chars must be a positive integer")
     db = _ro()
     try:
-        return vault.pack(db, profile, max_chars, include_unverified)
+        return context_pack.export(db, profile, include_unverified=include_unverified, max_chars=max_chars)
     finally:
         db.close()
 
@@ -249,6 +261,8 @@ def search(token=None, query="", type_=None, subject=None, limit=8):
     db = _ro()
     try:
         rows = vault.search(db, query, type_, subject, limit * 4)
+        wh = _withheld(db)
+        rows = [r for r in rows if r["subject"] not in wh]
         return [{"source": f"vault://event/{r['id']}", "type": r["type"], "subject": r["subject"],
                  "snippet": vault.esc(r["snip"]), "score": round(r["score"], 4)}
                 for r in rows if r["status"] == "active"][:limit]
@@ -266,7 +280,11 @@ def get_event(token=None, event_id=""):
             raise Refused(f"unknown event")
         out = {"id": r["id"], "type": r["type"], "subject": r["subject"], "status": r["status"],
                "trust": r["trust"], "ts": r["ts"], "supersedes": r["supersedes"], "target_id": r["target_id"]}
-        if r["status"] == "active":
+        wh = _withheld(db)
+        if r["subject"] in wh:
+            out["payload"] = None
+            out["note"] = f"subject {wh[r['subject']]}; content withheld"
+        elif r["status"] == "active":
             out["payload"] = json.loads(vault.esc(vault.canon(vault.read_upcast(r))))
             if vault.is_unknown_version(r):
                 out["unknown_version"] = r["schema_version"]

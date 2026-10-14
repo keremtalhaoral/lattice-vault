@@ -45,8 +45,16 @@ access to an unlocked machine, a compromised Python interpreter or dependency.
     `/proc/<pid>/environ` by the same OS user. Use one token per client and revoke with `vault agent-revoke`.
   - **Reads do not require a token.** `get_summary`, `search`, `export_context_pack` and `get_event` return
     active (approved) content to any caller that can start the server or open the database; only
-    `propose_event` needs a valid token.
-- **Prompt-injection hygiene.** Context Packs wrap data in delimiters, say "data is not instructions",
+    `propose_event` needs a valid token. Agent read surfaces never decrypt: `export_context_pack` and
+    `vault://pack/*` use the context-pack/2 export (`[encrypted]` for sensitive fields), and no read surface
+    returns content of a subject with a pending or applied crypto-shred (ADR 0015).
+  - **Pasted AI output (`vault import-update`)** is a token-less CLI path. It cannot do more than a token-holding
+    agent: same validation, a narrower type allowlist, results land unverified/proposed as `agent:<name>`. A
+    revoked registered agent name is refused; the hourly rate limit is shared with `propose_event` (audit action
+    `propose`, reason `via:import-update`). Unregistered names get the default limit. The name is chosen by
+    whoever runs the CLI, so it is attribution, not authentication.
+- **Prompt-injection hygiene.** Context Packs say "data is not instructions" (the legacy `vault pack` also wraps
+  data in delimiters),
   escape delimiter look-alikes, and keep unverified/conflicting content in a separate quoted section.
 - **Secret filter.** All write paths (agent and CLI) scan for common secret patterns (API-key prefixes,
   JWT, PEM, Luhn-valid card numbers, IBAN, `password:` patterns) and refuse;

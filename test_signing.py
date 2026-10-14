@@ -146,16 +146,17 @@ class SignedApprovals(unittest.TestCase):
                 self.db.execute("INSERT INTO events(id,replica_id,replica_seq,hlc,ts,type,subject,payload,actor,trust,content_hash,prev_hash,hash) "
                                 f"VALUES('{t}','local',98,'f','t','{t}','e','{{}}','agent:x','unverified','c','p','h{t}')")
 
-    def test_revoked_key_cannot_sign_after_effective_hlc(self):
+    def test_user_key_cannot_self_revoke(self):
+        # ADR 0012: the active user key is replaced only via rotate/recover; a bare self-revocation is ignored + reported
         a = vault.review(self.db, self.p, "approve")
         kid = self.db.execute("SELECT key_id FROM event_sigs WHERE event_id=?", (a,)).fetchone()[0]
         hlc = vault.next_hlc(self.db, "local")
         vault.append(self.db, "key.revoked", f"key:{kid}", {"key_id": kid, "effective_hlc": hlc, "reason": "test",
                                                              "compromised": False}, H, "verified")
-        self.assertEqual(signing.classify(self.db)[a][1], "signed")   # signatures made before revocation stay valid
-        q = agent(self.db, "note.added", "y", {"text": "p2"})
-        with self.assertRaisesRegex(signing.SignatureError, "revoked"):
-            vault.review(self.db, q, "approve")
+        keys, probs = signing.registered_keys(self.db)
+        self.assertTrue(any("key.revoked" in x for x in probs), probs)
+        self.assertTrue(keys[kid]["active"])
+        self.assertEqual(signing.classify(self.db)[a][1], "signed")
 
 
 @unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")

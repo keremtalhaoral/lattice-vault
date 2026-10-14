@@ -6,31 +6,38 @@ Status: Proposed (implemented on `feat/signing-completion`; Security review pend
 ADR 0011 defined `key.rotated` / `key.revoked` verification but no CLI, and decided on a rotation CLI, an offline
 recovery code and an optional second anchor (`VAULT_ANCHOR_PATH2`) before any multi-device work.
 
-## Decision
-- **Rotate** (`vault keys rotate --new-key PATH`, TTY): new Ed25519 key written O_EXCL/0600 at PATH, then
-  1. `key.registered{new, role:user, certified_by:old}` signed by the old key,
-  2. `key.rotated{old,new,new_key_sig}` signed by the old key, `new_key_sig` by the new key (both keys prove possession),
-  3. `key.revoked{old, effective_hlc = next HLC, compromised:false}` signed by the **new** key.
-  Old signatures (HLC before `effective_hlc`) stay valid; the old key can no longer sign, certify, revoke or anchor.
-  The anchor is rewritten with the new key. The user then points `VAULT_USER_KEY` at the new file.
-- **Revoke** (`vault keys revoke KEY_ID --reason R`, TTY): signed by the local live user key; not retroactive;
-  refuses to revoke the local key itself (use rotate). `compromised` is always `false` here: retroactive revocation
-  needs the ADR 0011 human-decision flow and is deferred.
-- **Recovery code** (`vault keys recovery-code`, TTY): 160 random bits shown once as base32 groups. The recovery
-  Ed25519 key is `seed = SHA-256("lattice-recovery-seed/v1\n" || code bytes)`; only its public key is registered
-  (`role: recovery`, certified by the user key). A new code revokes earlier recovery keys. 160 bits of entropy makes a
-  password KDF unnecessary.
-- **Recover** (`vault keys recover --new-key PATH`, code read from the TTY, never argv): the recovery key certifies a
-  new user key, revokes every unrevoked user key (effective now), and the new key revokes the recovery key (one-time).
-- **Role rules** (registry + classify + sign_row): only `user` keys sign ordinary human-only events and anchors; a
-  `recovery` key may only sign `key.registered` (of a user key) and `key.revoked`; a certifier/revoker must be live at
-  the event's HLC. A recovery-signed approval classifies as `wrong-role-key` (bad).
+## Decision (revised after the Security review of #12)
+- **One active user key.** The first user key is self-signed (TOFU; fingerprint confirmed on the TTY). A user key
+  registered by the active user key is only *pending* and cannot sign until a dual-signed `key.rotated` activates it.
+- **Rotate** (`vault keys rotate --new-key PATH`, TTY): `key.registered{new, certified_by:old}` (pending) +
+  `key.rotated{old,new,new_key_sig}` signed by the old key, `new_key_sig` by the new key. The rotation activates the
+  new key and revokes the old key **and, transitively, every key it certified** (pending keys an attacker may have
+  minted, device keys, the recovery key). Create a new recovery code afterwards.
+- **Revoke** (`vault keys revoke KEY_ID --reason R`, TTY): the active user key may revoke only device keys it
+  certified. A recovery key may revoke only itself. The user key itself is replaced only via rotate/recover.
+- **Recovery code** (`vault keys recovery-code`, TTY on stdin **and stdout**): 160 random bits shown once as base32
+  groups; recovery key seed = `SHA-256("lattice-recovery-seed/v1\n" || code bytes)`; only the public key is stored.
+  Registered by the active user key only while no recovery key is live. Replacing a live code
+  (`--replace`) needs the OLD code: the old recovery key revokes itself first. A stolen user key alone therefore
+  cannot swap the owner's code; if the code is lost, rotate (which revokes it) and create a new one.
+- **Recover** (`vault keys recover --new-key PATH`, code from the TTY): the live recovery key registers a new user key;
+  that one event atomically revokes every other user key, everything they certified, and the recovery key.
+- **Revocation is bound to log position**: a revoked key's signature is valid only if the event's `seq < revoked_seq`
+  **and** `hlc < revoked_hlc` (or it is the revoking event itself). HLCs are chosen by the signer, so back-dating
+  alone no longer works; inserting below the revocation changes chain hashes, which the anchor (rewritten by the new
+  key) detects. Sync: an event signed by a revoked key is quarantined whatever its HLC (human release only after
+  0.2 provides pre-revocation evidence).
+- **Role rules** (registry + classify + sign_row): only the active `user` key signs ordinary human-only events and
+  anchors; pending keys never sign; a recovery-signed approval is `wrong-role-key`.
 - **Second anchor**: if `VAULT_ANCHOR_PATH2` is set (for the `VAULT_DB` vault), every anchor write goes to both
   paths and open/doctor/verify check both. A missing second anchor (primary present) is a warning; a mismatch is an
   error. Anchors signed by a revoked or non-user key are errors.
 
 ## Consequences / limits
 - Whoever holds the recovery code can take over signing (by design); store it offline, apart from the key file.
-- An attacker holding the *old* key before rotation can still sign with it until the rotation is committed; events
-  forged later with an old HLC would need DB write access and are caught only by the anchor/chain checks.
+- An attacker holding the *old* key can sign until the rotation is committed. Retroactive (`compromised:true`)
+  revocation is deferred.
+- The default key file is unencrypted (0600); set `VAULT_USER_KEY_PASSPHRASE` to encrypt it. Prompting for a
+  passphrase on rotate/recover is a follow-up.
+- Anchors are written one after the other; if the second write fails the two disagree and open fails closed.
 - Not done here: OS keychain backend, device keys / per-device signing, retroactive (`compromised:true`) revocation.

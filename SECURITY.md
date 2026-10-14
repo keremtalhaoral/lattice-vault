@@ -118,6 +118,9 @@ access to an unlocked machine, a compromised Python interpreter or dependency.
   or register their own key first. Check the fingerprint shown by `keys init-user`.
 - **Sync-imported human-only events** are stored unsigned (`remote-unsigned`, flagged). Package/device signing is
   **(planned)** (ADR 0011).
+- **First key is TOFU and the key file is unencrypted by default.** Whoever registers the first self-signed user key
+  becomes the root; check the fingerprint `keys init-user` shows, before anything else can write to the DB. The key
+  file is a 0600 PEM, encrypted only if `VAULT_USER_KEY_PASSPHRASE` is set.
 - **Key loss.** Losing the key file blocks new human-only events unless a recovery code was created beforehand
   (`vault keys recovery-code`). Whoever holds the recovery code can replace the signing key; keep it offline.
   Revocation is never retroactive (`compromised:true` handling is **(planned)**).

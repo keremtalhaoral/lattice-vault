@@ -88,11 +88,22 @@ class Revoke(unittest.TestCase):
         with self.assertRaisesRegex(signing.SignatureError, "not a registered"):
             signing.revoke_key(self.db, "user/ed25519/ffffffffffffffff", "x")
 
-    def test_revoke_recovery_key(self):
+    def test_user_key_cannot_revoke_recovery_key(self):
+        # Security B3: the user key may revoke only device keys it certified
         _, rk = signing.new_recovery_code(self.db)
-        signing.revoke_key(self.db, rk, "lost paper")
+        with self.assertRaisesRegex(signing.SignatureError, "only revoke device keys"):
+            signing.revoke_key(self.db, rk, "x")
+        signing._revoke(self.db, signing._current_user_key(self.db), rk, "forced", H)   # bypass the library check
         keys, probs = signing.registered_keys(self.db)
-        self.assertEqual(probs, []); self.assertIsNotNone(keys[rk]["revoked_hlc"])
+        self.assertIsNone(keys[rk]["revoked_seq"]); self.assertTrue(probs)          # registry rejects it
+
+    def test_revoke_device_key(self):
+        import cryptography.hazmat.primitives.asymmetric.ed25519 as ed
+        me = signing._current_user_key(self.db)
+        dk = signing._register(self.db, me, ed.Ed25519PrivateKey.generate(), "device", H)
+        signing.revoke_key(self.db, dk, "lost laptop")
+        keys, probs = signing.registered_keys(self.db)
+        self.assertEqual(probs, []); self.assertIsNotNone(keys[dk]["revoked_seq"])
 
 
 @unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
@@ -108,11 +119,30 @@ class Recovery(unittest.TestCase):
         blob = testutil.all_bytes(self.dbp)
         self.assertNotIn(code.encode(), blob); self.assertNotIn(code.replace("-", "").encode(), blob)
 
-    def test_new_code_revokes_previous(self):
-        _, r1 = signing.new_recovery_code(self.db)
-        _, r2 = signing.new_recovery_code(self.db)
-        keys = signing.registered_keys(self.db)[0]
-        self.assertIsNotNone(keys[r1]["revoked_hlc"]); self.assertIsNone(keys[r2]["revoked_hlc"])
+    def test_replacing_code_needs_old_code(self):
+        # Security B2: a stolen user key alone cannot replace the owner's recovery code
+        c1, r1 = signing.new_recovery_code(self.db)
+        with self.assertRaisesRegex(signing.SignatureError, "needs the old code"):
+            signing.new_recovery_code(self.db)
+        with self.assertRaisesRegex(signing.SignatureError, "does not match"):
+            signing.new_recovery_code(self.db, old_code="AAAA-" * 7 + "AAAA")
+        _, r2 = signing.new_recovery_code(self.db, old_code=c1)
+        keys, probs = signing.registered_keys(self.db)
+        self.assertEqual(probs, [])
+        self.assertIsNotNone(keys[r1]["revoked_seq"]); self.assertIsNone(keys[r2]["revoked_seq"])
+        # a second recovery key registered by the user key while one is live is rejected by the registry
+        import cryptography.hazmat.primitives.asymmetric.ed25519 as ed
+        signing._register(self.db, signing._current_user_key(self.db), ed.Ed25519PrivateKey.generate(), "recovery", H)
+        self.assertTrue(signing.registered_keys(self.db)[1])
+
+    def test_recovery_key_cannot_only_revoke_users(self):
+        # Security B3: recovery may revoke only itself; user keys are revoked only atomically by `recover`
+        code, rk = signing.new_recovery_code(self.db)
+        rec = signing._priv_kid(signing._recovery_priv(code), "recovery")
+        me = signing.load_user_key()[1]
+        signing._revoke(self.db, rec, me, "dos", H)
+        keys, probs = signing.registered_keys(self.db)
+        self.assertTrue(keys[me]["active"]); self.assertTrue(probs)
 
     def test_recover_lost_key(self):
         code, rk = signing.new_recovery_code(self.db)
@@ -190,6 +220,78 @@ class Cli(unittest.TestCase):
         shown = json.loads(r.stdout); self.assertEqual(shown["problems"], [])
         self.assertEqual(sum(1 for k in shown["keys"].values() if k["revoked_hlc"] is None), 1)
         r = run("verify"); self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        r = run("keys", "recovery-code"); self.assertEqual(r.returncode, 0, r.stderr)
+        c2 = r.stdout.strip().splitlines()[-1].strip()
+        r = run("keys", "recovery-code"); self.assertEqual(r.returncode, 1); self.assertIn("old code", r.stderr)
+        r = run("keys", "recovery-code", "--replace", inp=c2 + "\n"); self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_recovery_code_refuses_non_tty_stdout(self):
+        fresh(self); self.db.close()
+        env = {k: v for k, v in os.environ.items() if k != "VAULT_TEST_HARNESS"}
+        r = subprocess.run([sys.executable, os.path.join(HERE, "vault.py"), "keys", "recovery-code"],
+                           capture_output=True, text=True, env=env, stdin=subprocess.DEVNULL)
+        self.assertEqual(r.returncode, 1); self.assertNotIn("RECOVERY CODE", r.stdout)
+
+
+@unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
+class SecurityReview(unittest.TestCase):
+    """Security review of #12: B1 single active user key, transitive revocation; (a) seq-bound revocation."""
+    def setUp(self):
+        fresh(self); self.p1 = approve_one(self.db, "a")
+        self.me = signing._current_user_key(self.db)
+
+    def test_stolen_key_cannot_mint_active_user_key(self):
+        import cryptography.hazmat.primitives.asymmetric.ed25519 as ed
+        evil = ed.Ed25519PrivateKey.generate()
+        ek = signing._register(self.db, self.me, evil, "user", H)       # attacker with the user key, before rotation
+        keys = signing.registered_keys(self.db)[0]
+        self.assertFalse(keys[ek]["active"])                            # pending: not usable without key.rotated
+        p = agent(self.db, "note.added", "x", {"text": "b"})
+        with self.assertRaisesRegex(signing.SignatureError, "pending"):
+            signing._append_signed(self.db, (evil, ek), "event.approved", f"event:{p}", {"reason": "x"}, H)
+        self.db.rollback()
+        code, rk = signing.new_recovery_code(self.db)
+        signing.rotate_user_key(self.db, os.path.join(self.d, "n.key"))  # owner rotates
+        keys, probs = signing.registered_keys(self.db)
+        self.assertEqual(probs, [])
+        self.assertIsNotNone(keys[ek]["revoked_seq"])                   # transitively revoked with the old key
+        self.assertIsNotNone(keys[rk]["revoked_seq"])                   # old recovery key too: make a new code
+        self.assertEqual(sum(1 for k in keys.values() if k["role"] == "user" and k["active"]), 1)
+
+    def test_rotation_needs_pending_key_certified_by_signer(self):
+        import cryptography.hazmat.primitives.asymmetric.ed25519 as ed
+        other = ed.Ed25519PrivateKey.generate()
+        ok_ = signing.key_id_for(signing.pub_raw(other))
+        signing._append_signed(self.db, self.me, "key.rotated", f"key:{ok_}", {"old_key_id": self.me[1], "new_key_id": ok_,
+                               "new_key_sig": signing.b64(other.sign(signing.rotation_message(self.me[1], ok_)))}, H)
+        keys, probs = signing.registered_keys(self.db)
+        self.assertTrue(probs); self.assertTrue(keys[self.me[1]]["active"])
+
+    def test_recover_revokes_all_user_keys_and_their_certs(self):
+        import cryptography.hazmat.primitives.asymmetric.ed25519 as ed
+        dk = signing._register(self.db, self.me, ed.Ed25519PrivateKey.generate(), "device", H)
+        code, rk = signing.new_recovery_code(self.db)
+        new = signing.recover_with_code(self.db, code, os.path.join(self.d, "r.key"))
+        keys, probs = signing.registered_keys(self.db)
+        self.assertEqual(probs, [])
+        for k in (self.me[1], dk, rk):
+            self.assertIsNotNone(keys[k]["revoked_seq"], k)
+        self.assertTrue(keys[new]["active"])
+
+    def test_backdated_signature_after_revocation_rejected(self):
+        """(a): a revoked key signs an event with an HLC before the revocation and appends it later: revoked-key."""
+        old = self.me
+        signing.rotate_user_key(self.db, os.path.join(self.d, "n.key"))
+        p = agent(self.db, "note.added", "x", {"text": "late"})
+        rot_hlc = self.db.execute("SELECT hlc FROM events WHERE type='key.rotated'").fetchone()[0]
+        early = f"{int(rot_hlc[:12], 16) - 1000:012x}-0000-local"
+        with mock.patch.object(vault, "next_hlc", lambda db, rep: early), \
+                mock.patch.object(signing, "sign_row", lambda db, row, parents: (old[1], signing.b64(
+                    old[0].sign(signing.sig_message(row, parents, old[1]))))):
+            ap = vault.append(self.db, "event.approved", f"event:{p}", {"reason": "x"}, H, "verified", target_id=p)[0]
+        cls = signing.classify(self.db); st = cls[ap][1]
+        self.assertEqual(st, "revoked-key"); self.assertIn(st, signing.BAD)
+        self.assertTrue(all(v == "signed" for k, (_, v) in cls.items() if k != ap))   # genuinely earlier ones stay valid
 
 
 if __name__ == "__main__":

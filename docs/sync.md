@@ -81,7 +81,7 @@ The rules below describe the pre-quarantine paired-device behaviour, kept behind
 
 ## Encryption, keys, shredding
 Encrypted fields travel as ciphertext (`payload_ct` plus `{"$enc": key_id}`) and are stored byte-identical on the receiver.
-**Key sync is out of scope (planned).** As a result: (a) on a device without the subject key, such events project as `redacted` (unreadable,
+**Key sync is out of scope (planned).** As a result: (a) on a device without the subject key, such events project as `undecryptable` (unreadable,
 never plaintext). (b) Crypto-shredding is **per device**: shredding on A destroys A's key only, and B's copy is protected only because B never had
 the key. Once key sync exists, a `subject.shredded` event must propagate and destroy the key on every device.
 Packages on disk are **not** encrypted (only the sensitive fields are). Treat `.vaultsync` files like the vault itself.

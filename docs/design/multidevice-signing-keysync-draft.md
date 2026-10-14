@@ -78,7 +78,7 @@ onaylanır), `key.rotated` (eski ve yeni anahtarın ikisi de imzalar), `key.revo
 
 ## 7. Anahtar senkronizasyonu
 ### 7.1 Model — Security ile mutabık (S5)
-- Bugün DEK'ler cihaz dışına çıkmıyor (`crypto_keys.py subject_keys`), B'de şifreli alanlar `redacted` görünüyor
+- Bugün DEK'ler cihaz dışına çıkmıyor (`crypto_keys.py subject_keys`), B'de şifreli alanlar `undecryptable` görünüyor
   (`test_sync.test_encrypted_fields_stay_ciphertext`).
 - Hedef: paket, imzalı bir **anahtar bölümü** taşır: her `key_id` için DEK, alıcı cihazın **age** alıcısına sarılı.
   Alıcı açar, kendi KEK'iyle yeniden sarar. DEK event log'a girmez.

@@ -36,6 +36,8 @@ All notable changes to this project are documented here. Format: [Keep a Changel
 - Event status `undecryptable` (missing key / wrong KEK), distinct from `redacted` (redacted or crypto-shredded).
 - `doctor` reports `shredded_keys` separately from `events_with_missing_keys`, plus `checks.keystore`.
 - Shredded subjects stay `redacted` (not `undecryptable`) even without keys.db, e.g. after `--allow-no-keys`.
+### Changed
+- README: CLI usage and file table synced with `backup-kek`, `restore --kek`, `verify`, `keys show`, `sync-quarantine` and the sync quarantine rules.
 ### Fixed
 - Tests no longer leak temp dirs (`testutil.fresh` registers `shutil.rmtree` cleanup).
 ### Changed
@@ -75,6 +77,8 @@ All notable changes to this project are documented here. Format: [Keep a Changel
 - `connect()` sets `busy_timeout=5000` and `synchronous=FULL`; journal mode stays DELETE (decision in
   docs/backup-restore.md).
 - `vault doctor` reports `PRAGMA integrity_check`/`quick_check` and warns when the ops log is not writable.
+### Changed
+- README: CLI usage and file table synced with `backup-kek`, `restore --kek`, `verify`, `keys show`, `sync-quarantine` and the sync quarantine rules.
 ### Fixed
 - `vault doctor` in-memory rebuild could not find the vault's keystore (`''` vs `:memory:` key), so encrypted
   events could be reported as projection drift.

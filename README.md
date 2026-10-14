@@ -63,6 +63,12 @@ Design details: [docs/design.md](docs/design.md). Decisions: [docs/adr/](docs/ad
 | `crypto_keys.py` | per-subject AES-256-GCM key store (needs `cryptography`) |
 | `citation_check.py` | human-CLI-only check for unsupported claims (not exposed over MCP) |
 | `obs.py` | allowlisted JSON-lines ops log (file only, never stdout) |
+| `signing.py` | user Ed25519 key, signatures for human-only events, signed chain-head anchor |
+| `sync.py` | file-based `.vaultsync` export/import with quarantine (experimental) |
+| `backup.py` | `backup`, `backup-keys`, `backup-kek`, `restore` (manifest + trial-decrypt verification) |
+| `schemas.py` | event payload schemas and upcasters |
+| `context_export.py` | `export-context` (format `lattice-context/v1`, docs/context-pack.md) |
+| `event_detail.py` | `show`: one event's detail and correction/supersede chain |
 | `examples/seed.py` | creates a synthetic demo vault |
 
 ## Install
@@ -82,6 +88,7 @@ Human-only commands require an interactive terminal.
 export VAULT_DB=$HOME/.local/share/lattice-vault/vault.db
 ./vault init                     # once: create the vault (commands never auto-create a missing VAULT_DB)
 ./vault keys init-user           # once, after init: create + register your Ed25519 signing key (TTY, confirm fingerprint)
+./vault keys show                # registered signing key(s) and fingerprint
 
 ./vault add preference.set user:ada --key language --payload '{"value":"English"}'
 ./vault add decision.made decision:D-100 --payload '{"decision_id":"D-100","title":"Local-first","decision":"No cloud"}'
@@ -105,7 +112,10 @@ export VAULT_DB=$HOME/.local/share/lattice-vault/vault.db
 ./vault doctor                           # triggers, hash chains, integrity_check, projection drift, keys, blocklist
 ./vault backup --out DIR                 # vault.db + manifest, never keys.db (docs/backup-restore.md)
 ./vault backup-keys --out DIR2           # keys.db only (wrapped); keep apart from vault backups
-./vault restore DIR --to PATH [--keys DIR2] [--force]  # verified restore drill
+./vault backup-kek --out DIR3            # keys.kek (or passphrase salt) only; keep apart from DIR and DIR2
+./vault restore DIR --to PATH [--keys DIR2] [--kek DIR3] [--force]  # verified restore drill
+./vault verify                           # read-only: full chain + signatures + anchor, projections vs fresh rebuild
+./vault sync-quarantine                  # synced events held back (unsigned/forged/unknown-key ...), see docs/sync.md
 ./vault migrate old.db new.db            # schema migration by copy
 ```
 Run `./vault -h` and `./vault <command> -h` for all options.
@@ -182,7 +192,9 @@ Implemented vs planned is tracked per decision in [docs/adr/](docs/adr/).
 events to a `.vaultsync` package, and `./vault sync-import FILE` verifies and merges one. You move the
 package yourself; there is **no network transport and no automatic/background sync**. Per-device
 signatures and key (`keys.db`/KEK) synchronization are **not built yet**, so do not rely on it for real
-data across several devices.
+data across several devices. Incoming human-only events are applied only with a valid signature by a user key
+already registered on the receiving vault; everything else (unsigned, forged, unknown-key, `key.*`, `user:*`
+content, schema-invalid) is held in quarantine (`./vault sync-quarantine`) and there is no release path yet.
 
 Human-only events (approve/reject/revert/redact/shred, …) are signed with a user Ed25519 key
 (`./vault keys init-user`), and a signed external anchor of the chain heads is written after each commit; see

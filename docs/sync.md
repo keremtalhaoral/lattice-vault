@@ -27,7 +27,13 @@ plus `origin_device`. Forwarded events (A→B→C) are re-exported from the stor
    Accepted events are stored without a local `event_sigs` row (the local copy's `replica_id` differs from the
    origin's); the origin row with `sig` stays in `sync_imported` and is re-exported as is. `doctor`/`verify` re-verify
    that origin signature and check that the origin row matches the chained local event (id, type, subject, actor,
-   hlc, payload hash, parents): `remote-signed` (ok), `remote-unsigned` (warning), `remote-mismatch` (error).
+   hlc, payload hash, parents): `remote-signed` (ok), `remote-unsigned` (no signature at all: warning), and
+   `remote-mismatch` / `unknown-key` / `bad-signature` / `wrong-role-key` / `revoked-key` (errors). A revoked key is
+   judged by the local log position of the imported copy, never by the sender-chosen HLC; an event signed by a key
+   that is already revoked when it arrives is quarantined whatever its HLC.
+   *Interim design (deviation from the multi-device draft §11.2):* `origin_row` is not hash-chained, so editing it can
+   only downgrade a status. The permanent fix is that the origin writes its real device id into `replica_id` at write
+   time, so the local copy can keep the signature in `event_sigs` and bind it into the local hash.
 4. **Not built:** Ed25519 package signing (`signature` is always null). SHA-256 detects corruption. It does **not** authenticate the sender:
    anyone who can write the file can recompute both hashes. Until signing exists, "paired device" is a label the
    user asserts, not something the vault proves (see the threat model / draft v0.4 K-6).
@@ -66,7 +72,11 @@ whichever correction replays last, but the conflict flag keeps it out of the con
 (`still_quarantined`). List with `vault sync-quarantine`. **Release:** `vault sync-quarantine --release [ID ...]
 [--dry-run]` (TTY) re-runs every import check below against the *current* key registry and pairings (e.g. after
 `vault keys init-user` or `sync-pair`) and applies only the events that now pass; the quarantine row is never changed,
-the release is recorded in `sync_released` plus an audit row. There is no override for events that still fail. Rules, in order:
+the release is itself a user-signed `attestation.recorded` event in the chain (ids of the released events), linked
+from `sync_released`, plus an audit row. There is no override for events that still fail. `vault sync-quarantine --all`
+also lists released events with their attestation id. Out of scope: releasing *unsigned* 0.1 rows by attestation
+(draft §9/S7) — they stay held. Held rows are not re-exported, so with the cursor advancing a third device gets a
+held event only from its origin; released rows are re-exported with their origin `sig`. Rules, in order:
 * Human-only types (`vault.SIGNED_TYPES`: approve/reject/revert/batch-approve/redact/shred/conflict.resolved, `key.*`,
   `attestation.recorded`) are applied **only** if the event's `sig` verifies (`signing._verify` over
   `signing.sig_message` of the origin row) against a **user** key that is registered on this vault

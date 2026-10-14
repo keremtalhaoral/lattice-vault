@@ -16,22 +16,24 @@ Status: design only, not implemented. Review needed from Security (crypto) and D
   for this PR and blocked on review. Today's mitigation: the receiver must already have the same user key
   (`vault keys init-user` with the same key file) and human-only events are verified per event.
 
-## 2. Redacted signed events
+## 2. Redacted signed events (decision after Security review: option 1, salted; deferred, not implemented)
 Today a redact-copy replaces the payload of a signed-type event, so its signature fails in the copy (known limit).
-Options:
-- (a) **Redaction-stable digest**: sign `payload_hash` = SHA-256 over the canonical payload (already the case) and keep
-  the original `payload_hash` in the redacted copy (`redactions` row, `orig_payload_hash`), so the signature verifies
-  over (`id,type,subject,orig_payload_hash,…`) while the bytes are gone. Requires classify to accept the stored hash
-  **only** when a valid, signed `event.redacted` targets the event.
-- (b) Record the redaction as its own signed `event.redacted` and classify the target as `redacted-signed` (signature
-  no longer checkable; trust moves to the signed redaction).
-Proposal: (a) — keeps end-to-end verifiability and needs no new crypto; the signed `event.redacted` gates it.
-Human-only event payloads are tiny (reasons) so this mostly matters for approvals with reasons.
-Why deferred: it changes what `sig_message` binds for an existing contract (ADR 0011) and needs a Security sign-off.
+- **Chosen: option 1 with a new signature contract `SIG_DOMAIN = b"lattice-event-sig/v2\n"`.** The signed message
+  binds `payload_hash = SHA-256(salt || canon(payload))`, where `salt` is a 128-bit random value per event stored in
+  the payload envelope. The redacted copy keeps `payload_hash` (in `redactions`, `orig_payload_hash`) but deletes the
+  payload **and the salt**, so the stored hash is no longer a dictionary oracle for short, guessable human payloads
+  (`{"reason":"ok"}`). Classify accepts the stored hash only when a valid, user-signed `event.redacted` targets the
+  event; otherwise the event stays `bad-signature`.
+- v1 events keep verifying under v1 (`SIG_DOMAIN` v1, unsalted). They cannot be redacted without failing their
+  signature; a v2 re-attestation could cover them.
+- Rejected: option 2 (the redaction event as the only proof) — trust in the target moves entirely to whoever signs
+  the redaction. Also rejected: keeping unsalted SHA-256 (oracle). An alternative is to always encrypt human-event
+  payloads and hash the ciphertext.
+- Why deferred: it versions the ADR 0011 contract and touches every signed event; it needs its own PR + review.
 
 ## 3. Also deferred
 - OS keychain backend (`VAULT_USER_KEY_BACKEND=keychain` stays a stub): platform-specific, needs packaging (step 6).
 - Per-device signing / device keys: part of 0.2 above.
 - Retroactive revocation (`compromised:true`): needs the ADR 0011 human-decision flow; today revocation is never
-  retroactive. Known limit: an attacker holding an old key could back-date events below `effective_hlc`; they still
-  need DB write access, and the chain + anchor checks detect rewrites of anchored history.
+  retroactive. Back-dating with a revoked key is closed by binding revocation to log position (ADR 0012); legitimate
+  events signed offline before a revocation but imported after it stay quarantined until 0.2 can prove they predate it.

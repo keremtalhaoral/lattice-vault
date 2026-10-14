@@ -406,5 +406,106 @@ class SyncTest(unittest.TestCase):
         r = run("sync-quarantine"); self.assertNotIn(ap, r.stdout)
 
 
+    # ---- Data Systems review of #13 (B1, B2, N3-N5) + Security nit (signed release) ----
+    def applied_approval(self):
+        signing.register_user_key(self.B)
+        a, ap, p = self.approval_pkg()
+        sync.import_package(self.B, p)
+        return a, ap, p
+
+    def set_origin(self, eid, mutate):
+        orig = json.loads(self.B.execute("SELECT origin_row FROM sync_imported WHERE event_id=?", (eid,)).fetchone()[0])
+        mutate(orig)
+        self.B.execute("UPDATE sync_imported SET origin_row=? WHERE event_id=?", (vault.canon(orig), eid)); self.B.commit()
+
+    @unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
+    def test_b1_corrupted_origin_signature_is_bad(self):
+        import ops
+        a, ap, p = self.applied_approval()
+        def flip(o):
+            sg = signing.unb64(o["sig"]["sig"]); o["sig"]["sig"] = signing.b64(bytes([sg[0] ^ 1]) + sg[1:])
+        self.set_origin(ap, flip)
+        st = signing.classify(self.B)[ap][1]
+        self.assertEqual(st, "bad-signature"); self.assertIn(st, signing.BAD)
+        self.assertFalse(ops.verify(self.B)["ok"])
+        self.set_origin(ap, lambda o: o.pop("sig"))                       # only a missing signature is a warning
+        self.assertEqual(signing.classify(self.B)[ap][1], "remote-unsigned")
+
+    @unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
+    def test_b1_revoked_key_is_bad(self):
+        import ops
+        a, ap, p = self.applied_approval()
+        signing.rotate_user_key(self.B, os.path.join(self.d, "rot.key"))
+        self.assertEqual(signing.classify(self.B)[ap][1], "remote-signed")   # imported before the revocation: valid
+        # the same signed approval arriving AFTER the revocation (any HLC) is never accepted: Security (a)
+        C = self.mk("c2"); sync.pair(C, self.da, "A"); signing.register_user_key(C)
+        signing.rotate_user_key(C, os.path.join(self.d, "rotc.key"))
+        sync.import_package(C, p)
+        self.assertEqual(self.held(C)[ap], "revoked key (imported after revocation)")
+        self.assertEqual(sync.release_quarantined(C, [ap])["released"], [])   # B2: release with a revoked key
+        # a revoked-key status in doctor terms: force the local copy to sit after the revocation
+        keys = signing.registered_keys(self.B)[0]
+        kid = json.loads(self.B.execute("SELECT origin_row FROM sync_imported WHERE event_id=?", (ap,)).fetchone()[0])["sig"]["key_id"]
+        keys[kid] = {**keys[kid], "revoked_seq": 1, "revoked_hlc": "0" * 12, "revoked_by": "x", "active": False}
+        st = signing.classify(self.B, keys=keys)[ap][1]
+        self.assertEqual(st, "revoked-key"); self.assertIn(st, signing.BAD)
+        self.assertTrue(ops.verify(self.B)["ok"])
+
+    @unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
+    def test_b2_forged_signature_never_released(self):
+        signing.register_user_key(self.B)
+        a, ap, p = self.approval_pkg()
+        def flip(e):
+            sg = signing.unb64(e["sig"]["sig"]); e["sig"]["sig"] = signing.b64(bytes([sg[0] ^ 1]) + sg[1:])
+        self.rewrite(p, ap, flip)
+        sync.import_package(self.B, p)
+        r = sync.release_quarantined(self.B, [ap])
+        self.assertEqual(r["released"], []); self.assertEqual(r["still_held"][ap], "bad signature")
+
+    @unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
+    def test_b2_child_released_only_after_parent(self):
+        a, ap, p = self.approval_pkg()
+        rv = vault.append(self.A, "event.reverted", f"event:{a}", {"reason": "undo"}, U, "verified", target_id=a,
+                          supersedes=ap)[0]
+        p = self.pkg(self.A, "child")
+        sync.import_package(self.B, p)
+        self.assertIn(ap, self.held(self.B)); self.assertIn(rv, self.held(self.B))
+        signing.register_user_key(self.B)
+        r = sync.release_quarantined(self.B, [rv])                         # child alone: parent still held
+        self.assertEqual(r["released"], []); self.assertEqual(r["still_held"][rv], "parent quarantined")
+        r = sync.release_quarantined(self.B, [rv, ap])                     # both: parent first, then child
+        self.assertEqual(r["released"], [ap, rv])
+        self.assertEqual(vault.verify_chains(self.B), [])
+
+    @unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
+    def test_b2_legacy_user_content_never_released(self):
+        signing.register_user_key(self.B)
+        e = vault.append(self.A, "preference.set", U, {"key": "dil", "value": "x"}, U, "verified")[0]
+        sync.import_package(self.B, self.pkg(self.A, "uc"))
+        r = sync.release_quarantined(self.B, [e])
+        self.assertEqual(r["released"], []); self.assertEqual(r["still_held"][e], "unsigned user:* event")
+
+    @unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
+    def test_release_is_signed_attestation_and_listed(self):
+        a, ap, p = self.approval_pkg()
+        sync.import_package(self.B, p); signing.register_user_key(self.B)
+        r = sync.release_quarantined(self.B, [ap])
+        att = r["attestation"]
+        row = self.B.execute("SELECT type, actor FROM events WHERE id=?", (att,)).fetchone()
+        self.assertEqual(row["type"], "attestation.recorded")
+        self.assertEqual(signing.classify(self.B)[att][1], "signed")
+        listed = {x["event_id"]: x for x in sync.quarantined(self.B, include_released=True)}
+        self.assertEqual(listed[ap]["released_attestation"], att)
+        self.assertNotIn(ap, {x["event_id"] for x in sync.quarantined(self.B)})
+        self.B.commit()
+        anchor = json.load(open(signing.anchor_path(os.path.join(self.d, "b", "v.db"))))   # N3: anchor is current
+        self.assertEqual(anchor["events"]["seq"], self.B.execute("SELECT MAX(seq) FROM events").fetchone()[0])
+
+    def test_n4_dry_run_release_creates_no_device_id(self):
+        C = self.mk("fresh")
+        sync.ensure_schema(C)
+        sync.release_quarantined(C, dry_run=True)
+        self.assertIsNone(sync.device_id(C, create=False))
+
 if __name__ == "__main__":
     unittest.main()

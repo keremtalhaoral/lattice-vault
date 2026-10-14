@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS sync_quarantine (          -- held, NOT in events: ne
   origin_row TEXT NOT NULL CHECK (json_valid(origin_row)), package_sha256 TEXT NOT NULL, reason TEXT NOT NULL,
   at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
 CREATE TABLE IF NOT EXISTS sync_released (           -- quarantine rows are never changed; a release is recorded here
-  event_id TEXT PRIMARY KEY, released_by TEXT NOT NULL CHECK (released_by LIKE 'user:%'),
+  event_id TEXT PRIMARY KEY, attestation_id TEXT NOT NULL,  -- signed attestation.recorded event (in the chain)
   at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
 CREATE TABLE IF NOT EXISTS sync_packages (
   body_sha256 TEXT PRIMARY KEY, source_device TEXT NOT NULL, report TEXT NOT NULL CHECK (json_valid(report)),
@@ -75,13 +75,14 @@ def _user_sig_problem(db, e, row, keys):
     if not keys:
         keys.append(signing.registered_keys(db)[0])
     k = keys[0].get(sg.get("key_id"))
-    if not k or k["role"] != "user":
+    if not k or k["role"] != "user" or (k["revoked_seq"] is None and not k["active"]):
         return f"unknown signing key {sg.get('key_id')} (no key.registered for it on this device)"
     if sg.get("alg") != "ed25519" or not signing._verify(
             k["pub"], sg["sig"], signing.sig_message(row, sorted({p for p, _ in e["parents"]}), sg["key_id"])):
         return "bad signature"
-    if k["revoked_hlc"] and e["hlc"] >= k["revoked_hlc"]:
-        return "revoked key"
+    if k["revoked_seq"] is not None:
+        # anything arriving now is appended after the revocation, so its HLC (chosen by the sender) proves nothing.
+        return "revoked key (imported after revocation)"
     return None
 
 
@@ -111,13 +112,21 @@ def _held_ids(db):
     return {r[0] for r in db.execute(f"SELECT event_id FROM sync_quarantine {rel}")}
 
 
-def quarantined(db):
-    held = _held_ids(db)
-    if not held:
+def quarantined(db, include_released=False):
+    """Held events; include_released adds released ones with the signed attestation id and time (audit trail)."""
+    if not _has(db, "sync_quarantine"):
         return []
-    return [dict(r) for r in db.execute(
-        "SELECT event_id, origin_device, type, actor, reason, package_sha256, at FROM sync_quarantine ORDER BY at, event_id")
-        if r["event_id"] in held]
+    held = _held_ids(db)
+    rel = {r[0]: (r[1], r[2]) for r in db.execute("SELECT event_id, attestation_id, at FROM sync_released")} \
+        if _has(db, "sync_released") else {}
+    out = []
+    for r in db.execute("SELECT event_id, origin_device, type, actor, reason, package_sha256, at FROM sync_quarantine "
+                        "ORDER BY at, event_id"):
+        if r["event_id"] in held:
+            out.append(dict(r))
+        elif include_released and r["event_id"] in rel:
+            out.append({**dict(r), "released_attestation": rel[r["event_id"]][0], "released_at": rel[r["event_id"]][1]})
+    return out
 
 
 def release_quarantined(db, event_ids=None, dry_run=False, actor=vault.HUMAN):
@@ -132,7 +141,7 @@ def release_quarantined(db, event_ids=None, dry_run=False, actor=vault.HUMAN):
     rows = [r for r in db.execute("SELECT * FROM sync_quarantine") if r["event_id"] in want]
     evs = [({"origin_device": r["origin_device"], **json.loads(r["origin_row"])}, r["package_sha256"]) for r in rows]
     evs.sort(key=lambda x: (x[0]["hlc"], x[0]["id"]))
-    me = device_id(db)
+    me = device_id(db, create=not dry_run)      # a dry run never creates the device id
     paired = {r[0] for r in db.execute("SELECT replica_id FROM replicas")} | {me}
     have = {r[0] for r in db.execute("SELECT id FROM events")}
     blocked = {r[0] for r in db.execute("SELECT content_hash FROM redacted_blocklist")} | \
@@ -156,18 +165,27 @@ def release_quarantined(db, event_ids=None, dry_run=False, actor=vault.HUMAN):
         plan.append((e, row, pkg)); rep["released"].append(e["id"])
     if dry_run or not plan:
         return rep
+    signing._current_user_key(db)   # the release itself is signed (attestation.recorded): fail before writing anything
     try:
         prev = (db.execute("SELECT hash FROM events ORDER BY seq DESC LIMIT 1").fetchone() or [vault.GENESIS])[0]
         for e, row, pkg in plan:
             local = dict(row); local.pop("_sig", None)
             local["replica_id"] = e["origin_device"] if row["replica_id"] == "local" else row["replica_id"]
             prev = _insert(db, e, local, prev, pkg, False)
-            db.execute("INSERT INTO sync_released(event_id, released_by) VALUES(?,?)", (e["id"], actor))
+        ids = [e["id"] for e, _, _ in plan]
+        att, _ = vault.append(db, signing.ATTEST_TYPE, "attestation:sync-release",
+                              {"target_event_ids": ids, "statement": "Released from sync quarantine after re-verification "
+                               "of the origin signatures against my current key registry."},
+                              actor, "verified", commit=False, _rebuild=False)
+        for i in ids:
+            db.execute("INSERT INTO sync_released(event_id, attestation_id) VALUES(?,?)", (i, att))
         db.commit()
     except Exception:
         db.rollback(); raise
     vault.rebuild(db)
-    vault.audit(db, actor, "sync_release", "accepted", f"released {len(plan)} re-verified event(s) from quarantine")
+    vault.audit(db, actor, "sync_release", "accepted",
+                f"released {len(ids)} re-verified event(s) from quarantine (first {ids[0]}), attestation {att}", att)
+    rep["attestation"] = att
     return rep
 
 
@@ -347,7 +365,7 @@ def import_package(db, path, dry_run=False, now_ms=None, _trust_unsigned=False):
     for e, row in todo:
         if e["content_hash"] in blocked or e["id"] in blocked:
             rep["skipped"].append({"id": e["id"], "reason": "redaction blocklist"}); continue
-        local = dict(row); local.pop("_sig", None)   # local copy is stored without the origin signature (remote-unsigned)
+        local = dict(row); local.pop("_sig", None)   # stored without event_sigs; origin sig re-verified from origin_row (remote-signed)
         local["replica_id"] = e["origin_device"] if row["replica_id"] == "local" else row["replica_id"]
         quarantine = e["origin_device"] not in paired and e["actor"].startswith("user:")
         if quarantine:

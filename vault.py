@@ -1214,6 +1214,7 @@ def main(argv=None):
     sq = sp.add_parser("sync-quarantine", help="list synced events held in quarantine; --release re-verifies and applies those that now pass")
     sq.add_argument("--release", nargs="*", metavar="EVENT_ID", help="re-verify (all held, or the given ids) and apply those that pass (TTY)")
     sq.add_argument("--dry-run", action="store_true")
+    sq.add_argument("--all", action="store_true", help="list: include released events (signed attestation id, time)")
     sp.add_parser("device-id", help="show (create on first use) this vault's stable device id")
     spr = sp.add_parser("sync-pair", help="register another device of the owner (human-only)")
     spr.add_argument("device"); spr.add_argument("--name", required=True)
@@ -1455,7 +1456,7 @@ def main(argv=None):
                 print(sync.UNSUPPORTED_WARNING, file=sys.stderr)
             if args.cmd == "sync-quarantine":
                 if args.release is None:
-                    print(json.dumps(sync.quarantined(db), ensure_ascii=False))
+                    print(json.dumps(sync.quarantined(db, include_released=args.all), ensure_ascii=False))
                 else:
                     if not args.dry_run:
                         require_human_tty("sync-quarantine --release")

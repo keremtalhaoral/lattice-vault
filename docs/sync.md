@@ -149,9 +149,10 @@ separate signed bundle (human-only, TTY):
     vault sync-keys quarantine                        # refused bundles / entries (ids and reasons only)
 
 The KEK never leaves a device; DEKs are wrapped to the recipient's certified X25519 key and re-wrapped under the
-recipient's KEK on import. Shredded keys are never sent; an applied, signed `subject.shredded` from another device puts
-the local copy into `pending_destroy` with the local grace period (finish with `vault shred-finalize SUBJECT`, or
-`vault shred-cancel SUBJECT`); shreds from a device revoked for key transport are ignored and listed in the quarantine.
+recipient's KEK on import. Shredded keys are never sent; when a signed `subject.shredded` from another device is applied,
+its payloads become unreadable at once and the local DEK moves to `pending_destroy`. It is destroyed after the local
+grace period, on the next vault open or `vault doctor`. Shreds from a device revoked for key transport are ignored and
+listed in the quarantine. Bundles carry subject, key and event ids in cleartext, as `.vaultsync` packages do.
 `vault sync-keys revoke-peer DEVICE --reason R` stops key transport to that device and refuses bundles naming it as
 sender. It is **not** a protection against a compromised user key (every device holds the same user key, and the
 sender device id is not cryptographically authenticated): after losing a device, rotate the user key

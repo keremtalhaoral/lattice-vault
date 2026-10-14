@@ -35,7 +35,11 @@ weakening crypto-shredding or the quarantine model (ADR 0008, 0011, 0012).
    opens the first listed event. The DEK is then **re-wrapped under the recipient's KEK** (existing `dek|<key_id>` AAD).
    A key id already present is a duplicate (idempotent). A subject that already has a different key is refused.
    keys.db rows are written in one transaction, then vault.db bookkeeping in one transaction; projections are rebuilt.
-   A receiver that so far only holds imported ciphertext may create its first KEK on import (no local DEK can be orphaned).
+   **KEK creation (review N7).** `_keystore` uses `vault.keystore` (which never creates a KEK when keys.db is missing
+   but encrypted events exist), with exactly one documented exception: no keys.db AND every encrypted event in the log
+   came in through sync, so no local DEK can be orphaned. Then a first KEK is created and an audit row
+   `keystore_created_for_key_import` is written. In every other case the error is raised. `reconcile_shreds` warns on
+   stderr when a synced shred is in the log but there is no keystore.
 7. **Fail closed / quarantine.** A bundle that fails any bundle-level check is refused as a whole; an entry that fails
    is skipped. Both are recorded in `sync_key_quarantine` (bundle hash, sender, key id, reason; never key material).
    Re-importing the same bundle later (e.g. after the events have been synced) re-evaluates it.
@@ -48,18 +52,40 @@ weakening crypto-shredding or the quarantine model (ADR 0008, 0011, 0012).
    against a compromised user key (e.g. a lost device): rotate the user key (`vault keys rotate`); signatures by the
    revoked key are then refused.
 9. **Shredding.** Export skips keys that are destroyed, `pending_destroy` or named by a `subject.shredded` event.
-   A user-signed `subject.shredded` from another device that is applied by `sync-import` (or released from quarantine)
-   does **not** destroy the receiver's DEK. It moves the key to `pending_destroy` with the local grace period
-   (`VAULT_SHRED_GRACE_DAYS`, default 7, as `vault shred --confirm`). The existing local mechanism finishes it:
-   `vault shred-finalize SUBJECT` after the grace period (destroys the DEK, writes the `redactions` row and a local
-   `subject.shredded`, as for a local shred), or `vault shred-cancel SUBJECT`. Each synced shred event is handled
-   once (`sync_shred_handled`), so a cancel is not undone by the next import. A shred whose origin device is revoked for
-   key transport is ignored and recorded in `sync_key_quarantine`. An old bundle can never bring a shredded key back.
-   Shred handling runs right after the events are committed (keys.db is a separate database, so one transaction is not
-   possible); it is idempotent and re-run on every `sync-import` and quarantine release, so an interrupted run is
-   completed by the next one (tested). A pending (not finalized) shred on the origin does not propagate.
+   For a user-signed `subject.shredded` from another device that is in the log (applied by `sync-import` or released
+   from quarantine):
+   - **reads are refused at once**: `vault.shred_applies` treats the key as shredded for that subject even while a DEK
+     copy still exists (payloads read as `redacted`);
+   - the DEK is **not destroyed at once** (review M1): `reconcile_shreds` moves it to `pending_destroy` with the local
+     grace period (`VAULT_SHRED_GRACE_DAYS`, default 7), and destroys it once the grace period is over, writing the same
+     `redactions` row as a local shred. `vault shred-cancel` is refused for a key with a shred in the log;
+   - before acting, the shred's `key_id` must belong to the event's subject in keys.db, and the event must re-verify
+     as `remote-signed` (signing.classify) at that moment (review N1); otherwise it is recorded once in
+     `sync_key_quarantine` and ignored;
+   - a shred whose origin device is revoked for key transport is ignored (recorded once); its key stays readable.
+   **Durability (review B1).** keys.db is a separate database, so the key update cannot share the vault.db transaction
+   that applied the event. `reconcile_shreds` is idempotent and runs after every `sync-import` and quarantine
+   release, **on every vault open** (`vault.connect`), and in `vault doctor`. Until it has run, reads are already
+   refused. `doctor` reports an ERROR for a live `active` DEK with an applied shred, or for a `pending_destroy` DEK
+   past its grace period, then reconciles. A crash-injection test covers the window. An old bundle can never bring a
+   shredded key back. A pending (not finalized) shred on the origin does not propagate.
 10. **CLI.** `vault sync-keys init|cert|add-peer|revoke-peer|export|import|quarantine`; all but `quarantine` are
     human-only (TTY). Output contains ids and fingerprints only.
+
+## Review items deferred (Data Systems review of #14)
+- **N2: signed bundle sequence numbers.** Not implemented (deviates from S8). Bundles are idempotent by key id, and
+  tombstones stop shredded keys from coming back. Needs explicit Security sign-off.
+- **N3: HPKE-style construction instead of age.** Deviates from S5 and needs Security sign-off (see item 4).
+- **N4: signing key.** Bundles and certificates are signed by the user key, not by a device key. `sender_device` is
+  only as authentic as the user key; see item 8. Device keys come with vaultsync/0.2.
+- **N5: key-transport revocation is separate from pairing.** `revoke-peer` stops key transport and synced shreds
+  from that device. The device stays paired for event sync (there is no unpair command yet).
+- **N6: no release path for the key quarantine.** Re-import the bundle to re-evaluate it; each refusal adds a row and
+  rows are never resolved. After a crash between the keys.db and vault.db steps of an import, the `sync_key_imports`
+  bookkeeping row is missing; the key itself is present and a re-import reports it as a duplicate.
+- **N7:** addressed in item 6 (the explicit, audited first-KEK case).
+- **N8: bundle metadata is in cleartext.** Subject ids, key ids and event ids are not encrypted, the same as in
+  `.vaultsync` packages (docs/sync.md, SECURITY.md).
 
 ## Consequences / limits (deferred)
 - Same-owner model only: every device must have the same user key registered (as for signed events today). Device

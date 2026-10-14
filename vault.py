@@ -511,6 +511,14 @@ def connect(path=None, verify=True, create=None):
     if not db.execute("SELECT 1 FROM sqlite_master WHERE name='proj_meta'").fetchone() or _proj_last_seq(db) != \
             db.execute("SELECT COALESCE(MAX(seq),0) FROM events").fetchone()[0]:
         rebuild(db)   # missing projections or checkpoint behind the log (e.g. crash between append and apply)
+    if not new and db.execute("SELECT 1 FROM sqlite_master WHERE name='sync_imported'").fetchone() and db.execute(
+            "SELECT 1 FROM events WHERE type='subject.shredded' LIMIT 1").fetchone():
+        import key_transport   # synced shreds: DEK at least pending_destroy, destroyed after grace (ADR 0013)
+        try:
+            key_transport.reconcile_shreds(db)
+        except Exception as x:   # reads stay refused (shred_applies); doctor reports the unreconciled key
+            warnings.append(f"synced shred not reconciled ({type(x).__name__}); run `vault doctor`")
+            print(f"warning: synced shred not reconciled ({type(x).__name__}); run `vault doctor`", file=sys.stderr)
     return db
 
 
@@ -728,6 +736,8 @@ def payload_state(db, e):
         return None, "redacted"
     if e["enc_key_id"]:
         import crypto_keys
+        if shred_applies(db, e["enc_key_id"], e["subject"]):   # shredded means unreadable, even while a DEK copy is
+            return None, "redacted"                            # still pending destroy (synced shred, ADR 0013)
         try:
             p.update(keystore(db).open(e["enc_key_id"], e["id"], e["payload_ct"]))
         except crypto_keys.Shredded:
@@ -737,6 +747,23 @@ def payload_state(db, e):
                 return None, "redacted"
             return None, "undecryptable"
     return read_upcast(e, p), None
+
+
+def shred_applies(db, key_id, subject):
+    """True if an applied subject.shredded for this key AND subject is in the log, except one that came from a device
+    revoked for key transport (ADR 0013). Fail-safe for reads: no signature work here (reconcile re-checks it)."""
+    ids = [r[0] for r in db.execute("SELECT id FROM events WHERE type='subject.shredded' AND subject=? AND "
+                                    "json_extract(payload,'$.key_id')=?", (subject, key_id))]
+    if not ids:
+        return False
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE name='sync_imported'").fetchone() or \
+            not db.execute("SELECT 1 FROM sqlite_master WHERE name='sync_ka_revoked'").fetchone():
+        return True
+    for i in ids:
+        r = db.execute("SELECT origin_device FROM sync_imported WHERE event_id=?", (i,)).fetchone()
+        if r is None or not db.execute("SELECT 1 FROM sync_ka_revoked WHERE device_id=?", (r[0],)).fetchone():
+            return True
+    return False
 
 
 def _shredded_in_log(db, key_id):

@@ -98,7 +98,8 @@ access to an unlocked machine, a compromised Python interpreter or dependency.
 - Sync key transport (ADR 0013, prototype): DEKs move only in user-signed `vaultkeys/0.1` bundles, wrapped to a
   paired device's certified X25519 key and re-wrapped under its own KEK; the KEK never leaves a device. Unpaired or
   revoked devices get nothing; anything that fails verification is quarantined. Shredded keys are never sent; a synced
-  shred only schedules the local key for destroy (local grace period). `sync-keys revoke-peer` is not a protection
+  shred makes the data unreadable at once and destroys the local key after the local grace period (reconciled on open
+  and in doctor). Bundle metadata (subject, key and event ids) is cleartext. `sync-keys revoke-peer` is not a protection
   against a compromised user key (the sender device id is not cryptographically authenticated); rotation is required.
 - Sync: the real device id is written into `replica_id` at write time (until then, verify against `origin_row`).
   Device keys are certified by the user key. Retroactive revocation needs `compromised:true`, a user signature and a

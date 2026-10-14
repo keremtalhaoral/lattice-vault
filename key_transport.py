@@ -20,7 +20,7 @@ versioned `vaultkeys/0.1` bundle next to the unchanged `vaultsync/0.1` event pac
 * Anything that does not verify is recorded in `sync_key_quarantine` (ids and reasons only, no key material) and
   not imported (fail closed).
 """
-import base64, hashlib, json, os, secrets, time
+import base64, hashlib, json, os, secrets, sys, time
 import signing, vault
 
 FORMAT = "vaultkeys/0.1"
@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS sync_key_quarantine (      -- ids and reasons only; n
 CREATE TABLE IF NOT EXISTS sync_key_imports (
   bundle_sha256 TEXT NOT NULL, key_id TEXT NOT NULL, sender_device TEXT NOT NULL,
   at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), PRIMARY KEY (bundle_sha256, key_id));
-CREATE TABLE IF NOT EXISTS sync_shred_handled (       -- synced subject.shredded events already acted on (once each)
+CREATE TABLE IF NOT EXISTS sync_shred_handled (       -- synced shreds that were ignored (noted once each)
   event_id TEXT PRIMARY KEY, key_id TEXT, action TEXT NOT NULL,
   at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
 CREATE TRIGGER IF NOT EXISTS sync_ka_peers_no_update BEFORE UPDATE ON sync_ka_peers BEGIN SELECT RAISE(ABORT,'append-only'); END;
@@ -124,7 +124,11 @@ def _keystore(db):
             if db.execute("SELECT 1 FROM sqlite_master WHERE name='sync_imported'").fetchone() else True
         if local_enc:
             raise
+        # The ONE documented case (ADR 0013 §6, review N7) where a KEK is created although encrypted events exist:
+        # no keys.db, and every encrypted event came in through sync (no local DEK can be orphaned). Audited.
         ks = vault._KEYSTORE[path] = crypto_keys.KeyStore(path, create=True, has_encrypted_events=False)
+        vault.audit(db, vault.HUMAN, "keystore_created_for_key_import", "accepted",
+                    "first KEK created on this device for imported ciphertext only")
     ks.db.executescript(KS_SCHEMA)
     return ks
 
@@ -463,48 +467,113 @@ def shred_grace_days():
     return float(os.environ.get("VAULT_SHRED_GRACE_DAYS", "7"))   # same default as `vault shred --confirm`
 
 
-def apply_remote_shreds(db):
-    """Handle applied `subject.shredded` events that came from another device (sync_imported). Each is handled once
-    (sync_shred_handled, vault.db):
-    * origin device revoked for key transport -> ignored, recorded in sync_key_quarantine (key stays live);
-    * otherwise the local DEK is put into `pending_destroy` with the local grace period. It is NOT destroyed here:
-      `vault shred-finalize <subject>` (ops.shred_finalize) destroys it after the grace period and writes the usual
-      redactions row; `vault shred-cancel` keeps it.
-    Runs after the events are committed (keys.db is a separate database); it is idempotent and re-run on every
-    sync-import / quarantine release, so an interrupted run is completed by the next one. Returns the scheduled key ids."""
-    if not HAVE_CRYPTO or not db.execute("SELECT 1 FROM sqlite_master WHERE name='sync_imported'").fetchone():
-        return []
-    ensure_schema(db)
-    todo = [(r[0], r[1], r[2], json.loads(r[3]).get("key_id")) for r in db.execute(
-        "SELECT e.id, e.subject, i.origin_device, e.payload FROM events e JOIN sync_imported i ON i.event_id=e.id "
-        "WHERE e.type='subject.shredded' AND e.id NOT IN (SELECT event_id FROM sync_shred_handled) ORDER BY e.seq")]
-    if not todo:
+def _applied_shreds(db):
+    """Applied subject.shredded events: [(event_id, subject, key_id, origin_device or None for local)]."""
+    imp = db.execute("SELECT 1 FROM sqlite_master WHERE name='sync_imported'").fetchone()
+    q = ("SELECT e.id, e.subject, e.payload, i.origin_device FROM events e LEFT JOIN sync_imported i ON i.event_id=e.id "
+         "WHERE e.type='subject.shredded' ORDER BY e.seq") if imp else \
+        "SELECT id, subject, payload, NULL FROM events WHERE type='subject.shredded' ORDER BY seq"
+    out = []
+    for eid, subj, payload, origin in db.execute(q):
+        try:
+            kid = json.loads(payload).get("key_id")
+        except (ValueError, AttributeError):
+            kid = None
+        out.append((eid, subj, kid, origin))
+    return out
+
+
+def _note_once(db, eid, kid, origin, action, reason):
+    if db.execute("INSERT OR IGNORE INTO sync_shred_handled(event_id, key_id, action) VALUES(?,?,?)",
+                  (eid, kid, action)).rowcount:
+        _q(db, "-", origin, kid, reason)
+
+
+def shred_problems(db):
+    """Read-only (doctor): a live, usable DEK (state active) or a past-grace pending DEK for a key named by an
+    applied shred. Ids only."""
+    if not HAVE_CRYPTO:
         return []
     import crypto_keys
     try:
         ks = vault.keystore(db)
-    except (crypto_keys.KeystoreMissing, FileNotFoundError):
-        ks = None
-    revoked, scheduled, handled = _revoked(db), [], []
-    for eid, subj, origin, kid in todo:
-        if origin in revoked:
-            handled.append((eid, kid, "ignored: origin revoked"))
-            _q(db, "-", origin, kid, "subject.shredded from a device revoked for key transport: ignored")
+    except Exception:
+        return []
+    out = []
+    for eid, subj, kid, origin in _applied_shreds(db):
+        if not kid or not vault.shred_applies(db, kid, subj):
             continue
-        row = ks.db.execute("SELECT subject, state, wrapped_dek IS NOT NULL FROM subject_keys WHERE key_id=?", (kid,)).fetchone() \
-            if ks else None
-        if row and row[2] and row[1] == "active":
-            ks.schedule_destroy(row[0], shred_grace_days(), f"sync:{origin}")   # commits keys.db
-            scheduled.append(kid); handled.append((eid, kid, "pending_destroy"))
-        else:
-            handled.append((eid, kid, "no live local key" if not row or not row[2] else f"already {row[1]}"))
+        r = ks.db.execute("SELECT state, destroy_after, wrapped_dek IS NOT NULL FROM subject_keys WHERE key_id=? AND subject=?",
+                          (kid, subj)).fetchone()
+        if r and r[2] and r[0] == "active":
+            out.append(f"key {kid}: live usable DEK although subject.shredded {eid} is in the log")
+        elif r and r[2] and r[0] == "pending_destroy" and r[1] is not None and r[1] <= time.time():
+            out.append(f"key {kid}: grace period over but DEK not destroyed (subject.shredded {eid})")
+    return out
+
+
+def reconcile_shreds(db, now=None):
+    """Make every applied *synced* subject.shredded effective locally (ADR 0013 §9). Idempotent; runs on vault open,
+    in doctor, after sync-import and after quarantine release. For each one:
+    * origin device revoked for key transport -> ignored (recorded once in sync_key_quarantine);
+    * the key's subject must equal the event's subject and the event must re-verify as `remote-signed` now
+      (signing.classify), else it is recorded once and not acted on;
+    * live active DEK -> pending_destroy with the local grace period (reads are already refused: vault.shred_applies);
+    * pending_destroy past its grace period -> destroyed, with the same redactions row as a local shred.
+    Locally created shreds are not touched (ops.shred_finalize already destroyed the key). Returns
+    {"pending": [...], "destroyed": [...]}."""
+    rep = {"pending": [], "destroyed": []}
+    if not HAVE_CRYPTO or not db.execute("SELECT 1 FROM sqlite_master WHERE name='sync_imported'").fetchone():
+        return rep
+    todo = [x for x in _applied_shreds(db) if x[3] is not None]
+    if not todo:
+        return rep
+    ensure_schema(db)
+    import crypto_keys
     try:
-        for eid, kid, action in handled:
-            db.execute("INSERT OR IGNORE INTO sync_shred_handled(event_id, key_id, action) VALUES(?,?,?)", (eid, kid, action))
+        ks = vault.keystore(db)
+    except (crypto_keys.KeystoreMissing, FileNotFoundError):
+        print("warning: synced subject.shredded in the log but no keystore here; nothing to destroy", file=sys.stderr)
+        return rep
+    now = now if now is not None else time.time()
+    revoked, cls = _revoked(db), None
+    try:
+        for eid, subj, kid, origin in todo:
+            if origin in revoked:
+                _note_once(db, eid, kid, origin, "ignored: origin revoked",
+                           "subject.shredded from a device revoked for key transport: ignored"); continue
+            row = ks.db.execute("SELECT subject, state, destroy_after, wrapped_dek IS NOT NULL FROM subject_keys WHERE key_id=?",
+                                (kid,)).fetchone() if isinstance(kid, str) else None
+            if not row or not row[3]:
+                continue                                   # nothing live here
+            if row[0] != subj:
+                _note_once(db, eid, kid, origin, "ignored: subject mismatch",
+                           "subject.shredded names a key of another subject: ignored"); continue
+            if cls is None:
+                cls = signing.classify(db)
+            if (cls.get(eid) or (None, None))[1] != "remote-signed":
+                _note_once(db, eid, kid, origin, "ignored: signature",
+                           "subject.shredded does not re-verify (remote-signed): ignored"); continue
+            if row[1] == "active":
+                ks.schedule_destroy(subj, shred_grace_days(), f"sync:{origin}")
+                rep["pending"].append(kid)
+            elif row[1] == "pending_destroy" and row[2] is not None and row[2] <= now:
+                ks.finalize(subj, now=now)
+                db.execute("INSERT INTO redactions(kind,scope,key_id,approved_by,reason) VALUES('shred',?,?,?,?)",
+                           (f"subject:{subj}", kid, vault.HUMAN, f"crypto-shred (synced from {origin})"))
+                rep["destroyed"].append(kid)
         db.commit()
     except Exception:
         db.rollback(); raise
-    if scheduled:
-        vault.audit(db, vault.HUMAN, "sync_shred_scheduled", "accepted",
-                    f"{len(scheduled)} key(s) pending destroy after synced shred (grace {shred_grace_days()}d)")
-    return scheduled
+    if rep["pending"] or rep["destroyed"]:
+        if rep["destroyed"]:
+            db.execute("VACUUM")
+        vault.rebuild(db)
+        vault.audit(db, vault.HUMAN, "sync_shred_reconciled", "accepted",
+                    f"{len(rep['pending'])} key(s) pending destroy, {len(rep['destroyed'])} destroyed after synced shred")
+    return rep
+
+
+def apply_remote_shreds(db):
+    """Compatibility wrapper used by sync.py: reconcile and return the key ids newly put into pending_destroy."""
+    return reconcile_shreds(db)["pending"]

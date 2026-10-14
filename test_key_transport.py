@@ -175,26 +175,60 @@ class KeyTransportTest(unittest.TestCase):
         self.assertEqual(r["pending_destroy_keys"], [kid])  # not destroyed at once: local grace period
         ksb = vault.keystore(self.B)
         self.assertEqual(ksb.info("person:ayse")["state"], "pending_destroy")
-        self.assertEqual(self.payload(self.B, e1)[0]["pin"], "4711-gizli")   # still readable during the grace period
-        self.assertEqual(self.sync_events(self.A, self.B).get("pending_destroy_keys"), None)   # handled once
-        with self.assertRaisesRegex(ValueError, "grace"):
-            ops.shred_finalize(self.B, "person:ayse")
-        ksb.db.execute("UPDATE subject_keys SET destroy_after=0 WHERE key_id=?", (kid,)); ksb.db.commit()
-        self.assertEqual(ops.shred_finalize(self.B, "person:ayse"), kid)   # the existing local mechanism destroys it
-        self.assertEqual(self.payload(self.B, e1), (None, "redacted"))
+        self.assertEqual(self.payload(self.B, e1), (None, "redacted"))   # reads refused at once, DEK kept for grace
         self.assertEqual(self.payload(self.B, e2)[0]["pin"], "9999-gizli")
+        self.assertEqual(self.sync_events(self.A, self.B).get("pending_destroy_keys"), None)
+        with self.assertRaisesRegex(ValueError, "cannot be cancelled"):
+            ops.shred_cancel(self.B, "person:ayse")
+        self.assertEqual(kt.reconcile_shreds(self.B)["destroyed"], [])        # grace not over
+        r = kt.reconcile_shreds(self.B, now=time.time() + 8 * 86400)          # after the grace period
+        self.assertEqual(r["destroyed"], [kid])
         self.assertIsNone(ksb.db.execute("SELECT wrapped_dek FROM subject_keys WHERE key_id=?", (kid,)).fetchone()[0])
-        rows = self.B.execute("SELECT kind, key_id FROM redactions").fetchall()   # same records as a local shred
+        rows = self.B.execute("SELECT kind, key_id FROM redactions").fetchall()   # same record as a local shred
         self.assertEqual([tuple(r) for r in rows], [("shred", kid)])
-        self.assertEqual(ops.doctor(self.B)["checks"]["shredded_but_readable"], 0)
+        d = ops.doctor(self.B)
+        self.assertEqual((d["checks"]["shredded_but_readable"], d["checks"]["synced_shreds_unreconciled"]), (0, 0))
+        self.assertEqual(self.payload(self.B, e2)[0]["pin"], "9999-gizli")
 
-    def test_remote_shred_can_be_cancelled_locally(self):
-        self.secret(); self.sync_events(self.A, self.B); self.ready(); kt.import_keys(self.B, self.bundle())
+    def test_crash_after_commit_reconciled_on_open_and_doctor(self):
+        """Regression (review B1): crash between the vault.db commit and the key update."""
+        from unittest import mock
+        eid = self.secret(); self.sync_events(self.A, self.B); self.ready(); kt.import_keys(self.B, self.bundle())
         ops.shred_confirm(self.A, "person:ayse", 0); time.sleep(0.01); ops.shred_finalize(self.A, "person:ayse")
-        self.sync_events(self.A, self.B)
-        ops.shred_cancel(self.B, "person:ayse")
-        self.sync_events(self.A, self.B)              # not re-scheduled: each synced shred is handled once
+        p = self.path("p.vaultsync"); sync.export(self.A, p)
+        with mock.patch.object(kt, "apply_remote_shreds", side_effect=RuntimeError("crash")):
+            with self.assertRaises(RuntimeError):
+                sync.import_package(self.B, p)
+        ksb = vault.keystore(self.B)
+        self.assertEqual(ksb.info("person:ayse")["state"], "active")          # crash state: DEK still live
+        self.assertEqual(self.payload(self.B, eid), (None, "redacted"))      # ...but never readable
+        probs = kt.shred_problems(self.B)
+        self.assertEqual(len(probs), 1); self.assertIn("live usable DEK", probs[0])
+        with mock.patch.object(kt, "reconcile_shreds", side_effect=RuntimeError("crash")):
+            d = ops.doctor(self.B)
+        self.assertFalse(d["ok"]); self.assertEqual(d["checks"]["synced_shreds_unreconciled"], 1)
+        vault._KEYSTORE.clear()
+        db2 = vault.connect(os.path.join(self.d, "b", "v.db")); self.addCleanup(db2.close)   # open reconciles
+        self.assertEqual(vault.keystore(db2).info("person:ayse")["state"], "pending_destroy")
+        self.assertEqual(kt.shred_problems(db2), [])
+        vault.keystore(db2).db.execute("UPDATE subject_keys SET destroy_after=1"); vault.keystore(db2).db.commit()
+        self.assertEqual(len(kt.shred_problems(db2)), 1)                    # past grace, not destroyed -> doctor error
+        d = ops.doctor(db2)                                                  # doctor reports and finalizes
+        self.assertFalse(d["ok"]); self.assertTrue(d["checks"]["synced_shreds_reconciled_now"])
+        self.assertEqual(kt.shred_problems(db2), [])
+        self.assertTrue(ops.doctor(db2)["ok"])
+
+    def test_shred_key_must_belong_to_its_subject(self):
+        """Review N1: a shred naming another subject's key is not applied."""
+        e1 = self.secret(subject="person:ayse"); self.sync_events(self.A, self.B); self.ready()
+        kid = kt.import_keys(self.B, self.bundle())["imported"][0]
+        vault.append(self.A, "subject.shredded", "person:nobody", {"key_id": kid}, "user:owner", "verified")
+        r = self.sync_events(self.A, self.B)
+        self.assertNotIn("pending_destroy_keys", r)
         self.assertEqual(vault.keystore(self.B).info("person:ayse")["state"], "active")
+        self.assertEqual(self.payload(self.B, e1)[0]["pin"], "4711-gizli")
+        self.assertTrue(any("another subject" in q["reason"] for q in kt.quarantined(self.B)))
+        self.assertEqual(kt.shred_problems(self.B), [])
 
     def test_shred_from_revoked_origin_ignored(self):
         """Regression (review M1): a revoked device's shred must not touch the receiver's keys."""
@@ -210,6 +244,9 @@ class KeyTransportTest(unittest.TestCase):
         self.assertEqual(tuple(row), (1, "active"))
         self.assertEqual(self.payload(self.B, eid)[0]["pin"], "4711-gizli")
         self.assertTrue(any("revoked" in q["reason"] and q["key_id"] == kid for q in kt.quarantined(self.B)))
+        self.sync_events(self.A, self.B)
+        self.assertEqual(sum("revoked" in q["reason"] for q in kt.quarantined(self.B)), 1)   # noted once
+        self.assertEqual(kt.shred_problems(self.B), [])
 
     def test_interrupted_shred_handling_is_retried(self):
         self.secret(); self.sync_events(self.A, self.B); self.ready(); kt.import_keys(self.B, self.bundle())

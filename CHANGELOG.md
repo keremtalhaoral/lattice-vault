@@ -9,7 +9,8 @@ All notable changes to this project are documented here. Format: [Keep a Changel
   subject, event ids, both devices, recipient key, signer) in a user-signed `vaultkeys/0.1` bundle and re-wrapped
   under the recipient's KEK. The KEK is never transported. Unpaired/revoked devices get nothing; failures are
   recorded in `sync_key_quarantine`. Shredded keys are never sent; an applied `subject.shredded` from another
-  device schedules the receiver's copy for destroy with the local grace period (ignored from a revoked device);
+  device makes its data unreadable at once and destroys the receiver's key after the local grace period, reconciled
+  on vault open and in doctor (ignored from a revoked device; key must belong to the subject);
   `revoke-peer` is not a substitute for user-key rotation. `vaultsync/0.1` packages are unchanged.
 - Sync: `vault sync-quarantine --release [ID ...] [--dry-run]` re-verifies held events against the current key
   registry/pairings and applies only those that pass (recorded in `sync_released`; quarantine rows unchanged).

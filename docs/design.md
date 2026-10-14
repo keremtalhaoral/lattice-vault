@@ -104,14 +104,15 @@ Agents may not write `event.*` (except proposing `event.corrected`), `conflict.*
 - **Revert and correction do not remove data.** The old event and its content remain in the log; to remove a
   secret, use redaction or crypto-shredding (§3).
 
-### 2.4 Schema evolution — *Partially implemented*
+### 2.4 Schema evolution — *Implemented (stdlib registry; see docs/schema-evolution.md)*
 - Every event carries `schema_version` (currently 1). The database schema is versioned in `schema_meta`.
 - **Events are never rewritten in place.** The **single exception** is a human-approved
   **copy-to-new-file**: `vault redact` (content of one event replaced by `{"redacted": true, ...}`) and
   `vault migrate` (schema change). The source file is left untouched, the hash chains are recomputed in the
   new file, and redactions are recorded as first-class events plus audit and blocklist rows.
-- *Planned:* a JSON Schema (2020-12) registry per event type and pure, tested upcasters
-  (`v<N> → v<N+1>`) applied at read time. Today payloads are validated in code only.
+- Per-type registry (`schemas.py`, a small declarative stdlib spec instead of JSON Schema) validates on write
+  and stamps `schema_version`. Pure upcasters (`v<N> → v<N+1>`) are applied in memory at read time, and
+  newer-than-known events are tolerated, kept out of projections and reported by `doctor`. See docs/schema-evolution.md.
 
 ## 3. Secrets — *Implemented*
 1. **Pre-write filter** on every agent and CLI write: API-key prefixes (`sk-`, `ghp_`, `xox[bp]-`, `AKIA`),

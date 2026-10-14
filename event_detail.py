@@ -69,7 +69,7 @@ def _scrub(v):
 
 
 def safe_payload(e, status=None):
-    p = json.loads(e["payload"])
+    p = vault.read_upcast(e)
     if p.get("redacted") is True or status == "redacted":
         return "[redacted]"
     return _scrub(p)

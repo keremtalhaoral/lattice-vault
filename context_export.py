@@ -88,7 +88,7 @@ def _items(db, since=None, types=None, unverified=False):
         return i
     for e in events:
         if e["type"] == "event.corrected" and status(e["id"]) == "active" and e["id"] in root_of:
-            p = json.loads(e["payload"])
+            p = vault.read_upcast(e)
             if "field" in p and not p.get("redacted"):
                 corr.setdefault(root(e["id"]), []).append((e, p))
     superseded = set()
@@ -111,7 +111,7 @@ def _items(db, since=None, types=None, unverified=False):
             continue
         if types and t not in types:
             continue
-        p = json.loads(e["payload"])
+        p = vault.read_upcast(e)
         item = {"id": e["id"], "hlc": e["hlc"], "type": t, "date": e["ts"][:10], "supersedes": None,
                 "trust": tr, "actor": e["actor"], "status": s}
         if s == "redacted" or p.get("redacted") is True or e["id"] in blocked:

@@ -5,7 +5,7 @@ Write:  propose_event(token, args)  -- the single, narrow write path; always lan
 Tokens are never logged, echoed, or included in errors. Only sha256 hashes are stored (agents.json, mode 600).
 """
 import hashlib, hmac, json, os, re, secrets, sqlite3, stat, time, unicodedata
-import vault
+import schemas, vault
 
 MAX_PAYLOAD_BYTES = 8192
 FORBIDDEN_KEYS = {"actor", "source", "trust", "status", "approved"}
@@ -200,6 +200,10 @@ def propose_event(token, args):
         refuse(f"type {typ} not allowed for agents")
     if not isinstance(subject, str) or not subject or not isinstance(payload, dict) or not isinstance(ikey, str) or not ikey:
         refuse("subject, payload (object) and idempotency_key are required")
+    try:   # per-type schema (schemas.py); agents may not introduce unknown types
+        schemas.validate(typ, payload)
+    except schemas.SchemaError as e:
+        refuse(f"schema: {str(e)[:300]}")
     bad_src = _check_sources(payload)
     if bad_src:
         refuse(bad_src)
@@ -229,7 +233,7 @@ def propose_event(token, args):
         last = db.execute("SELECT COALESCE(MAX(seq),0) FROM events WHERE subject=?", (subject,)).fetchone()[0]
         try:
             eid, _ = vault.append(db, typ, subject, payload, actor, "unverified", key=args.get("key"),
-                                  supersedes=args.get("supersedes"), idempotency_key=ikey)
+                                  supersedes=args.get("supersedes"), idempotency_key=ikey, strict_types=True)
         except ValueError as e:   # supersedes validation, blocklist, secret filter
             refuse(str(e).split(";")[0][:160])
         vault.audit(db, actor, "propose", "accepted", "ok", eid)
@@ -263,7 +267,9 @@ def get_event(token=None, event_id=""):
         out = {"id": r["id"], "type": r["type"], "subject": r["subject"], "status": r["status"],
                "trust": r["trust"], "ts": r["ts"], "supersedes": r["supersedes"], "target_id": r["target_id"]}
         if r["status"] == "active":
-            out["payload"] = json.loads(vault.esc(r["payload"]))
+            out["payload"] = json.loads(vault.esc(vault.canon(vault.read_upcast(r))))
+            if vault.is_unknown_version(r):
+                out["unknown_version"] = r["schema_version"]
         else:
             out["payload"] = None
             out["note"] = "not active (proposed/rejected); content withheld until a human approves it"

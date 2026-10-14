@@ -11,6 +11,8 @@ Storage decisions (documented in README):
 import argparse, hashlib, json, os, re, secrets, sqlite3, sys, time, uuid
 from datetime import datetime, timezone
 
+import schemas
+
 HUMAN = "user:" + (os.environ.get("VAULT_USER", "owner").strip() or "owner")   # local human actor
 
 os.umask(0o077)
@@ -364,10 +366,13 @@ def current_heads(db, subject, key):
 
 def append(db, type_, subject, payload, actor, trust, key=None, target_id=None, supersedes=None,
            idempotency_key=None, replica_id="local", target_ids=None, parents=None, import_id=None,
-           sensitive=None, force=False, commit=True, _rebuild=True):
+           sensitive=None, force=False, commit=True, _rebuild=True, strict_types=False):
     """Append one event. Returns (event_id, duplicate). Raises SecretRefused / ValueError / sqlite errors."""
     if not isinstance(payload, dict):
         raise ValueError("payload must be an object")
+    # per-type schema check (docs/schema-evolution.md). Known types are always validated. Unknown types are refused
+    # when strict_types (MCP/agent path); library/human CLI may store them at v1 with only the generic size check.
+    schemas.validate(type_, payload, allow_unknown=not strict_types)
     key = key or payload.get("key")
     parents = list(parents or ([supersedes] if supersedes else []))
     targets = list(target_ids or ([target_id] if target_id else []))
@@ -403,7 +408,7 @@ def append(db, type_, subject, payload, actor, trust, key=None, target_id=None, 
     m = db.execute("SELECT COALESCE(MAX(replica_seq),0) FROM events WHERE replica_id=?", (replica_id,)).fetchone()[0]
     prev = (db.execute("SELECT hash FROM events ORDER BY seq DESC LIMIT 1").fetchone() or [GENESIS])[0]
     row = {"id": eid, "replica_id": replica_id, "replica_seq": m + 1, "hlc": next_hlc(db, replica_id), "ts": now(),
-           "type": type_, "schema_version": 1, "subject": subject, "key": key, "payload": canon(stored),
+           "type": type_, "schema_version": schemas.current_version(type_), "subject": subject, "key": key, "payload": canon(stored),
            "payload_ct": payload_ct, "enc_key_id": enc_key_id, "actor": actor, "trust": trust,
            "supersedes": parents[0] if parents else None, "target_id": targets[0] if targets else None,
            "idempotency_key": idempotency_key, "import_id": import_id, "content_hash": chash,
@@ -474,7 +479,23 @@ def decrypt_payload(db, e):
             p.update(keystore(db).open(e["enc_key_id"], e["id"], e["payload_ct"]))
         except Exception:
             return None
-    return p
+    return read_upcast(e, p)
+
+
+def read_upcast(e, p=None):
+    """Payload of a stored event brought to the current schema in memory (stored bytes untouched).
+    Unknown-version (newer than this code) events are returned as stored, never raising."""
+    p = json.loads(e["payload"]) if p is None else p
+    if p.get("redacted") is True:
+        return p
+    try:
+        return schemas.upcast(e["type"], e["schema_version"], p)
+    except schemas.UnknownVersion:
+        return p
+
+
+def is_unknown_version(e):
+    return schemas.is_future(e["type"], e["schema_version"])
 
 
 def compute_status(db, events):
@@ -507,6 +528,10 @@ def rebuild(db):
     plain = {}
     for e in events:
         if e["type"] in META_TYPES and e["type"] != "event.corrected":
+            continue
+        if is_unknown_version(e):   # forward-compat: newer writer; keep it out of projections, doctor reports it
+            if status.get(e["id"], ("",))[0] in ("active", "proposed"):
+                status[e["id"]] = ("unknown_version", None, None)
             continue
         p = decrypt_payload(db, e)
         if p is None:
@@ -614,7 +639,7 @@ def get_history(db, subject):
                       f"WHERE e.id IN ({','.join('?' * len(seen))}) ORDER BY e.hlc, e.id", list(seen)).fetchall()
     out = []
     for r in rows:
-        p = decrypt_payload(db, r) if r["type"] not in REVIEW_TYPES else json.loads(r["payload"])
+        p = decrypt_payload(db, r) if r["type"] not in REVIEW_TYPES else read_upcast(r)
         out.append({"id": r["id"], "type": r["type"], "actor": r["actor"], "status": r["status"], "hlc": r["hlc"],
                     "supersedes": _parents(db, r["id"]),
                     "targets": [t[0] for t in db.execute("SELECT target_id FROM event_targets WHERE event_id=?", (r["id"],))],
@@ -685,7 +710,7 @@ def pack(db, profile="full", max_chars=None, include_unverified=False):
     if include_unverified:
         conf = [f"> - (ÇAKIŞMA {esc(r['subject'])}/{esc(r['key'])}) {esc(r['value'])} {_cite(r['event_id'], r['trust'], ts[r['event_id']])}"
                 for r in db.execute("SELECT * FROM proj_preferences WHERE conflict=1 ORDER BY subject, key, event_id")]
-        sec.append(("Doğrulanmamış", conf + [f"> - ({p['type']}, {p['actor']}) {esc(_flatten(json.loads(p['payload'])))} {_cite(p['id'], p['trust'], p['ts'])}"
+        sec.append(("Doğrulanmamış", conf + [f"> - ({p['type']}, {p['actor']}) {esc(_flatten(read_upcast(p)))} {_cite(p['id'], p['trust'], p['ts'])}"
                     for p in pend]))
     as_of = db.execute("SELECT COALESCE(MAX(seq),0) FROM events").fetchone()[0]
     pack_id = str(uuid.uuid4())
@@ -842,6 +867,9 @@ def main(argv=None):
             if args.source != "user":
                 raise ValueError("`add` is the human path; agents must use `vault propose`")
             actor, trust = actor_for(args.source)
+            if not schemas.is_known(args.type):   # human CLI: unknown types allowed (stored at v1), but say so
+                print(f"warning: {args.type!r} is not a registered event type; stored at schema_version 1 without "
+                      f"per-type validation and ignored by projections (see docs/schema-evolution.md)", file=sys.stderr)
             eid, dup = append(db, args.type, args.subject, payload, actor, trust, key=args.key, supersedes=args.supersedes,
                               idempotency_key=args.idempotency_key, force=args.force,
                               sensitive=[x.strip() for x in args.sensitive.split(",")] if args.sensitive else None)
@@ -955,7 +983,7 @@ def main(argv=None):
     except Exception as e:
         if type(e).__name__ not in ("Refused", "ValueError", "OperationalError", "IntegrityError", "DatabaseError",
                                     "JSONDecodeError", "TamperError", "SecretRefused", "HumanRequired", "KeyError",
-                                    "FileExistsError", "BackupError", "Shredded", "SyncError", "CryptoUnavailable", "PermissionError"):
+                                    "FileExistsError", "BackupError", "Shredded", "SyncError", "SchemaError", "CryptoUnavailable", "PermissionError"):
             raise
         print(f"error: {e}", file=sys.stderr); return 1
     return 0

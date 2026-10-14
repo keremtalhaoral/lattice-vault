@@ -1,6 +1,7 @@
 # ADR 0004 (D-004): Storage model — append-only event log + projections
 - **Status:** Accepted
 - **Implementation:** Implemented
+- **Update 2026-10-14:** payload schema evolution follows this ADR. Old events are never rewritten; upcasters run in memory at read time (docs/schema-evolution.md).
 
 ## Context
 History must be complete and tamper-evident, and approvals/corrections must never destroy earlier state.

@@ -272,4 +272,11 @@ def doctor(db):
     except OSError as e:
         checks["ops_log_writable"] = False
         warnings.append(f"ops log {lp} is not writable ({type(e).__name__}); obs.log() drops records silently")
+    # forward-compat (docs/schema-evolution.md): events written by a newer schema than this code knows
+    unknown = [r["id"] for r in db.execute("SELECT id, type, schema_version FROM events ORDER BY seq")
+               if vault.is_unknown_version(r)]
+    checks["unknown_version_events"] = len(unknown)
+    if unknown:
+        problems.append(f"{len(unknown)} event(s) have a schema_version newer than this code; excluded from "
+                        f"projections until upgrade (first: {unknown[0]})")
     return {"ok": not problems, "problems": problems, "warnings": warnings, "checks": checks}

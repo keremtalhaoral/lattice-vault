@@ -30,6 +30,7 @@ BUNDLE_DOMAIN = b"lattice-key-bundle-sig/v1\n"
 WRAP_AAD_DOMAIN = b"lattice-key-wrap-aad/v1\n"
 WRAP_INFO = b"lattice-sync-key-transport/v1 x25519-hkdf-sha256-aes256gcm"
 MAX_BUNDLE_BYTES = 16 * 1024 * 1024
+SYSTEM_ACTOR = "system:sync-reconcile"   # automatic shred reconcile (vault open / doctor / sync), not a human action
 
 try:
     from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
@@ -235,6 +236,7 @@ def revoke_peer(db, dev, reason, actor=vault.HUMAN):
     ensure_schema(db)
     db.execute("INSERT OR IGNORE INTO sync_ka_revoked(device_id, reason, revoked_by) VALUES(?,?,?)", (dev, reason, actor))
     db.commit()
+    vault.rebuild(db)   # shreds from this device stop applying (vault.shred_applies): projections must follow (L4)
     vault.audit(db, actor, "sync_keys_revoke_peer", "accepted", f"{dev} revoked for key transport")
 
 
@@ -545,6 +547,14 @@ def reconcile_shreds(db, now=None):
             row = ks.db.execute("SELECT subject, state, destroy_after, wrapped_dek IS NOT NULL FROM subject_keys WHERE key_id=?",
                                 (kid,)).fetchone() if isinstance(kid, str) else None
             if not row or not row[3]:
+                # L5: keys.db and vault.db cannot share a transaction. If a crash hit between ks.finalize and the
+                # redactions insert, the key is gone but the record is missing: write it now (idempotent).
+                if row and row[1] == "destroyed" and row[0] == subj and not db.execute(
+                        "SELECT 1 FROM redactions WHERE kind='shred' AND key_id=?", (kid,)).fetchone() and \
+                        (ks.db.execute("SELECT requested_by FROM subject_keys WHERE key_id=?", (kid,)).fetchone()[0] or "").startswith("sync:"):
+                    db.execute("INSERT INTO redactions(kind,scope,key_id,approved_by,reason) VALUES('shred',?,?,?,?)",
+                               (f"subject:{subj}", kid, vault.HUMAN, f"crypto-shred (synced from {origin})"))
+                    rep["destroyed"].append(kid)
                 continue                                   # nothing live here
             if row[0] != subj:
                 _note_once(db, eid, kid, origin, "ignored: subject mismatch",
@@ -569,7 +579,7 @@ def reconcile_shreds(db, now=None):
         if rep["destroyed"]:
             db.execute("VACUUM")
         vault.rebuild(db)
-        vault.audit(db, vault.HUMAN, "sync_shred_reconciled", "accepted",
+        vault.audit(db, SYSTEM_ACTOR, "sync_shred_reconciled", "accepted",
                     f"{len(rep['pending'])} key(s) pending destroy, {len(rep['destroyed'])} destroyed after synced shred")
     return rep
 

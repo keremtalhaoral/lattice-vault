@@ -157,3 +157,9 @@ listed in the quarantine. Bundles carry subject, key and event ids in cleartext,
 sender. It is **not** a protection against a compromised user key (every device holds the same user key, and the
 sender device id is not cryptographically authenticated): after losing a device, rotate the user key
 (`vault keys rotate`).
+
+**Lost device, within the grace period.** If a lost or untrusted device sends a shred you do not want, its data is
+hidden at once but the key is kept until the grace period ends. To recover: `vault sync-keys revoke-peer DEVICE
+--reason lost` (its shreds stop applying, reads return), then `vault shred-cancel SUBJECT` for each affected subject
+(back to `active`), then rotate the user key. After the grace period the key is destroyed and only a backup of
+keys.db taken before that can bring it back. `vault doctor` may reconcile (write) synced shreds; it is not read-only.

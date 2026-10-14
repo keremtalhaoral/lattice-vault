@@ -67,15 +67,20 @@ weakening crypto-shredding or the quarantine model (ADR 0008, 0011, 0012).
    that applied the event. `reconcile_shreds` is idempotent and runs after every `sync-import` and quarantine
    release, **on every vault open** (`vault.connect`), and in `vault doctor`. Until it has run, reads are already
    refused. `doctor` reports an ERROR for a live `active` DEK with an applied shred, or for a `pending_destroy` DEK
-   past its grace period, then reconciles. A crash-injection test covers the window. An old bundle can never bring a
+   past its grace period, then reconciles, so **`vault doctor` is not read-only** in this case (use `vault verify` for a
+   read-only check). Automatic reconcile audits as `system:sync-reconcile`, not as the user. A crash-injection test
+   covers the window. Destroying the key (keys.db) and writing the `redactions` row (vault.db) cannot be one
+   transaction (review L5); a missing row after a crash is written by the next reconcile (tested).
+   `revoke-peer` and `shred-cancel` rebuild projections (review L4). An old bundle can never bring a
    shredded key back. A pending (not finalized) shred on the origin does not propagate.
 10. **CLI.** `vault sync-keys init|cert|add-peer|revoke-peer|export|import|quarantine`; all but `quarantine` are
     human-only (TTY). Output contains ids and fingerprints only.
 
 ## Review items deferred (Data Systems review of #14)
-- **N2: signed bundle sequence numbers.** Not implemented (deviates from S8). Bundles are idempotent by key id, and
+- **N2: signed bundle sequence numbers. MUST be closed before real user data.** Not implemented (deviates from S8). Bundles are idempotent by key id, and
   tombstones stop shredded keys from coming back. Needs explicit Security sign-off.
-- **N3: HPKE-style construction instead of age.** Deviates from S5 and needs Security sign-off (see item 4).
+- **N3: HPKE-style construction instead of age. MUST be closed before real user data** (decision + Security sign-off).
+  Deviates from S5 (see item 4).
 - **N4: signing key.** Bundles and certificates are signed by the user key, not by a device key. `sender_device` is
   only as authentic as the user key; see item 8. Device keys come with vaultsync/0.2.
 - **N5: key-transport revocation is separate from pairing.** `revoke-peer` stops key transport and synced shreds
@@ -84,6 +89,12 @@ weakening crypto-shredding or the quarantine model (ADR 0008, 0011, 0012).
   rows are never resolved. After a crash between the keys.db and vault.db steps of an import, the `sync_key_imports`
   bookkeeping row is missing; the key itself is present and a re-import reports it as a duplicate.
 - **N7:** addressed in item 6 (the explicit, audited first-KEK case).
+- **N9: over-hiding (safe direction).** Any applied `subject.shredded` in the log hides that subject's data for reads,
+  even if it is later found invalid by reconcile (subject mismatch, failed re-verification) or its origin is revoked
+  after the fact; reads return after `revoke-peer` (then `shred-cancel`). Never the leaking direction.
+- **N10: opening needs write access.** `vault.connect` may write (shred reconcile on open: keys.db update, audit row
+  as `system:sync-reconcile`); a read-only vault file or keys.db makes the reconcile fail with a warning (reads stay
+  refused) until it can write.
 - **N8: bundle metadata is in cleartext.** Subject ids, key ids and event ids are not encrypted, the same as in
   `.vaultsync` packages (docs/sync.md, SECURITY.md).
 

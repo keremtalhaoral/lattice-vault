@@ -218,6 +218,36 @@ class KeyTransportTest(unittest.TestCase):
         self.assertEqual(kt.shred_problems(db2), [])
         self.assertTrue(ops.doctor(db2)["ok"])
 
+    def test_lost_device_recovery_keeps_projections_consistent(self):
+        """Review L4: revoke-peer + shred-cancel within the grace period; doctor stays clean."""
+        eid = self.secret(); self.sync_events(self.A, self.B); self.ready(); kt.import_keys(self.B, self.bundle())
+        ops.shred_confirm(self.A, "person:ayse", 0); time.sleep(0.01); ops.shred_finalize(self.A, "person:ayse")
+        self.sync_events(self.A, self.B)
+        self.assertEqual(self.payload(self.B, eid), (None, "redacted"))
+        kt.revoke_peer(self.B, self.da, "lost device")
+        self.assertTrue(ops.doctor(self.B)["checks"]["projection_matches_log"])
+        ops.shred_cancel(self.B, "person:ayse")
+        self.assertEqual(vault.keystore(self.B).info("person:ayse")["state"], "active")
+        self.assertEqual(self.payload(self.B, eid)[0]["pin"], "4711-gizli")
+        d = ops.doctor(self.B)
+        self.assertTrue(d["ok"], d["problems"])
+        a = self.B.execute("SELECT actor FROM audit WHERE action='sync_shred_reconciled'").fetchall()
+        self.assertEqual({r[0] for r in a}, {kt.SYSTEM_ACTOR})
+
+    def test_crash_between_finalize_and_redactions_row_healed(self):
+        """Review L5: the missing redactions row is written by the next reconcile."""
+        from unittest import mock
+        self.secret(); self.sync_events(self.A, self.B); self.ready(); kid = kt.import_keys(self.B, self.bundle())["imported"][0]
+        ops.shred_confirm(self.A, "person:ayse", 0); time.sleep(0.01); ops.shred_finalize(self.A, "person:ayse")
+        self.sync_events(self.A, self.B)
+        ks = vault.keystore(self.B)
+        ks.finalize("person:ayse", now=time.time() + 8 * 86400)     # key destroyed, vault.db step "crashed"
+        self.assertEqual(self.B.execute("SELECT count(*) FROM redactions").fetchone()[0], 0)
+        kt.reconcile_shreds(self.B)
+        self.assertEqual([tuple(r) for r in self.B.execute("SELECT kind, key_id FROM redactions")], [("shred", kid)])
+        kt.reconcile_shreds(self.B)
+        self.assertEqual(self.B.execute("SELECT count(*) FROM redactions").fetchone()[0], 1)
+
     def test_shred_key_must_belong_to_its_subject(self):
         """Review N1: a shred naming another subject's key is not applied."""
         e1 = self.secret(subject="person:ayse"); self.sync_events(self.A, self.B); self.ready()

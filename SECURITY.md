@@ -99,7 +99,10 @@ access to an unlocked machine, a compromised Python interpreter or dependency.
   paired device's certified X25519 key and re-wrapped under its own KEK; the KEK never leaves a device. Unpaired or
   revoked devices get nothing; anything that fails verification is quarantined. Shredded keys are never sent; a synced
   shred makes the data unreadable at once and destroys the local key after the local grace period (reconciled on open
-  and in doctor). Bundle metadata (subject, key and event ids) is cleartext. `sync-keys revoke-peer` is not a protection
+  and in doctor). Bundle metadata (subject, key and event ids) is cleartext.
+  Until the grace period ends, a receiver keeps the KEK-wrapped key of a shredded subject, and keys.db backups
+  (`vault backup-keys`) taken in that window contain it (N11). `vault doctor` may reconcile synced shreds (writes).
+  Signed bundle sequence numbers (N2) and the age vs HPKE-style decision (N3) must be closed before real user data. `sync-keys revoke-peer` is not a protection
   against a compromised user key (the sender device id is not cryptographically authenticated); rotation is required.
 - Sync: the real device id is written into `replica_id` at write time (until then, verify against `origin_row`).
   Device keys are certified by the user key. Retroactive revocation needs `compromised:true`, a user signature and a

@@ -199,6 +199,7 @@ def shred_cancel(db, subject, by=vault.HUMAN):
     if i and vault.shred_applies(db, i["key_id"], subject):
         raise ValueError("a subject.shredded for this key is already in the log (synced shred); it cannot be cancelled")
     vault.keystore(db).cancel(subject)
+    vault.rebuild(db)   # readability may change (L4): keep projections equal to a fresh rebuild
     vault.audit(db, by, "shred_cancel", "accepted", "pending destroy cancelled")
 
 

@@ -16,3 +16,13 @@ jobs:
       - run: pip install -r requirements.txt
       - run: python -m unittest discover -p 'test_*.py' -v
       - run: python examples/seed.py "$RUNNER_TEMP/demo-vault"
+  min-cryptography:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install "cryptography==49.*"
+      - run: python -c "import cryptography; print(cryptography.__version__)"
+      - run: python -m unittest discover -p 'test_*.py' -v

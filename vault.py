@@ -387,7 +387,7 @@ def validate_parents(db, new_id, parents):
         if not db.execute("SELECT 1 FROM events WHERE id=?", (p,)).fetchone():
             raise ValueError(f"supersedes unknown event {p}")
         st = db.execute("SELECT status FROM proj_status WHERE event_id=?", (p,)).fetchone()
-        if st and st[0] in ("rejected", "reverted", "redacted"):
+        if st and st[0] in ("rejected", "reverted", "redacted", "undecryptable"):
             raise ValueError(f"cannot supersede a {st[0]} event")
         if _live_children(db, p):
             raise ValueError(f"double supersede: {p} is already superseded by {_live_children(db, p)[0]}; supersede the latest head")
@@ -516,15 +516,25 @@ def _parents(db, eid):
 
 def decrypt_payload(db, e):
     """Plain payload, or None if the event is redacted/shredded/undecryptable (never raises)."""
+    return payload_state(db, e)[0]
+
+
+def payload_state(db, e):
+    """(payload, None) when readable, else (None, reason): 'redacted' for redacted or crypto-shredded events
+    (data intentionally destroyed), 'undecryptable' when the key is missing, the KEK is wrong or the
+    ciphertext fails authentication (data exists but cannot be read here; restore the right keys/KEK)."""
     p = json.loads(e["payload"])
     if p.get("redacted") is True:
-        return None
+        return None, "redacted"
     if e["enc_key_id"]:
+        import crypto_keys
         try:
             p.update(keystore(db).open(e["enc_key_id"], e["id"], e["payload_ct"]))
+        except crypto_keys.Shredded:
+            return None, "redacted"
         except Exception:
-            return None
-    return read_upcast(e, p)
+            return None, "undecryptable"
+    return read_upcast(e, p), None
 
 
 def read_upcast(e, p=None):
@@ -612,10 +622,10 @@ def _rebuild_body(db):
             if status.get(e["id"], ("",))[0] in ("active", "proposed"):
                 status[e["id"]] = ("unknown_version", None, None)
             continue
-        p = decrypt_payload(db, e)
+        p, why = payload_state(db, e)
         if p is None:
             if status.get(e["id"], ("",))[0] in ("active", "proposed"):
-                status[e["id"]] = ("redacted", None, None)
+                status[e["id"]] = (why, None, None)
             continue
         plain[e["id"]] = p
     for eid, (st, by, sq) in sorted(status.items()):
@@ -723,9 +733,9 @@ def apply_incremental(db, eid):
     status, trust_eff = dict(cur), {}
     _status_step(status, trust_eff, e, targets)
     if t not in META_TYPES:
-        p = decrypt_payload(db, e)
+        p, why = payload_state(db, e)
         if p is None:
-            status[eid] = ("redacted", None, None)
+            status[eid] = (why, None, None)
         elif status[eid][0] == "active":
             if parents and t != "event.corrected":
                 for tbl, _ in _CONFLICT_GROUPS:
@@ -801,7 +811,7 @@ def get_history(db, subject):
         out.append({"id": r["id"], "type": r["type"], "actor": r["actor"], "status": r["status"], "hlc": r["hlc"],
                     "supersedes": _parents(db, r["id"]),
                     "targets": [t[0] for t in db.execute("SELECT target_id FROM event_targets WHERE event_id=?", (r["id"],))],
-                    "payload": p if p is not None else {"redacted": True}})
+                    "payload": p if p is not None else ({"undecryptable": True} if r["status"] == "undecryptable" else {"redacted": True})})
     return out
 
 
@@ -916,7 +926,7 @@ def pack(db, profile="full", max_chars=None, include_unverified=False):
 
 # ---------- CLI ----------
 HUMAN_CMDS = {"add", "approve", "reject", "correct", "revert", "import-approve", "revert-import", "redact",
-              "shred-cancel", "shred-finalize", "agent-add", "agent-revoke", "review-verdict", "migrate", "sync-pair", "backup", "backup-keys", "restore"}
+              "shred-cancel", "shred-finalize", "agent-add", "agent-revoke", "review-verdict", "migrate", "sync-pair", "backup", "backup-keys", "backup-kek", "restore"}
 
 
 def _tip(db, event_id):
@@ -953,8 +963,10 @@ def main(argv=None):
     p.add_argument("--max-chars", type=int); p.add_argument("--include-unverified", action="store_true")
     import context_export; context_export.add_parser(sp)
     sp.add_parser("rebuild"); sp.add_parser("pending")
-    sp.add_parser("doctor").add_argument("--full", action="store_true",
+    dr = sp.add_parser("doctor"); dr.add_argument("--full", action="store_true",
         help="full hash-chain verify from genesis (always on for doctor; open-time checks are incremental)")
+    dr.add_argument("--decrypt-all", action="store_true",
+        help="trial-decrypt every encrypted event (default: every key + one sampled event per key)")
     for v in ("approve", "reject"):
         r = sp.add_parser(v); r.add_argument("event_id", nargs="+"); r.add_argument("--reason")
     c = sp.add_parser("correct"); c.add_argument("event_id"); c.add_argument("--field", required=True)
@@ -993,10 +1005,16 @@ def main(argv=None):
                                                              help="deprecated no-op: backups never include keys.db")
     bkk = sp.add_parser("backup-keys", help="separate backup of keys.db (KEK-wrapped); store apart from vault backups")
     bkk.add_argument("--out", required=True)
+    bkek = sp.add_parser("backup-kek", help="explicit, separate KEK backup (keys.kek or passphrase salt); store apart from key backups")
+    bkek.add_argument("--out", required=True)
     rs = sp.add_parser("restore", help="verify a backup and restore it to a new path")
     rs.add_argument("backup_dir"); rs.add_argument("--to", required=True); rs.add_argument("--force", action="store_true")
     rs.add_argument("--keys", metavar="KEYS_DIR", help="keys backup dir from `vault backup-keys`")
-    rs.add_argument("--allow-missing-keys", action="store_true", help="restore even if keys.db lacks keys the log references")
+    rs.add_argument("--allow-missing-keys", action="store_true", help="with --keys: restore even if keys.db lacks keys the log references")
+    rs.add_argument("--allow-no-keys", action="store_true",
+                    help="restore WITHOUT --keys although encrypted events exist (they stay undecryptable)")
+    rs.add_argument("--kek", metavar="KEK_DIR", help="KEK backup dir from `vault backup-kek`, installed next to the target")
+    sp.add_parser("verify", help="read-only: full hash-chain verify + projection hash vs a fresh rebuild (exit 2 on failure)")
     args = ap.parse_args(argv)
     try:
         if args.cmd in HUMAN_CMDS or (args.cmd == "shred" and args.confirm):
@@ -1009,7 +1027,8 @@ def main(argv=None):
             sys.stdout.write(event_detail.show(args.event_id, args.json, args.tree)); return 0
         if args.cmd == "restore":   # does not open the live vault
             import backup
-            print(json.dumps(backup.restore(args.backup_dir, args.to, args.force, args.allow_missing_keys, args.keys), ensure_ascii=False, indent=2)); return 0
+            print(json.dumps(backup.restore(args.backup_dir, args.to, args.force, args.allow_missing_keys, args.keys,
+                                            allow_no_keys=args.allow_no_keys, kek_dir=args.kek), ensure_ascii=False, indent=2)); return 0
         db = connect()
         if args.cmd == "backup":
             import backup
@@ -1017,6 +1036,15 @@ def main(argv=None):
                 print("note: --no-keys is deprecated and a no-op; backups never include keys.db", file=sys.stderr)
             rep = backup.backup(db, args.out)
             print(json.dumps(rep["manifest"], ensure_ascii=False, indent=2)); return 0
+        if args.cmd == "backup-kek":
+            import backup
+            rep = backup.backup_kek(db, args.out)
+            print("WARNING: " + rep["warning"], file=sys.stderr)
+            print(json.dumps(rep["manifest"], ensure_ascii=False, indent=2)); return 0
+        if args.cmd == "verify":
+            import ops
+            rep = ops.verify(db); print(json.dumps(rep, ensure_ascii=False, indent=2))
+            return 0 if rep["ok"] else 2
         if args.cmd == "backup-keys":
             import backup
             rep = backup.backup_keys(db, args.out)
@@ -1065,7 +1093,7 @@ def main(argv=None):
             rebuild(db); print("rebuilt", projection_hash(db))
         elif args.cmd == "doctor":
             import ops
-            rep = ops.doctor(db); print(json.dumps(rep, ensure_ascii=False, indent=2))
+            rep = ops.doctor(db, decrypt_all=args.decrypt_all); print(json.dumps(rep, ensure_ascii=False, indent=2))
             return 0 if rep["ok"] else 2
         elif args.cmd == "pending":
             for r in db.execute("""SELECT e.id,e.type,e.subject,e.actor,e.payload FROM events e JOIN proj_status s

@@ -72,6 +72,8 @@ def safe_payload(e, status=None):
     p = vault.read_upcast(e)
     if p.get("redacted") is True or status == "redacted":
         return "[redacted]"
+    if status == "undecryptable":
+        return "[undecryptable]"
     return _scrub(p)
 
 

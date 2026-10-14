@@ -47,6 +47,71 @@ def _secure_file(p):
         os.chmod(p, 0o600)
 
 
+class KekMismatch(ValueError):
+    pass
+
+
+def kek_paths(kek_path):
+    """Files that make up the KEK on disk: keys.kek (file mode) or keys.kek.salt (VAULT_PASSPHRASE mode)."""
+    return kek_path + ".salt" if os.environ.get("VAULT_PASSPHRASE") else kek_path
+
+
+def read_kek(kek_path, create=False):
+    """(kek, kek_id). With create=False a missing KEK file / salt raises FileNotFoundError instead of
+    silently generating a fresh KEK (restore and doctor must never invent a KEK)."""
+    _need()
+    pw = os.environ.get("VAULT_PASSPHRASE")
+    if pw:
+        salt_p = kek_path + ".salt"
+        if not os.path.exists(salt_p):
+            if not create:
+                raise FileNotFoundError("KEK salt not found")
+            fd = os.open(salt_p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600); os.write(fd, os.urandom(16)); os.close(fd)
+        salt = open(salt_p, "rb").read()
+        return Scrypt(salt=salt, length=32, n=2 ** 17, r=8, p=1).derive(pw.encode()), "kek-scrypt-v1"
+    if not os.path.exists(kek_path):
+        if not create:
+            raise FileNotFoundError("KEK file not found")
+        fd = os.open(kek_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600); os.write(fd, AESGCM.generate_key(256)); os.close(fd)
+    mode = stat.S_IMODE(os.stat(kek_path).st_mode)
+    if mode & 0o077:
+        raise PermissionError(f"KEK file permissions {oct(mode)} too open; require 600")
+    return open(kek_path, "rb").read(), "kek-file-v1"
+
+
+def unwrap_dek(kek, kid, blob):
+    return AESGCM(kek).decrypt(blob[:12], blob[12:], b"dek|" + kid.encode())
+
+
+def open_event(dek, kid, event_id, ct):
+    return json.loads(AESGCM(dek).decrypt(ct[:12], ct[12:], f"{event_id}|{kid}".encode()))
+
+
+def trial_decrypt(keys_conn, vault_conn, kek, max_events_per_key=1):
+    """Try to unwrap every live DEK in keys_conn with `kek` and open up to `max_events_per_key` encrypted events
+    per key (None = all). Returns {"keys_checked", "events_checked", "bad_keys", "bad_events"} (ids only, never
+    plaintext or ciphertext)."""
+    _need()
+    rep = {"keys_checked": 0, "events_checked": 0, "bad_keys": [], "bad_events": []}
+    for kid, blob in keys_conn.execute("SELECT key_id, wrapped_dek FROM subject_keys WHERE wrapped_dek IS NOT NULL ORDER BY key_id"):
+        rep["keys_checked"] += 1
+        try:
+            dek = unwrap_dek(kek, kid, blob)
+        except Exception:
+            rep["bad_keys"].append(kid); continue
+        q = "SELECT id, payload_ct FROM events WHERE enc_key_id=? AND payload_ct IS NOT NULL ORDER BY seq"
+        args = (kid,)
+        if max_events_per_key is not None:
+            q += " LIMIT ?"; args = (kid, max_events_per_key)
+        for eid, ct in vault_conn.execute(q, args):
+            rep["events_checked"] += 1
+            try:
+                open_event(dek, kid, eid, ct)
+            except Exception:
+                rep["bad_events"].append(eid)
+    return rep
+
+
 class KeyStore:
     def __init__(self, vault_db_path):
         _need()
@@ -61,19 +126,7 @@ class KeyStore:
         self.kek, self.kek_id = self._kek()
 
     def _kek(self):
-        pw = os.environ.get("VAULT_PASSPHRASE")
-        if pw:
-            salt_p = self.kek_path + ".salt"
-            if not os.path.exists(salt_p):
-                fd = os.open(salt_p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600); os.write(fd, os.urandom(16)); os.close(fd)
-            salt = open(salt_p, "rb").read()
-            return Scrypt(salt=salt, length=32, n=2 ** 17, r=8, p=1).derive(pw.encode()), "kek-scrypt-v1"
-        if not os.path.exists(self.kek_path):
-            fd = os.open(self.kek_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600); os.write(fd, AESGCM.generate_key(256)); os.close(fd)
-        mode = stat.S_IMODE(os.stat(self.kek_path).st_mode)
-        if mode & 0o077:
-            raise PermissionError(f"KEK file permissions {oct(mode)} too open; require 600")
-        return open(self.kek_path, "rb").read(), "kek-file-v1"
+        return read_kek(self.kek_path, create=True)
 
     def close(self):
         self.db.close()
@@ -106,7 +159,7 @@ class KeyStore:
         n = os.urandom(12); return n + AESGCM(self.kek).encrypt(n, dek, b"dek|" + kid.encode())
 
     def _unwrap(self, blob, kid):
-        return AESGCM(self.kek).decrypt(blob[:12], blob[12:], b"dek|" + kid.encode())
+        return unwrap_dek(self.kek, kid, blob)
 
     # -- payload
     def seal(self, subject, event_id, fields):
@@ -116,8 +169,7 @@ class KeyStore:
         return kid, ct
 
     def open(self, kid, event_id, ct):
-        dek = self.dek_by_id(kid)
-        return json.loads(AESGCM(dek).decrypt(ct[:12], ct[12:], f"{event_id}|{kid}".encode()))
+        return open_event(self.dek_by_id(kid), kid, event_id, ct)
 
     # -- shredding lifecycle
     def info(self, subject):

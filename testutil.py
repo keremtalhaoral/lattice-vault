@@ -1,4 +1,4 @@
-import os, sqlite3, tempfile
+import os, shutil, sqlite3, tempfile
 os.environ.setdefault("VAULT_ALLOW_NONTTY", "1")
 import vault
 
@@ -11,6 +11,7 @@ except Exception:
 
 def fresh(test):
     d = tempfile.mkdtemp()
+    test.addCleanup(shutil.rmtree, d, ignore_errors=True)   # registered first -> runs after db.close()
     os.environ["VAULT_DB"] = os.path.join(d, "v.db")
     os.environ["VAULT_LOG"] = os.path.join(d, "ops.jsonl")
     for k in ("VAULT_KEYS_DB", "VAULT_KEK_FILE", "VAULT_PASSPHRASE", "VAULT_AGENTS"):

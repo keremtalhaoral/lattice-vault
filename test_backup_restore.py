@@ -144,11 +144,21 @@ class EncryptedBackupTest(unittest.TestCase):
         with self.assertRaisesRegex(backup.BackupError, "not a keys backup"):
             backup.restore(self.bk, self.to, keys_dir=self.bk)
 
-    def test_no_keys_restore_unreadable(self):
+    def test_no_keys_restore_refused_when_encrypted(self):
         backup.backup(self.db, self.bk)
-        self.assertTrue(backup.restore(self.bk, self.to)["warnings"])
-        nd, dec = self._open()
-        self.assertIsNone(dec(self.e))
+        with self.assertRaisesRegex(backup.BackupError, "--allow-no-keys"):
+            backup.restore(self.bk, self.to)
+        self.assertFalse(os.path.exists(self.to))
+
+    def test_no_keys_restore_override_undecryptable_no_kek_created(self):
+        backup.backup(self.db, self.bk)
+        os.environ.pop("VAULT_KEK_FILE", None); os.environ.pop("VAULT_KEYS_DB", None)
+        self.assertTrue(backup.restore(self.bk, self.to, allow_no_keys=True)["warnings"])
+        tdir = os.path.dirname(self.to)
+        self.assertNotIn("keys.db", os.listdir(tdir)); self.assertNotIn("keys.kek", os.listdir(tdir))
+        c = sqlite3.connect(self.to)
+        self.assertEqual(c.execute("SELECT status FROM proj_status WHERE event_id=?", (self.e,)).fetchone()[0], "undecryptable")
+        c.close()
 
     def test_missing_keys_rejected_unless_allowed(self):
         bk, kd = self.full("b")
@@ -216,3 +226,118 @@ class EncryptedBackupTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
+class RestoreKeyVerificationTest(unittest.TestCase):
+    """Restore drill 2026-10-14 regressions: wrong KEK, keyless restore, undecryptable state, doctor decrypt check."""
+    def setUp(self):
+        fresh(self)
+        os.environ["VAULT_KEK_FILE"] = os.path.join(self.d, "keys.kek")
+        self.addCleanup(os.environ.pop, "VAULT_KEK_FILE", None)
+        self.e = vault.append(self.db, "note.added", "user:owner", {"text": "acik", "secret": SECRET}, "user:owner",
+                              "verified", sensitive=["secret"])[0]
+        self.e2 = vault.append(self.db, "note.added", "kisi:b", {"text": "b", "secret": "ikinci-gizli"}, "user:owner",
+                               "verified", sensitive=["secret"])[0]
+        self.bk = os.path.join(self.d, "bk"); self.kd = os.path.join(self.d, "keys")
+        backup.backup(self.db, self.bk); backup.backup_keys(self.db, self.kd)
+        self.tdir = os.path.join(self.d, "r"); self.to = os.path.join(self.tdir, "vault.db")
+        os.environ.pop("VAULT_KEK_FILE")          # restore target uses its own keys.kek next to vault.db
+
+    def _wrong_kek(self):
+        os.makedirs(self.tdir, mode=0o700, exist_ok=True)
+        fd = os.open(os.path.join(self.tdir, "keys.kek"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.write(fd, os.urandom(32)); os.close(fd)
+
+    def _good_kek(self):
+        os.makedirs(self.tdir, mode=0o700, exist_ok=True)
+        shutil.copy(os.path.join(self.d, "keys.kek"), os.path.join(self.tdir, "keys.kek"))
+        os.chmod(os.path.join(self.tdir, "keys.kek"), 0o600)
+
+    def test_wrong_kek_rejected(self):
+        self._wrong_kek()
+        with self.assertRaisesRegex(backup.BackupError, "KEK does not match"):
+            backup.restore(self.bk, self.to, keys_dir=self.kd)
+        self.assertEqual(os.listdir(self.tdir), ["keys.kek"])            # nothing restored, no staging left
+
+    def test_wrong_kek_rejected_even_with_force_over_existing(self):
+        self._wrong_kek()
+        backup.restore(self.bk, self.to, allow_no_keys=True)              # keyless restore first (drill path)
+        with self.assertRaisesRegex(backup.BackupError, "KEK does not match"):
+            backup.restore(self.bk, self.to, force=True, keys_dir=self.kd)
+
+    def test_right_kek_reports_verification(self):
+        self._good_kek()
+        rep = backup.restore(self.bk, self.to, keys_dir=self.kd)
+        self.assertEqual(rep["kek_verified"], {"keys_checked": 2, "events_checked": 2})
+
+    def test_kek_backup_separate_and_restorable(self):
+        os.environ["VAULT_KEK_FILE"] = os.path.join(self.d, "keys.kek")
+        kekd = os.path.join(self.d, "kek")
+        rep = backup.backup_kek(self.db, kekd)
+        self.assertIn("apart", rep["warning"]); self.assertEqual(sorted(os.listdir(kekd)), ["keys.kek", "manifest.json"])
+        for target in (self.kd, os.path.join(self.bk, "x")):
+            with self.assertRaisesRegex(backup.BackupError, "overlaps"):
+                backup.backup_kek(self.db, target)
+        with self.assertRaisesRegex(backup.BackupError, "overlaps"):
+            backup.backup_keys(self.db, os.path.join(kekd, "k"))
+        self.assertNotIn("keys.kek", os.listdir(self.kd))                 # keys backup never carries the KEK
+        os.environ.pop("VAULT_KEK_FILE")
+        rep = backup.restore(self.bk, self.to, keys_dir=self.kd, kek_dir=kekd)
+        self.assertTrue(rep["kek_installed"])
+        self.assertEqual(stat.S_IMODE(os.stat(os.path.join(self.tdir, "keys.kek")).st_mode), 0o600)
+        vault._KEYSTORE.clear(); nd = vault.connect(self.to); self.addCleanup(nd.close)
+        self.assertEqual(vault.decrypt_payload(nd, nd.execute("SELECT * FROM events WHERE id=?", (self.e,)).fetchone())["secret"], SECRET)
+        self.assertTrue(ops.doctor(nd)["ok"])
+
+    def test_kek_never_overwritten(self):
+        os.environ["VAULT_KEK_FILE"] = os.path.join(self.d, "keys.kek")
+        kekd = os.path.join(self.d, "kek"); backup.backup_kek(self.db, kekd); os.environ.pop("VAULT_KEK_FILE")
+        self._wrong_kek()
+        with self.assertRaisesRegex(backup.BackupError, "different KEK already exists"):
+            backup.restore(self.bk, self.to, keys_dir=self.kd, kek_dir=kekd, force=True)
+
+    def test_doctor_detects_undecryptable_and_state(self):
+        self._good_kek()
+        backup.restore(self.bk, self.to, keys_dir=self.kd)
+        os.chmod(os.path.join(self.tdir, "keys.kek"), 0o600)
+        with open(os.path.join(self.tdir, "keys.kek"), "wb") as f:      # KEK swapped after restore
+            f.write(os.urandom(32))
+        vault._KEYSTORE.clear(); nd = vault.connect(self.to); self.addCleanup(nd.close)
+        vault.rebuild(nd)
+        self.assertEqual(status(nd, self.e), "undecryptable")              # not 'redacted'
+        rep = ops.doctor(nd)
+        self.assertFalse(rep["ok"]); self.assertEqual(rep["checks"]["decrypt"]["undecryptable_keys"], 2)
+        self.assertTrue(any("cannot be unwrapped" in p for p in rep["problems"]))
+        self.assertEqual(ops.doctor(nd, decrypt_all=True)["checks"]["decrypt"]["mode"], "all")
+
+    def test_doctor_full_decrypt_mode(self):
+        self._good_kek()
+        backup.restore(self.bk, self.to, keys_dir=self.kd)
+        vault._KEYSTORE.clear(); nd = vault.connect(self.to); self.addCleanup(nd.close)
+        self.assertTrue(ops.doctor(nd, decrypt_all=True)["ok"])
+        self.assertEqual(ops.doctor(nd, decrypt_all=True)["checks"]["decrypt"]["events_checked"], 2)
+
+    def test_shredded_vs_missing_in_doctor(self):
+        os.environ["VAULT_KEK_FILE"] = os.path.join(self.d, "keys.kek")
+        ops.shred_confirm(self.db, "kisi:b", 0); ops.shred_finalize(self.db, "kisi:b")
+        rep = ops.doctor(self.db)
+        self.assertTrue(rep["ok"], rep["problems"])
+        self.assertEqual(rep["checks"]["shredded_keys"], 1); self.assertEqual(rep["checks"]["events_with_missing_keys"], 0)
+        self.assertEqual(status(self.db, self.e2), "redacted")              # crypto-shredded stays 'redacted'
+        c = vault.keystore(self.db).db; c.execute("DELETE FROM subject_keys WHERE subject='user:owner'"); c.commit()
+        rep = ops.doctor(self.db)
+        self.assertEqual(rep["checks"]["events_with_missing_keys"], 1); self.assertEqual(rep["checks"]["shredded_keys"], 1)
+        vault.rebuild(self.db); self.assertEqual(status(self.db, self.e), "undecryptable")
+
+    def test_corrupt_row_error_sanitized(self):
+        bad = os.path.join(self.d, "bad"); shutil.copytree(self.bk, bad)
+        p = os.path.join(bad, "vault.db"); b = bytearray(open(p, "rb").read())
+        i = b.find(b'"acik"'); self.assertGreater(i, 0); b[i + 1] = 0xFF; open(p, "wb").write(b); rehash(bad, "vault.db")
+        with self.assertRaises(backup.BackupError) as cm:
+            backup.restore(bad, self.to, keys_dir=self.kd)
+        self.assertNotIn("cik", str(cm.exception))
+
+    def test_verify_command(self):
+        rep = ops.verify(self.db)
+        self.assertTrue(rep["ok"]); self.assertEqual(rep["projection_hash"], vault.projection_hash(self.db))

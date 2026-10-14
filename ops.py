@@ -202,16 +202,8 @@ def shred_finalize(db, subject, by=vault.HUMAN):
     return kid
 
 
-def doctor(db):
-    """Append-only integrity, projection vs log, orphan keys, shredded-but-still-readable. Returns {ok, problems, checks}."""
-    problems = vault.check_triggers(db) + vault.verify_chains(db)
-    checks = {"triggers_and_chains": not problems}
-    ic = [r[0] for r in db.execute("PRAGMA integrity_check")]
-    qc = [r[0] for r in db.execute("PRAGMA quick_check")]
-    checks["integrity_check"] = ic[0] if ic == ["ok"] else ic[:5]
-    checks["quick_check"] = qc[0] if qc == ["ok"] else qc[:5]
-    if ic != ["ok"] or qc != ["ok"]:
-        problems.append("sqlite integrity_check/quick_check failed")
+def _projection_pair(db):
+    """(stored projection_hash, hash of a fresh in-memory rebuild of the log). Read-only for db."""
     mem = sqlite3.connect(":memory:"); mem.row_factory = sqlite3.Row
     db.backup(mem)
     before = vault.projection_hash(db)
@@ -231,6 +223,34 @@ def doctor(db):
     finally:
         for k in mem_keys:
             vault._KEYSTORE.pop(k, None)
+    return before, after
+
+
+def verify(db):
+    """`vault verify`: full event + audit hash-chain verify and projection hash vs a fresh rebuild. No writes."""
+    problems = vault.check_triggers(db) + vault.verify_chains(db)
+    before, after = _projection_pair(db)
+    if before != after:
+        problems.append("projections differ from a fresh rebuild of the log")
+    n = db.execute("SELECT count(*) FROM events").fetchone()[0]
+    head = (db.execute("SELECT hash FROM events ORDER BY seq DESC LIMIT 1").fetchone() or [vault.GENESIS])[0]
+    return {"ok": not problems, "problems": problems, "event_count": n, "chain_head": head,
+            "projection_hash": before, "projection_matches_log": before == after}
+
+
+def doctor(db, decrypt_all=False):
+    """Append-only integrity, projection vs log, orphan keys, shredded-but-still-readable, key decryptability
+    (every live DEK unwrapped with the KEK; one sampled event per key, or every encrypted event with decrypt_all).
+    Returns {ok, problems, checks}."""
+    problems = vault.check_triggers(db) + vault.verify_chains(db)
+    checks = {"triggers_and_chains": not problems}
+    ic = [r[0] for r in db.execute("PRAGMA integrity_check")]
+    qc = [r[0] for r in db.execute("PRAGMA quick_check")]
+    checks["integrity_check"] = ic[0] if ic == ["ok"] else ic[:5]
+    checks["quick_check"] = qc[0] if qc == ["ok"] else qc[:5]
+    if ic != ["ok"] or qc != ["ok"]:
+        problems.append("sqlite integrity_check/quick_check failed")
+    before, after = _projection_pair(db)
     checks["projection_matches_log"] = before == after
     if before != after:
         problems.append("projections differ from a fresh rebuild of the log")
@@ -242,11 +262,36 @@ def doctor(db):
     except Exception as e:
         problems.append(f"keystore unavailable: {type(e).__name__}")
     key_ids = {k["key_id"] for k in keys}
+    shredded_log = set()
+    for r in db.execute("SELECT payload FROM events WHERE type='subject.shredded'"):
+        try:
+            kid = json.loads(r[0]).get("key_id")
+        except (ValueError, AttributeError):
+            kid = None
+        if kid:
+            shredded_log.add(kid)
+    destroyed = {k["key_id"] for k in keys if not k["has_dek"]}
     orphans = sorted(key_ids - enc_ids)
-    missing = sorted(enc_ids - key_ids)
+    missing = sorted(enc_ids - key_ids - shredded_log)
     checks["orphan_keys"] = orphans; checks["events_with_missing_keys"] = len(missing)
+    checks["shredded_keys"] = len((enc_ids & shredded_log) | (enc_ids & destroyed))
     if missing:
         problems.append(f"{len(missing)} key id(s) referenced by events are missing from keys.db")
+    dec = {"keys_checked": 0, "events_checked": 0, "bad_keys": [], "bad_events": [], "mode": "all" if decrypt_all else "sample"}
+    if keys:
+        try:
+            import crypto_keys
+            ks = vault.keystore(db)
+            dec.update(crypto_keys.trial_decrypt(ks.db, db, ks.kek, None if decrypt_all else 1))
+        except Exception as e:
+            problems.append(f"decrypt check failed: {type(e).__name__}")
+    checks["decrypt"] = {"mode": dec["mode"], "keys_checked": dec["keys_checked"], "events_checked": dec["events_checked"],
+                         "undecryptable_keys": len(dec["bad_keys"]), "undecryptable_events": len(dec["bad_events"])}
+    if dec["bad_keys"]:
+        problems.append(f"{len(dec['bad_keys'])} key(s) cannot be unwrapped with the current KEK (wrong keys.kek / "
+                        f"VAULT_PASSPHRASE?): encrypted fields are undecryptable")
+    if dec["bad_events"]:
+        problems.append(f"{len(dec['bad_events'])} encrypted event(s) fail to decrypt")
     readable = 0
     for k in keys:
         if not k["has_dek"]:

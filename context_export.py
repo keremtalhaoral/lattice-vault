@@ -105,7 +105,7 @@ def _items(db, since=None, types=None, unverified=False):
         if unverified:
             if approved or s not in ("active", "proposed"):
                 continue
-        elif not (approved or (s == "redacted" and tr == "verified")):
+        elif not (approved or (s in ("redacted", "undecryptable") and tr == "verified")):
             continue
         if since and e["ts"][:len(since)] < since:
             continue
@@ -116,6 +116,8 @@ def _items(db, since=None, types=None, unverified=False):
                 "trust": tr, "actor": e["actor"], "status": s}
         if s == "redacted" or p.get("redacted") is True or e["id"] in blocked:
             item["text"] = "[redacted]"
+        elif s == "undecryptable":
+            item["text"] = "[undecryptable]"
         else:
             last = None
             for c, cp in corr.get(e["id"], []):

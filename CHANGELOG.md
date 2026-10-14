@@ -2,6 +2,21 @@
 All notable changes to this project are documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
+### Security
+- Restore drill 2026-10-14 fixes. `restore --keys` trial-decrypts with the target KEK (every live DEK + one
+  event per key) and refuses on mismatch instead of exiting 0 with silently unreadable fields.
+- `vault doctor` checks decryptability (DEKs unwrap; sampled events, or all with `--decrypt-all`).
+- Restore without `--keys` is refused when unshredded encrypted events exist; `--allow-no-keys` overrides it on
+  purpose and no longer auto-creates keys.db / a fresh KEK at the target.
+- Restore errors for a corrupt vault.db no longer leak stored row text from SQLite messages.
+### Added
+- `vault backup-kek --out DIR` (separate, explicit KEK backup; salt only in passphrase mode) and
+  `restore --kek DIR`. A KEK is never bundled with `backup-keys`. See docs/backup-restore.md.
+- `vault verify`: read-only full chain verify + projection hash vs a fresh rebuild.
+- Event status `undecryptable` (missing key / wrong KEK), distinct from `redacted` (redacted or crypto-shredded).
+- `doctor` reports `shredded_keys` separately from `events_with_missing_keys`.
+### Fixed
+- Tests no longer leak temp dirs (`testutil.fresh` registers `shutil.rmtree` cleanup).
 ### Changed
 - Projections are applied incrementally on append, inside the append transaction, through the same fold
   functions as `rebuild()`. Unsafe event shapes (corrections, reverts, redaction/shred, HLC merges, approval of

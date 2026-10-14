@@ -3,6 +3,10 @@ All notable changes to this project are documented here. Format: [Keep a Changel
 
 ## [Unreleased]
 ### Security
+- Crypto-shredding lifecycle (docs/adr/0014-crypto-shredding.md): signed `subject.shred_scheduled` /
+  `subject.shred_cancelled` events next to `subject.shredded`; pending shreds and cancellations propagate to paired
+  devices; event-first ordering with an idempotent reconcile (vault open, doctor, sync) completes interrupted steps;
+  vault backups drop derived plaintext tables; `verify`/`doctor` check shred invariants; clearer `vault shred` CLI.
 - Sync key transport prototype (docs/adr/0013-sync-key-transport.md): `vault sync-keys init|cert|add-peer|revoke-peer|
   export|import|quarantine`. Per-device X25519 key-agreement keys (KEK-wrapped in keys.db) certified by the user
   Ed25519 key; DEKs wrapped per recipient (X25519 + HKDF-SHA256 + AES-256-GCM, AAD binds version, bundle, key,

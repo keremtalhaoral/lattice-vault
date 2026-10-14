@@ -88,7 +88,12 @@ directory could decrypt every subject. Instead the KEK gets its **own explicit c
   `{"undecryptable": true}`, context export / `show` print `[undecryptable]`.
 - Restore errors on a corrupt vault.db never echo SQLite's message (it can quote stored row text).
 
-Limitation: restore only knows shreds that are *in the restored log*. Restoring a pre-shred vault backup with
+Vault backups and snapshots drop the derived projection/cache tables (they hold decrypted plaintext of sensitive
+fields) and are VACUUMed, so they contain only ciphertext for encrypted fields; restore rebuilds projections and
+reconciles the shred lifecycle on open (docs/adr/0014-crypto-shredding.md).
+
+Limitation: restore only knows shreds that are *in the restored log*; syncing from a device that has later shreds
+applies them. Restoring a pre-shred vault backup with
 a pre-shred keys backup brings the subject back as readable.
 
 ## Durability settings (decision)

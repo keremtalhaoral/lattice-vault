@@ -72,7 +72,7 @@ weakening crypto-shredding or the quarantine model (ADR 0008, 0011, 0012).
    covers the window. Destroying the key (keys.db) and writing the `redactions` row (vault.db) cannot be one
    transaction (review L5); a missing row after a crash is written by the next reconcile (tested).
    `revoke-peer` and `shred-cancel` rebuild projections (review L4). An old bundle can never bring a
-   shredded key back. A pending (not finalized) shred on the origin does not propagate.
+   shredded key back. Pending shreds and cancellations now propagate as well (ADR 0014).
 10. **CLI.** `vault sync-keys init|cert|add-peer|revoke-peer|export|import|quarantine`; all but `quarantine` are
     human-only (TTY). Output contains ids and fingerprints only.
 

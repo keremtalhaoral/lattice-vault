@@ -42,6 +42,20 @@ def _sqlite_copy(src_path, dst_path):
     os.chmod(dst_path, 0o600)
 
 
+def _strip_derived(path):
+    """Drop derived tables (decrypted plaintext of sensitive fields) from a backup copy and VACUUM it, so a vault
+    backup holds only ciphertext for encrypted fields and a later shred is not undone by it (docs/adr/0014)."""
+    from ops import SNAP_DROP
+    c = sqlite3.connect(path)
+    try:
+        c.execute("PRAGMA secure_delete=ON")
+        for t in SNAP_DROP:
+            c.execute(f"DROP TABLE IF EXISTS {t}")
+        c.commit(); c.execute("VACUUM")
+    finally:
+        c.close()
+
+
 def integrity(conn):
     return {"integrity_check": [r[0] for r in conn.execute("PRAGMA integrity_check")],
             "quick_check": [r[0] for r in conn.execute("PRAGMA quick_check")]}
@@ -181,6 +195,7 @@ def backup(db, out_dir, include_keys=False):
         db.commit()
         vpath = os.path.join(out_dir, "vault.db")
         _sqlite_copy(src, vpath)
+        _strip_derived(vpath)   # projections / caches hold decrypted plaintext: never in a backup (restore rebuilds)
         files = {"vault.db": _sha256_file(vpath)}
         c = sqlite3.connect(vpath)
         n = c.execute("SELECT count(*) FROM events").fetchone()[0]

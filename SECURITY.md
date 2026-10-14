@@ -80,7 +80,9 @@ access to an unlocked machine, a compromised Python interpreter or dependency.
   per-subject data key (AAD = `event_id|key_id`) stored wrapped in a separate `keys.db`; sensitive fields
   never enter full-text search, `text_norm` or audit reasons. The key-encryption key is a 0600 file
   (`keys.kek`) or derived from `VAULT_PASSPHRASE` with scrypt (n=2^17, r=8, p=1). Shredding is two-step
-  (`--preview`, `--confirm` with grace period, `shred-cancel` / `shred-finalize`).
+  (`--preview`, `--confirm` with grace period, `shred-cancel` / `shred-finalize`). The lifecycle is recorded as
+  user-signed events, propagates to paired devices and is reconciled into keys.db on open, in doctor and after sync;
+  `verify`/`doctor` check the invariants (docs/adr/0014-crypto-shredding.md). Old keys backups remain a risk.
 - **Redaction.** `vault redact` copies the vault to a **new file** with the event content replaced, records
   a first-class `event.redacted` event and audit row, and adds the content to a persistent blocklist that
   imports refuse. The source file is never modified in place.
@@ -150,6 +152,7 @@ access to an unlocked machine, a compromised Python interpreter or dependency.
 - **Revert/correct do not remove data.** They only change projections; use `redact` or shredding.
 - **Snapshots** taken before redact/shred still contain the data (plaintext fields) — delete them after
   verifying. Backups of `keys.db` defeat shredding.
-- **Plaintext projections** of decrypted sensitive fields exist in the database until the subject is shredded.
+- **Plaintext projections** of decrypted sensitive fields exist in the database until the subject is shredded; they
+  are never copied into snapshots or vault backups (ADR 0014).
 - Content hashes of low-entropy secrets on the redaction blocklist can be guessed offline.
 - The secret filter has false negatives and false positives.

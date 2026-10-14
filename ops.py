@@ -5,7 +5,7 @@ The ONLY exception to "events are never rewritten" is the human-approved copy-to
 redacted/migrated content and a fresh hash chain, and the redaction is recorded as a first-class event.
 """
 import hashlib, json, os, re, shutil, sqlite3, tempfile, time
-import vault, obs
+import vault, obs, shredding
 
 SNAP_DROP = vault.PROJ_TABLES + ["review_queue", "url_cache"]   # derived/caches may hold plaintext of sensitive fields
 
@@ -183,34 +183,71 @@ def shred_preview(db, subject):
     plain = db.execute("SELECT count(*) FROM events WHERE subject=? AND enc_key_id IS NULL", (subject,)).fetchone()[0]
     info = vault.keystore(db).info(subject)
     return {"subject": subject, "encrypted_events": enc, "plaintext_events": plain, "key": info,
-            "note": "plaintext (non-sensitive) fields are NOT removed by shredding; use `vault redact` for those"}
+            "grace_days_default": shredding.grace_days(),
+            "note": "only fields stored as sensitive (encrypted) are destroyed; plaintext fields of this subject are NOT "
+                    "removed by shredding (use `vault redact`). Paired devices follow via signed sync events. Old "
+                    "keys backups (`vault backup-keys`) taken before the shred can still decrypt; delete them."}
+
+
+def _live_key(db, subject, want_state):
+    i = vault.keystore(db).info(subject)
+    if not i:
+        raise KeyError(f"no key for subject {subject}")
+    if i["state"] == "destroyed":
+        raise vault_shredded(i["key_id"])
+    if want_state and i["state"] != want_state:
+        raise ValueError({"active": "a shred is already pending for this subject (see `vault shred-cancel` / `shred-finalize`)",
+                          "pending_destroy": "no pending shred for this subject (run `vault shred <subject> --confirm` first)"}[want_state])
+    return i
+
+
+def vault_shredded(kid):
+    import crypto_keys
+    return crypto_keys.Shredded(f"already destroyed (key {kid})")
 
 
 def shred_confirm(db, subject, grace_days, by=vault.HUMAN):
+    """Schedule a shred: signed subject.shred_scheduled FIRST (it propagates to paired devices), then keys.db.
+    A crash in between is completed by shredding.reconcile (vault open / doctor)."""
+    if grace_days < 0:
+        raise ValueError("grace days must be >= 0")
+    i = _live_key(db, subject, "active")
     snap = snapshot(db, "pre-shred")
     with obs.span("ops", "shred_schedule"):
+        vault.append(db, shredding.SCHEDULED, subject, {"key_id": i["key_id"], "grace_seconds": int(round(grace_days * 86400))}, by, "verified")
         info = vault.keystore(db).schedule_destroy(subject, grace_days, by)
         vault.audit(db, by, "shred_schedule", "accepted", f"key {info['key_id']} pending destroy ({grace_days}d)")
-    return {"key": info, "snapshot": snap[0]}
+    return {"key": info, "snapshot": snap[0], "grace_days": grace_days,
+            "destroy_after_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(info["destroy_after"])),
+            "next": f"after the grace period: vault shred-finalize {subject}   (undo before that: vault shred-cancel {subject})"}
 
 
 def shred_cancel(db, subject, by=vault.HUMAN):
     i = vault.keystore(db).info(subject)
     if i and vault.shred_applies(db, i["key_id"], subject):
-        raise ValueError("a subject.shredded for this key is already in the log (synced shred); it cannot be cancelled")
+        raise ValueError("a subject.shredded for this key is already in the log; it cannot be cancelled")
+    i = _live_key(db, subject, "pending_destroy")
+    vault.append(db, shredding.CANCELLED, subject, {"key_id": i["key_id"]}, by, "verified")   # propagates the undo
     vault.keystore(db).cancel(subject)
     vault.rebuild(db)   # readability may change (L4): keep projections equal to a fresh rebuild
     vault.audit(db, by, "shred_cancel", "accepted", "pending destroy cancelled")
 
 
-def shred_finalize(db, subject, by=vault.HUMAN):
+def shred_finalize(db, subject, by=vault.HUMAN, now=None):
+    """Destroy the key after the grace period. Order: checks, signed subject.shredded (reads are refused from here
+    on), destroy the DEK in keys.db, redactions row, VACUUM. Any crash in between is completed by reconcile."""
+    i = _live_key(db, subject, "pending_destroy")
+    if (now or time.time()) < i["destroy_after"]:
+        raise ValueError("grace period not over yet")
+    kid = i["key_id"]
     with obs.span("ops", "shred_finalize"):
-        kid = vault.keystore(db).finalize(subject)
+        vault.append(db, "subject.shredded", subject, {"key_id": kid}, by, "verified")   # first-class event; rebuilds
+        vault.keystore(db).finalize(subject, now=now)
         db.execute("INSERT INTO redactions(kind,scope,key_id,approved_by,reason) VALUES('shred',?,?,?,?)",
                    (f"subject:{subject}", kid, by, "crypto-shred"))
         db.commit()
-        vault.append(db, "subject.shredded", subject, {"key_id": kid}, by, "verified")   # first-class event; rebuilds
         vault.audit(db, by, "shred_finalize", "accepted", f"key {kid} destroyed")
+        vault.rebuild(db)
         db.execute("VACUUM")
     return kid
 
@@ -278,6 +315,8 @@ def verify(db):
     before, after = _projection_pair(db)
     if before != after:
         problems.append("projections differ from a fresh rebuild of the log")
+    se, swn = shredding.problems(db)   # shred invariants, read-only
+    problems += se; sw = list(sw) + swn
     n = db.execute("SELECT count(*) FROM events").fetchone()[0]
     head = (db.execute("SELECT hash FROM events ORDER BY seq DESC LIMIT 1").fetchone() or [vault.GENESIS])[0]
     return {"ok": not problems, "problems": problems, "warnings": sw, "event_count": n, "chain_head": head,
@@ -346,14 +385,14 @@ def doctor(db, decrypt_all=False):
                         f"VAULT_PASSPHRASE?): encrypted fields are undecryptable")
     if dec["bad_events"]:
         problems.append(f"{len(dec['bad_events'])} encrypted event(s) fail to decrypt")
-    import key_transport
-    sp2 = key_transport.shred_problems(db)
+    sp2, sw2 = shredding.problems(db)
     checks["synced_shreds_unreconciled"] = len(sp2); problems += sp2
-    if sp2:
+    checks["shred_warnings"] = sw2
+    if sp2:   # doctor is NOT read-only here: it repairs keys.db to match the log (use `vault verify` to only check)
         try:
-            key_transport.reconcile_shreds(db); checks["synced_shreds_reconciled_now"] = True
+            shredding.reconcile(db); checks["synced_shreds_reconciled_now"] = True
         except Exception as e:
-            problems.append(f"synced shred reconcile failed: {type(e).__name__}")
+            problems.append(f"shred reconcile failed: {type(e).__name__}")
     readable = 0
     for k in keys:
         if not k["has_dek"]:

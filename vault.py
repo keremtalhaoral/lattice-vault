@@ -26,8 +26,13 @@ HUMAN_ONLY_TYPES = ("event.approved", "event.rejected", "event.reverted", "impor
                     "event.redacted", "subject.shredded", "conflict.resolved")
 # Every event type that must carry a user Ed25519 signature (signing.py). Kept separate from HUMAN_ONLY_TYPES so the
 # existing trigger SQL (and therefore check_triggers on existing vaults) does not change.
-SIGNED_TYPES = HUMAN_ONLY_TYPES + ("key.registered", "key.rotated", "key.revoked", "attestation.recorded")
-META_TYPES = REVIEW_TYPES + ("event.reverted", "import.batch_approved", "event.redacted", "subject.shredded",
+_SIGNED_TYPES_V1 = HUMAN_ONLY_TYPES + ("key.registered", "key.rotated", "key.revoked", "attestation.recorded")
+# Shred lifecycle (docs/adr/0014): signed like the others, but NOT added to the trigger SQL (events_require_sig uses
+# _SIGNED_TYPES_V1) so check_triggers on existing vaults is unchanged; signature checks run in code (classify,
+# sync quarantine, shredding.reconcile) and agents can never write subject.* types (agent_api).
+SHRED_LIFECYCLE_TYPES = ("subject.shred_scheduled", "subject.shred_cancelled")
+SIGNED_TYPES = _SIGNED_TYPES_V1 + SHRED_LIFECYCLE_TYPES
+META_TYPES = REVIEW_TYPES + ("event.reverted", "import.batch_approved", "event.redacted", "subject.shredded", *SHRED_LIFECYCLE_TYPES,
                              "event.corrected", "conflict.resolved")
 
 TABLES_SQL = """
@@ -127,7 +132,7 @@ SIG_TRIGGERS = {
     # after signing is enabled (a key.registered exists), a locally written signed-type event needs its event_sigs row
     # inserted first. Sync-imported rows (replica_id <> 'local') are classified remote-unsigned instead (ADR 0011).
     "events_require_sig": "CREATE TRIGGER events_require_sig BEFORE INSERT ON events WHEN NEW.type IN ("
-        + ",".join(f"'{t}'" for t in SIGNED_TYPES) + ") AND NEW.replica_id = 'local' AND NEW.actor LIKE 'user:%' AND NEW.type <> 'key.registered' "
+        + ",".join(f"'{t}'" for t in _SIGNED_TYPES_V1) + ") AND NEW.replica_id = 'local' AND NEW.actor LIKE 'user:%' AND NEW.type <> 'key.registered' "
         "AND EXISTS (SELECT 1 FROM events WHERE type='key.registered') "
         "AND NOT EXISTS (SELECT 1 FROM event_sigs WHERE event_id=NEW.id) BEGIN SELECT RAISE(ABORT, 'unsigned human-only event refused'); END",
 }
@@ -511,14 +516,14 @@ def connect(path=None, verify=True, create=None):
     if not db.execute("SELECT 1 FROM sqlite_master WHERE name='proj_meta'").fetchone() or _proj_last_seq(db) != \
             db.execute("SELECT COALESCE(MAX(seq),0) FROM events").fetchone()[0]:
         rebuild(db)   # missing projections or checkpoint behind the log (e.g. crash between append and apply)
-    if not new and db.execute("SELECT 1 FROM sqlite_master WHERE name='sync_imported'").fetchone() and db.execute(
-            "SELECT 1 FROM events WHERE type='subject.shredded' LIMIT 1").fetchone():
-        import key_transport   # synced shreds: DEK at least pending_destroy, destroyed after grace (ADR 0013)
+    if not new:
+        import shredding   # keys.db follows the shred lifecycle in the log (docs/adr/0014); only when something is due
         try:
-            key_transport.reconcile_shreds(db)
-        except Exception as x:   # reads stay refused (shred_applies); doctor reports the unreconciled key
-            warnings.append(f"synced shred not reconciled ({type(x).__name__}); run `vault doctor`")
-            print(f"warning: synced shred not reconciled ({type(x).__name__}); run `vault doctor`", file=sys.stderr)
+            if shredding.needs_reconcile(db):
+                shredding.reconcile(db)
+        except Exception as x:   # reads of shredded keys stay refused (shred_applies); doctor reports the key
+            warnings.append(f"shred reconcile failed ({type(x).__name__}); run `vault doctor`")
+            print(f"warning: shred reconcile failed ({type(x).__name__}); run `vault doctor`", file=sys.stderr)
     return db
 
 
@@ -1216,11 +1221,14 @@ def main(argv=None):
                        help="'all' or comma-separated block ids from the dry-run owner_lines list")
     ri = sp.add_parser("revert-import"); ri.add_argument("import_id")
     rd = sp.add_parser("redact"); rd.add_argument("event_id"); rd.add_argument("--out", required=True); rd.add_argument("--reason", required=True)
-    sh = sp.add_parser("shred"); sh.add_argument("subject"); gg = sh.add_mutually_exclusive_group(required=True)
+    sh = sp.add_parser("shred", help="crypto-shred a subject's encrypted fields: --preview, then --confirm (TTY, grace period), "
+                                     "then shred-finalize after the grace period (docs/adr/0014)")
+    sh.add_argument("subject"); gg = sh.add_mutually_exclusive_group(required=True)
     gg.add_argument("--preview", action="store_true"); gg.add_argument("--confirm", action="store_true")
     sh.add_argument("--grace-days", type=float, default=float(os.environ.get("VAULT_SHRED_GRACE_DAYS", "7")))
-    for n in ("shred-cancel", "shred-finalize"):
-        x = sp.add_parser(n); x.add_argument("subject")
+    for n, h in (("shred-cancel", "undo a pending shred (before shred-finalize; TTY)"),
+                 ("shred-finalize", "destroy the key after the grace period (irreversible; TTY)")):
+        x = sp.add_parser(n, help=h); x.add_argument("subject")
     ky = sp.add_parser("keys", help="user signing key (Ed25519) for human-only events")
     ky.add_argument("action", choices=["init-user", "show", "rotate", "revoke", "recovery-code", "recover"])
     ky.add_argument("key_id", nargs="?", help="revoke: the key_id to revoke")
@@ -1476,14 +1484,27 @@ def main(argv=None):
             print(json.dumps(ops.redact(db, args.event_id, args.out, args.reason), ensure_ascii=False, indent=2))
         elif args.cmd == "shred":
             import ops
-            print(json.dumps(ops.shred_preview(db, args.subject) if args.preview else
-                             ops.shred_confirm(db, args.subject, args.grace_days), ensure_ascii=False, indent=2))
+            if args.preview:
+                print(json.dumps(ops.shred_preview(db, args.subject), ensure_ascii=False, indent=2))
+            else:
+                pv = ops.shred_preview(db, args.subject)
+                print(f"About to schedule a crypto-shred of {args.subject!r}: {pv['encrypted_events']} encrypted event(s) become "
+                      f"unreadable for good after a {args.grace_days:g}-day grace period (then `vault shred-finalize`). "
+                      f"{pv['plaintext_events']} event(s) with plaintext fields are NOT affected. Paired devices follow.",
+                      file=sys.stderr)
+                if sys.stdin.isatty() and input(f"Type the subject to confirm: ").strip() != args.subject:
+                    raise ValueError("confirmation did not match; nothing changed")
+                print(json.dumps(ops.shred_confirm(db, args.subject, args.grace_days), ensure_ascii=False, indent=2))
         elif args.cmd == "shred-cancel":
             import ops
-            ops.shred_cancel(db, args.subject); print("cancelled")
+            ops.shred_cancel(db, args.subject); print("cancelled (the key is active again; paired devices follow)")
         elif args.cmd == "shred-finalize":
             import ops
-            print(json.dumps({"destroyed_key": ops.shred_finalize(db, args.subject)}))
+            if sys.stdin.isatty() and input(f"Destroy the key of {args.subject!r} now? This cannot be undone. Type the subject: "
+                                            ).strip() != args.subject:
+                raise ValueError("confirmation did not match; nothing changed")
+            print(json.dumps({"destroyed_key": ops.shred_finalize(db, args.subject),
+                              "note": "delete keys backups taken before now: they can still decrypt this subject"}))
         elif args.cmd in ("sync-export", "sync-import", "device-id", "sync-pair", "sync-quarantine"):
             import sync
             if args.cmd in ("sync-export", "sync-import", "sync-pair"):

@@ -3,6 +3,15 @@ All notable changes to this project are documented here. Format: [Keep a Changel
 
 ## [Unreleased]
 ### Security
+- Sync: `vault sync-quarantine --release [ID ...] [--dry-run]` re-verifies held events against the current key
+  registry/pairings and applies only those that pass (recorded in `sync_released`; quarantine rows unchanged).
+  Sync-imported human-only events re-verify their origin signature in doctor/verify (`remote-signed`), bound to the
+  chained local row; `remote-mismatch`, `bad-signature`, `revoked-key` etc. are errors, only a missing signature is
+  a warning. The release is a user-signed `attestation.recorded` event; `sync-quarantine --all` lists released rows.
+  Events signed by an already revoked key are quarantined regardless of HLC. Re-import reports `still_quarantined`.
+  Imported/released events must have `targets` equal to their signed target parents; `remote-unsigned` is an error
+  (`remote-unverifiable` warns without cryptography); release requires a strict TTY; malformed origin rows fail closed. vaultsync/0.2 and
+  redaction-stable signatures: design only (docs/design/vaultsync-0.2-and-redaction-sigs.md).
 - Key lifecycle (docs/adr/0012-key-lifecycle.md): `vault keys rotate --new-key PATH`, `vault keys revoke`,
   `vault keys recovery-code` and `vault keys recover`. Recovery keys (role `recovery`) can only certify a new user key
   and revoke; revoked/non-user keys can no longer sign, certify or anchor. Optional second anchor `VAULT_ANCHOR_PATH2`.

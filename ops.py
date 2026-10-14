@@ -251,9 +251,9 @@ def signature_report(db):
     if summ.get("legacy-unsigned"):
         warnings.append(f"{summ['legacy-unsigned']} legacy-unsigned human-only event(s) predate signing; accepted but "
                         "flagged. Re-attest with `vault sign-legacy` (TTY).")
-    if summ.get("remote-unsigned"):
-        warnings.append(f"{summ['remote-unsigned']} human-only event(s) imported via sync are unsigned locally "
-                        "(package/device signing is planned, ADR 0011)")
+    if summ.get("remote-unverifiable"):
+        warnings.append(f"{summ['remote-unverifiable']} sync-imported human-only event(s) could not be verified here "
+                        "(cryptography not installed)")
     if signing.epoch_seq(db) is None:
         warnings.append("no user signing key registered in this vault: run `vault keys init-user`")
     elif not any(k["role"] == "recovery" and k["revoked_seq"] is None for k in keys.values()):

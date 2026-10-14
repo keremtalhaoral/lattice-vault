@@ -51,17 +51,30 @@ directory could decrypt every subject. Instead the KEK gets its **own explicit c
    missing from a keys backup, never a restore without `--keys`). A KEK must be reachable for the target
    (keys.kek next to it, `VAULT_KEK_FILE`, `VAULT_PASSPHRASE`, or `--kek`), else restore refuses rather than
    letting a fresh KEK be auto-created. Keys come only from `--keys`.
+   **KEK check value:** keys.db stores AES-GCM("ok") under the KEK (`kek_check`, written whenever the keystore
+   is opened for a sensitive write). Restore verifies it first, so a wrong KEK is caught even when the keys
+   backup has no live keys. If a keys backup has neither live keys nor a check value (pre-check-value
+   keys.db), restore succeeds with a `KEK NOT VERIFIED` warning and `kek_verified.tested: false`.
    **KEK trial-decrypt:** every live (unshredded) DEK in the staged keys.db must unwrap with that KEK and one
    encrypted event per key must decrypt; otherwise restore fails with `KEK does not match the keys backup`
    and nothing is written. The report carries `kek_verified: {keys_checked, events_checked}`.
 3b. Without `--keys`: if the log has encrypted events whose key was not shredded, restore **refuses** (rc 1).
    `--allow-no-keys` restores anyway on purpose: those events get status `undecryptable`, a warning is
-   printed, and restore creates **no** keys.db / KEK at the target. (Any later command that opens the vault
-   creates a fresh, empty keystore there; a later `restore --keys --force` into that dir is then rejected by
-   the trial-decrypt until the right keys.kek is put in place.)
+   printed, and restore creates **no** keys.db / KEK at the target. Later commands do not create them either
+   (see "Key material creation" below); a sensitive write there fails loudly until keys + KEK are restored.
 4. Shreds recorded in the restored log are re-applied to the restored keys.db (wrapped DEK nulled).
 5. Refuses existing target vault.db / keys.db without `--force`; atomic `os.replace` (same filesystem).
 6. `connect()` re-verifies, projections rebuilt, `restore` audit row written; JSON report printed.
+
+## Key material creation (and `vault init`)
+- `VAULT_DB` pointing at a missing/empty file is an error for every command (`no vault at … ; vault init`).
+  `vault init` creates an empty vault explicitly and refuses an existing one. Library callers that pass a path
+  to `vault.connect(path)` still create (tests, seed, migrate, restore); the MCP server never does.
+- keys.db and the KEK are created only by a write that seals sensitive fields, and only if neither keys.db
+  exists nor the log already has encrypted events. Reads (`verify`, `doctor`, `history`, `search`, MCP, …)
+  never create them; a missing keystore just makes encrypted events `undecryptable`. keys.db without its KEK,
+  or encrypted events without a KEK, fails loudly (`KeystoreMissing`) instead of minting a fresh KEK.
+- Events whose key is recorded in a `subject.shredded` event stay `redacted` even when no keys.db exists.
 
 ## Doctor / verify
 - `vault doctor` also unwraps every live DEK with the current KEK and decrypts one sampled event per key

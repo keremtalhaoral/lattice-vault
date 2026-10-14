@@ -256,11 +256,16 @@ def doctor(db, decrypt_all=False):
         problems.append("projections differ from a fresh rebuild of the log")
     enc_ids = {r[0] for r in db.execute("SELECT DISTINCT enc_key_id FROM events WHERE enc_key_id IS NOT NULL")}
     keys = []
+    checks["keystore"] = "absent"
     try:
-        if enc_ids or os.path.exists(os.path.join(os.path.dirname(db_path(db)), "keys.db")):
-            keys = vault.keystore(db).all_keys()
+        keys = vault.keystore(db).all_keys()      # never creates keys.db / a KEK (read path)
+        checks["keystore"] = "ok"
     except Exception as e:
-        problems.append(f"keystore unavailable: {type(e).__name__}")
+        import crypto_keys
+        if not isinstance(e, crypto_keys.KeystoreMissing) or "no KEK" in str(e):
+            checks["keystore"] = "unavailable"
+            problems.append(f"keystore unavailable: {type(e).__name__}" + (" (KEK missing)" if "no KEK" in str(e) else ""))
+        # plain "no keys.db": unshredded encrypted events are reported below as missing keys
     key_ids = {k["key_id"] for k in keys}
     shredded_log = set()
     for r in db.execute("SELECT payload FROM events WHERE type='subject.shredded'"):

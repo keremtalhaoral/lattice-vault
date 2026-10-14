@@ -314,9 +314,20 @@ def create_schema(db):
     db.commit()
 
 
-def connect(path=None, verify=True):
+class VaultNotFound(FileNotFoundError):
+    pass
+
+
+def connect(path=None, verify=True, create=None):
+    """Open (and verify) a vault. create: allow creating a new vault at a missing/empty path. Default: True only
+    when `path` is passed explicitly by code; a path taken from VAULT_DB / ./vault.db is never auto-created
+    (a typo'd VAULT_DB must not silently produce an empty vault) -> `vault init`."""
+    if create is None:
+        create = path is not None
     path = path or os.environ.get("VAULT_DB", "./vault.db")
     new = not os.path.exists(path) or os.path.getsize(path) == 0
+    if new and not create:
+        raise VaultNotFound(f"no vault at {path} (check VAULT_DB); create one explicitly with `vault init`")
     db = sqlite3.connect(path)
     db.row_factory = sqlite3.Row
     db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
@@ -364,12 +375,17 @@ def actor_for(source):
 _KEYSTORE = {}
 
 
-def keystore(db):
+def keystore(db, create=False):
+    """The vault's KeyStore. create=False (reads, doctor, backups, shred lifecycle) never creates keys.db or a
+    KEK and raises crypto_keys.KeystoreMissing instead. create=True is used only by writes that seal new data;
+    even then a fresh KEK is refused if keys.db already exists or the log already has encrypted events
+    (a new KEK could never decrypt them)."""
     import crypto_keys
     path = db.execute("PRAGMA database_list").fetchone()[2]
     ks = _KEYSTORE.get(path)
     if ks is None:
-        ks = _KEYSTORE[path] = crypto_keys.KeyStore(path)
+        has_enc = db.execute("SELECT 1 FROM events WHERE enc_key_id IS NOT NULL LIMIT 1").fetchone() is not None
+        ks = _KEYSTORE[path] = crypto_keys.KeyStore(path, create=create, has_encrypted_events=has_enc)
     return ks
 
 
@@ -443,7 +459,7 @@ def append(db, type_, subject, payload, actor, trust, key=None, target_id=None, 
         missing = sens - set(payload)
         if missing:
             raise ValueError(f"sensitive field(s) not in payload: {sorted(missing)}")
-        enc_key_id, payload_ct = keystore(db).seal(subject, eid, {k: payload[k] for k in sens})
+        enc_key_id, payload_ct = keystore(db, create=True).seal(subject, eid, {k: payload[k] for k in sens})
         for k in sens:
             stored[k] = {"$enc": enc_key_id}
     chash = content_hash(type_, subject, key, stored if sens else payload)
@@ -533,8 +549,15 @@ def payload_state(db, e):
         except crypto_keys.Shredded:
             return None, "redacted"
         except Exception:
+            if _shredded_in_log(db, e["enc_key_id"]):   # e.g. keyless restore: key gone, but shredded on purpose
+                return None, "redacted"
             return None, "undecryptable"
     return read_upcast(e, p), None
+
+
+def _shredded_in_log(db, key_id):
+    return db.execute("SELECT 1 FROM events WHERE type='subject.shredded' AND json_extract(payload,'$.key_id')=? LIMIT 1",
+                      (key_id,)).fetchone() is not None
 
 
 def read_upcast(e, p=None):
@@ -1005,6 +1028,7 @@ def main(argv=None):
                                                              help="deprecated no-op: backups never include keys.db")
     bkk = sp.add_parser("backup-keys", help="separate backup of keys.db (KEK-wrapped); store apart from vault backups")
     bkk.add_argument("--out", required=True)
+    sp.add_parser("init", help="create a new, empty vault at VAULT_DB (other commands never auto-create one)")
     bkek = sp.add_parser("backup-kek", help="explicit, separate KEK backup (keys.kek or passphrase salt); store apart from key backups")
     bkek.add_argument("--out", required=True)
     rs = sp.add_parser("restore", help="verify a backup and restore it to a new path")
@@ -1029,6 +1053,11 @@ def main(argv=None):
             import backup
             print(json.dumps(backup.restore(args.backup_dir, args.to, args.force, args.allow_missing_keys, args.keys,
                                             allow_no_keys=args.allow_no_keys, kek_dir=args.kek), ensure_ascii=False, indent=2)); return 0
+        if args.cmd == "init":
+            path = os.environ.get("VAULT_DB", "./vault.db")
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                raise FileExistsError(f"{path} already exists")
+            connect(path, create=True).close(); print(f"initialized empty vault at {path}"); return 0
         db = connect()
         if args.cmd == "backup":
             import backup
@@ -1171,7 +1200,8 @@ def main(argv=None):
     except Exception as e:
         if type(e).__name__ not in ("Refused", "ValueError", "OperationalError", "IntegrityError", "DatabaseError",
                                     "JSONDecodeError", "TamperError", "SecretRefused", "HumanRequired", "KeyError",
-                                    "FileExistsError", "BackupError", "Shredded", "SyncError", "SchemaError", "CryptoUnavailable", "PermissionError"):
+                                    "FileExistsError", "BackupError", "Shredded", "SyncError", "SchemaError", "CryptoUnavailable", "PermissionError",
+                                    "VaultNotFound", "KeystoreMissing"):
             raise
         print(f"error: {e}", file=sys.stderr); return 1
     return 0

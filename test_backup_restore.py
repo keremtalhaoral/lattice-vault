@@ -269,7 +269,8 @@ class RestoreKeyVerificationTest(unittest.TestCase):
     def test_right_kek_reports_verification(self):
         self._good_kek()
         rep = backup.restore(self.bk, self.to, keys_dir=self.kd)
-        self.assertEqual(rep["kek_verified"], {"keys_checked": 2, "events_checked": 2})
+        self.assertEqual(rep["kek_verified"], {"keys_checked": 2, "events_checked": 2, "check_value": "ok", "tested": True})
+        self.assertFalse(rep["warnings"])
 
     def test_kek_backup_separate_and_restorable(self):
         os.environ["VAULT_KEK_FILE"] = os.path.join(self.d, "keys.kek")
@@ -341,3 +342,106 @@ class RestoreKeyVerificationTest(unittest.TestCase):
     def test_verify_command(self):
         rep = ops.verify(self.db)
         self.assertTrue(rep["ok"]); self.assertEqual(rep["projection_hash"], vault.projection_hash(self.db))
+
+
+@unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
+class ReliabilityFollowupTest(unittest.TestCase):
+    """PR #8 re-verification items R1-R4."""
+    def setUp(self):
+        fresh(self)
+        self.e = vault.append(self.db, "note.added", "user:owner", {"text": "acik", "secret": SECRET}, "user:owner",
+                              "verified", sensitive=["secret"])[0]
+        self.e2 = vault.append(self.db, "note.added", "kisi:b", {"text": "b", "secret": "ikinci-gizli"}, "user:owner",
+                               "verified", sensitive=["secret"])[0]
+        self.tdir = os.path.join(self.d, "r"); self.to = os.path.join(self.tdir, "vault.db")
+
+    def _cli(self, *args, db=None):
+        env = dict(os.environ, VAULT_DB=db or self.to, VAULT_ALLOW_NONTTY="1")
+        return subprocess.run([sys.executable, os.path.join(HERE, "vault.py"), *args], capture_output=True, text=True, env=env)
+
+    def test_r1_read_only_commands_never_create_keystore(self):
+        bk = os.path.join(self.d, "bk"); backup.backup(self.db, bk)
+        backup.restore(bk, self.to, allow_no_keys=True)
+        for cmd in (["verify"], ["doctor"], ["history", "user:owner"], ["search", "acik"]):
+            with self.subTest(cmd=cmd):
+                self._cli(*cmd)
+                self.assertEqual(sorted(f for f in os.listdir(self.tdir) if f.startswith("keys")), [])
+        vault._KEYSTORE.clear(); nd = vault.connect(self.to); self.addCleanup(nd.close)
+        self.assertEqual(status(nd, self.e), "undecryptable")
+        rep = ops.doctor(nd)
+        self.assertFalse(rep["ok"]); self.assertEqual(rep["checks"]["events_with_missing_keys"], 2)
+        self.assertEqual(os.listdir(self.tdir).count("keys.kek"), 0)
+
+    def test_r1_write_with_encrypted_events_but_no_kek_fails_loudly(self):
+        bk = os.path.join(self.d, "bk"); backup.backup(self.db, bk)
+        backup.restore(bk, self.to, allow_no_keys=True)
+        vault._KEYSTORE.clear(); nd = vault.connect(self.to); self.addCleanup(nd.close)
+        import crypto_keys
+        with self.assertRaisesRegex(crypto_keys.KeystoreMissing, "refusing to create a new KEK"):
+            vault.append(nd, "note.added", "user:owner", {"text": "t", "secret": "x"}, "user:owner", "verified", sensitive=["secret"])
+        self.assertNotIn("keys.kek", os.listdir(self.tdir))
+
+    def test_r1_keys_db_without_kek_fails_loudly(self):
+        os.remove(os.path.join(self.d, "keys.kek")); vault._KEYSTORE.clear()
+        import crypto_keys
+        with self.assertRaisesRegex(crypto_keys.KeystoreMissing, "no KEK"):
+            vault.keystore(self.db)
+        with self.assertRaisesRegex(crypto_keys.KeystoreMissing, "no KEK"):
+            vault.keystore(self.db, create=True)
+        self.assertNotIn("keys.kek", os.listdir(self.d))
+        rep = ops.doctor(self.db); self.assertFalse(rep["ok"]); self.assertEqual(rep["checks"]["keystore"], "unavailable")
+
+    def test_r1_plain_vault_creates_keystore_only_on_sensitive_write(self):
+        d = os.path.join(self.d, "plain"); os.makedirs(d); p = os.path.join(d, "v.db")
+        os.environ.pop("VAULT_KEK_FILE", None)
+        nd = vault.connect(p); self.addCleanup(nd.close)
+        vault.append(nd, "note.added", "x:y", {"text": "plain"}, "user:owner", "verified")
+        self.assertTrue(ops.doctor(nd)["ok"]); ops.verify(nd)
+        self.assertEqual(sorted(os.listdir(d)), ["v.db"])
+        vault.append(nd, "note.added", "x:y", {"text": "t", "secret": "s"}, "user:owner", "verified", sensitive=["secret"])
+        self.assertIn("keys.kek", os.listdir(d)); self.assertIn("keys.db", os.listdir(d))
+
+    def test_r2_kek_untested_warned_and_check_value_catches_wrong_kek(self):
+        ops.shred_confirm(self.db, "user:owner", 0); ops.shred_finalize(self.db, "user:owner")
+        ops.shred_confirm(self.db, "kisi:b", 0); ops.shred_finalize(self.db, "kisi:b")   # no live DEKs left
+        bk, kd = os.path.join(self.d, "bk"), os.path.join(self.d, "kd")
+        backup.backup(self.db, bk); backup.backup_keys(self.db, kd)
+        os.makedirs(self.tdir, mode=0o700)
+        fd = os.open(os.path.join(self.tdir, "keys.kek"), os.O_WRONLY | os.O_CREAT, 0o600); os.write(fd, os.urandom(32)); os.close(fd)
+        with self.assertRaisesRegex(backup.BackupError, "check value"):      # wrong KEK caught with 0 live keys
+            backup.restore(bk, self.to, keys_dir=kd)
+        shutil.copy(os.path.join(self.d, "keys.kek"), os.path.join(self.tdir, "keys.kek"))
+        rep = backup.restore(bk, self.to, keys_dir=kd)
+        self.assertEqual(rep["kek_verified"]["keys_checked"], 0); self.assertEqual(rep["kek_verified"]["check_value"], "ok")
+        self.assertTrue(rep["kek_verified"]["tested"])
+        # legacy keys.db without a check value and no live keys -> explicit "not verified" warning
+        c = sqlite3.connect(os.path.join(kd, "keys.db")); c.execute("DROP TABLE kek_check"); c.commit(); c.close()
+        rehash(kd, "keys.db")
+        rep = backup.restore(bk, self.to, keys_dir=kd, force=True)
+        self.assertFalse(rep["kek_verified"]["tested"])
+        self.assertTrue(any("KEK NOT VERIFIED" in w for w in rep["warnings"]))
+
+    def test_r3_keyless_restore_shredded_stays_redacted(self):
+        ops.shred_confirm(self.db, "kisi:b", 0); ops.shred_finalize(self.db, "kisi:b")
+        bk = os.path.join(self.d, "bk"); backup.backup(self.db, bk)
+        backup.restore(bk, self.to, allow_no_keys=True)
+        vault._KEYSTORE.clear(); nd = vault.connect(self.to); self.addCleanup(nd.close)
+        self.assertEqual(status(nd, self.e2), "redacted")
+        self.assertEqual(status(nd, self.e), "undecryptable")
+        rep = ops.doctor(nd)
+        self.assertEqual(rep["checks"]["shredded_keys"], 1); self.assertEqual(rep["checks"]["events_with_missing_keys"], 1)
+
+    def test_r4_missing_vault_db_not_auto_created(self):
+        missing = os.path.join(self.d, "typo", "vault.db"); os.makedirs(os.path.dirname(missing))
+        for cmd in (["verify"], ["doctor"], ["search", "x"], ["add", "note.added", "x:y", "--text", "hi"]):
+            with self.subTest(cmd=cmd):
+                r = self._cli(*cmd, db=missing)
+                self.assertEqual(r.returncode, 1, r.stderr); self.assertIn("vault init", r.stderr)
+                self.assertNotIn("Traceback", r.stderr); self.assertFalse(os.path.exists(missing))
+        os.environ["VAULT_DB"] = missing
+        with self.assertRaises(vault.VaultNotFound):
+            vault.connect()
+        r = self._cli("init", db=missing); self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(os.path.exists(missing))
+        self.assertEqual(self._cli("init", db=missing).returncode, 1)       # never re-inits an existing vault
+        self.assertEqual(self._cli("add", "note.added", "x:y", "--text", "hi", db=missing).returncode, 0)

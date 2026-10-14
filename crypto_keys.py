@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS subject_keys(
   kek_id TEXT NOT NULL, created_at TEXT NOT NULL,
   state TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active','pending_destroy','destroyed')),
   destroy_after REAL, shredded_at TEXT, requested_by TEXT);
+CREATE TABLE IF NOT EXISTS kek_check(kek_id TEXT PRIMARY KEY, check_ct BLOB NOT NULL);  -- AES-GCM('ok') under the KEK
 """
 
 
@@ -49,6 +50,13 @@ def _secure_file(p):
 
 class KekMismatch(ValueError):
     pass
+
+
+class KeystoreMissing(FileNotFoundError):
+    """keys.db / KEK absent and this caller may not create them (read paths never create key material)."""
+
+
+KEK_CHECK_AAD = b"lattice-kek-check/v1"
 
 
 def kek_paths(kek_path):
@@ -92,7 +100,19 @@ def trial_decrypt(keys_conn, vault_conn, kek, max_events_per_key=1):
     per key (None = all). Returns {"keys_checked", "events_checked", "bad_keys", "bad_events"} (ids only, never
     plaintext or ciphertext)."""
     _need()
-    rep = {"keys_checked": 0, "events_checked": 0, "bad_keys": [], "bad_events": []}
+    rep = {"keys_checked": 0, "events_checked": 0, "bad_keys": [], "bad_events": [], "check_value": None}
+    try:
+        rows = keys_conn.execute("SELECT check_ct FROM kek_check").fetchall()
+    except sqlite3.Error:
+        rows = []                                     # keys.db from before the check value existed
+    if rows:
+        ok = False
+        for (ct,) in rows:
+            try:
+                AESGCM(kek).decrypt(ct[:12], ct[12:], KEK_CHECK_AAD); ok = True; break
+            except Exception:
+                pass
+        rep["check_value"] = "ok" if ok else "mismatch"
     for kid, blob in keys_conn.execute("SELECT key_id, wrapped_dek FROM subject_keys WHERE wrapped_dek IS NOT NULL ORDER BY key_id"):
         rep["keys_checked"] += 1
         try:
@@ -113,17 +133,35 @@ def trial_decrypt(keys_conn, vault_conn, kek, max_events_per_key=1):
 
 
 class KeyStore:
-    def __init__(self, vault_db_path):
+    def __init__(self, vault_db_path, create=False, has_encrypted_events=False):
         _need()
         base = os.path.dirname(os.path.abspath(vault_db_path))
         self.path = os.environ.get("VAULT_KEYS_DB", os.path.join(base, "keys.db"))
         self.kek_path = os.environ.get("VAULT_KEK_FILE", os.path.join(base, "keys.kek"))
+        have_db, have_kek = os.path.exists(self.path), os.path.exists(kek_paths(self.kek_path))
+        if not have_kek and (have_db or has_encrypted_events):
+            raise KeystoreMissing("no KEK (keys.kek / VAULT_KEK_FILE / VAULT_PASSPHRASE salt) for an existing keystore or "
+                                  "encrypted events; refusing to create a new KEK that could never decrypt them. "
+                                  "Restore the original KEK (`vault restore ... --kek DIR`).")
+        if not have_db and not create:
+            raise KeystoreMissing("no keys.db for this vault (nothing encrypted yet, or keys not restored)")
+        self.kek, self.kek_id = read_kek(self.kek_path, create=create and not have_db)
         self.db = sqlite3.connect(self.path)
         _secure_file(self.path)
         self.db.execute("PRAGMA busy_timeout=5000"); self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("PRAGMA journal_mode=DELETE"); self.db.execute("PRAGMA secure_delete=ON")
         self.db.executescript(SCHEMA)
-        self.kek, self.kek_id = self._kek()
+        if create:
+            self._ensure_kek_check()
+
+    def _ensure_kek_check(self):
+        """Store an AES-GCM check value under the KEK so restore can verify a KEK even with no live DEKs."""
+        if self.db.execute("SELECT 1 FROM kek_check WHERE kek_id=?", (self.kek_id,)).fetchone():
+            return
+        n = os.urandom(12)
+        self.db.execute("INSERT INTO kek_check(kek_id, check_ct) VALUES(?,?)",
+                        (self.kek_id, n + AESGCM(self.kek).encrypt(n, b"ok", KEK_CHECK_AAD)))
+        self.db.commit()
 
     def _kek(self):
         return read_kek(self.kek_path, create=True)

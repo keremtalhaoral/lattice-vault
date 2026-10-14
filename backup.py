@@ -331,6 +331,9 @@ def restore(backup_dir, to_path, force=False, allow_missing_keys=False, keys_dir
                 trial = crypto_keys.trial_decrypt(kc, vc, kek, 1)
             finally:
                 kc.close(); vc.close()
+            if trial["check_value"] == "mismatch":
+                raise BackupError("KEK does not match the keys backup (stored KEK check value fails). Use the keys.kek / "
+                                  "VAULT_PASSPHRASE that was in use when the keys backup was taken.")
             if trial["bad_keys"] or trial["bad_events"]:
                 raise BackupError(f"KEK does not match the keys backup: {len(trial['bad_keys'])} of {trial['keys_checked']} key(s) "
                                   f"cannot be unwrapped, {len(trial['bad_events'])} sampled event(s) fail to decrypt. "
@@ -397,10 +400,15 @@ def restore(backup_dir, to_path, force=False, allow_missing_keys=False, keys_dir
     warnings = []
     if missing:
         warnings.append(f"MISSING KEYS: {len(missing)} key id(s) absent from keys.db; those fields are unreadable")
+    kek_untested = has_keys and trial["keys_checked"] == 0 and trial["check_value"] is None
+    if kek_untested:
+        warnings.append("KEK NOT VERIFIED: the keys backup has no live keys and no stored KEK check value, so the KEK "
+                        "could not be tested; new encrypted data may become unreadable if it is the wrong KEK")
     if not has_keys and live_enc:
         warnings.append("restored without --keys (--allow-no-keys): encrypted fields are undecryptable until a keys "
                         "backup and its KEK are restored")
     return {"restored": to_path, "keys_restored": has_keys, "event_count": man["event_count"], "chain_head": man["chain_head"],
             "integrity_check": integ["integrity_check"][0], "quick_check": integ["quick_check"][0],
             "shreds_reapplied": reapplied, "kek_installed": kek_install is not None,
-            "kek_verified": {"keys_checked": trial["keys_checked"], "events_checked": trial["events_checked"]} if has_keys else None, "missing_keys": missing, "projection_hash": ph, "warnings": warnings}
+            "kek_verified": {"keys_checked": trial["keys_checked"], "events_checked": trial["events_checked"],
+                             "check_value": trial["check_value"], "tested": not kek_untested} if has_keys else None, "missing_keys": missing, "projection_hash": ph, "warnings": warnings}

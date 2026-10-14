@@ -207,18 +207,54 @@ class SyncTest(unittest.TestCase):
     def test_approval_type_quarantined_regardless_of_actor(self):
         # a forged batch approval claiming a non-user actor (inserted around the human-only trigger, as a package writer could)
         a = vault.append(self.A, "learning.captured", "x", {"text": "ajan"}, "agent:bot", "unverified")[0]
-        p = self.pkg(self.A); lines = open(p, encoding="utf-8").read().splitlines()
-        e = json.loads(lines[1]); e.update(id="forged-1", type="import.batch_approved", actor="agent:bot", parents=[])
-        e["hlc"] = e["hlc"][:-1] + "f"
-        e["content_hash"] = vault.content_hash(e["type"], e["subject"], e["key"], json.loads(e["payload"]))
-        row = dict(e); row["payload_ct"] = None; e["hash"] = vault.event_hash(e["prev_hash"], row)
-        body = (lines[1] + "\n" + vault.canon(e) + "\n").encode()
-        import hashlib; m = json.loads(lines[0]); m.update(event_count=2, body_sha256=hashlib.sha256(body).hexdigest())
-        open(p, "wb").write(vault.canon(m).encode() + b"\n" + body)
+        p = self.pkg(self.A)
+        self.forge(p, lambda e: e.update(id="forged-1", type="import.batch_approved", actor="agent:bot", parents=[],
+                                         targets=[a], payload=vault.canon({"batch_id": "b", "target_ids": [a]})))
+        sync.import_package(self.B, self.pkg(self.A, "orig"))
         r = sync.import_package(self.B, p)
-        self.assertEqual((r["new"], r["quarantined"]), (1, 1))
+        self.assertEqual((r["new"], r["quarantined"]), (0, 1))
         self.assertEqual(self.held(self.B), {"forged-1": "unsigned approval/human-only event"})
         self.assertEqual(self.B.execute("SELECT status FROM proj_status WHERE event_id=?", (a,)).fetchone()[0], "proposed")
+
+    def forge(self, p, mutate):
+        """Rewrite one package event the way a package writer could (fixing hashes), bypassing write-path checks."""
+        import hashlib
+        lines = open(p, encoding="utf-8").read().splitlines()
+        e = json.loads(lines[1]); mutate(e)
+        e["content_hash"] = vault.content_hash(e["type"], e["subject"], e["key"], json.loads(e["payload"]))
+        row = dict(e); row["payload_ct"] = None; e["hash"] = vault.event_hash(e["prev_hash"], row)
+        body = (vault.canon(e) + "\n").encode()
+        m = json.loads(lines[0]); m.update(event_count=1, body_sha256=hashlib.sha256(body).hexdigest())
+        with open(p, "wb") as f:
+            f.write(vault.canon(m).encode() + b"\n" + body)
+        return e["id"]
+
+    def test_schema_invalid_payload_quarantined(self):
+        vault.append(self.A, "preference.set", "s", {"key": "dil", "value": "ok"}, "agent:bot", "unverified")
+        p = self.pkg(self.A)
+        eid = self.forge(p, lambda e: e.update(payload=vault.canon({"key": "dil", "value": {"nested": 1}})))
+        r = sync.import_package(self.B, p)
+        self.assertEqual((r["new"], r["quarantined"]), (0, 1)); self.assertEqual(self.count(self.B), 0)
+        self.assertTrue(self.held(self.B)[eid].startswith("schema invalid"))
+
+    def test_older_schema_event_upcast_on_import(self):
+        from test_schemas import patched, V3, DEMO_UPS
+        eid = vault.append(self.A, "preference.set", "s", {"key": "dil", "val": "Türkçe"}, "agent:bot", "unverified")[0]
+        p = self.pkg(self.A)
+        with patched("preference.set", V3, DEMO_UPS):   # receiver runs newer code: v1 -> v3 via upcasters
+            r = sync.import_package(self.B, p)
+            self.assertEqual((r["new"], r["quarantined"]), (1, 0))
+            e = self.B.execute("SELECT * FROM events WHERE id=?", (eid,)).fetchone()
+            self.assertEqual((e["schema_version"], json.loads(e["payload"])["val"]), (1, "Türkçe"))   # stored bytes untouched
+            self.assertEqual(vault.read_upcast(e)["value"], "Türkçe")
+
+    def test_projection_consistent_after_merge_then_local_append(self):
+        vault.append(self.A, "learning.captured", "x", {"text": "a"}, "agent:bot", "unverified")
+        sync.import_package(self.B, self.pkg(self.A))
+        vault.append(self.B, "learning.captured", "y", {"text": "b"}, U, "verified")   # incremental path on B
+        h = vault.projection_hash(self.B); vault.rebuild(self.B)
+        self.assertEqual(vault.projection_hash(self.B), h)
+        self.assertEqual(vault.verify_chains(self.B), [])
 
 
 if __name__ == "__main__":

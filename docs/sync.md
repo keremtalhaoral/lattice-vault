@@ -1,6 +1,6 @@
 # Sync & multi-device prototype (`.vaultsync`, format `vaultsync/0.1`)
 
-Status: **prototype** on `feat/sync-prototype`. Implements part of ADR 0008. Single owner, 2+ devices, no server,
+Status: **file-based prototype** (packages are files you move by hand; no server, no network, no signing). Implements part of ADR 0008. Single owner, 2+ devices, no server,
 no network code. Device A exports a file, the user moves it (USB, file sync, …), device B imports it.
 
 > **Do not use multi-device sync with real data.** Packages are unsigned, there is no key sync, and redaction/shredding
@@ -69,6 +69,15 @@ The rules below describe the pre-quarantine paired-device behaviour, kept behind
 * `user:*` events from an **unknown** device are quarantined: actor becomes `import:sync-<device>`, trust becomes `unverified`, status becomes `proposed`
   (they need `vault approve`). Human-only types (approve/reject/revert/redact/shred/…) from an unknown device are skipped and reported.
 * Content on the redaction blocklist is skipped. A package never resurrects redacted data.
+
+## Integration with schemas, projections, backup
+* **Upcasters / schema validation:** each incoming plaintext payload is upcast to the current version (`schemas.upcast`) and
+  validated like `vault.append` does. Invalid payloads are quarantined (`reason = "schema invalid: …"`). Stored bytes and
+  `schema_version` stay as on the origin (upcasting is read-time only). Newer-schema events are stored and kept out of
+  projections by `rebuild()` (`unknown_version`). Encrypted payloads are not validated here (the receiver may lack the key).
+* **Projections:** after a merge, `rebuild()` runs in full and refreshes the projection checkpoint. Imported events can sort
+  before local ones, which `apply_incremental` refuses by design. Later local appends use the incremental path again.
+* **Backup:** the `sync_*` tables live in vault.db, so `vault backup` includes them. keys.db is never included, as before.
 
 ## Encryption, keys, shredding
 Encrypted fields travel as ciphertext (`payload_ct` plus `{"$enc": key_id}`) and are stored byte-identical on the receiver.

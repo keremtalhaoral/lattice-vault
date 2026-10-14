@@ -1,10 +1,18 @@
-"""File-based multi-device sync prototype (`.vaultsync` packages). See docs/sync.md.
+"""File-based multi-device sync PROTOTYPE (`.vaultsync` packages moved by hand). See docs/sync.md.
+
+Not for real data: packages are unsigned, there is no key sync, and redaction/shredding does not propagate.
+Unsigned user:* and approval events are quarantined (sync_quarantine), never applied.
+Integration with main: incoming plaintext payloads are upcast (schemas.upcast) and validated against the current
+schema before they are applied (invalid ones are quarantined); stored bytes stay the origin's. Newer-schema events
+are stored as-is and kept out of projections by rebuild() (unknown_version). After a merge, projections are
+rebuilt in full (imported events may sort before local ones, which apply_incremental refuses by design);
+rebuild() also refreshes the projection checkpoint.
 
 Package = line 1: manifest JSON; lines 2..n: body JSONL (one origin event per line, sorted by (hlc, id)).
 No network code. Additive schema only (CREATE TABLE IF NOT EXISTS); existing tables/triggers untouched.
 """
 import base64, hashlib, json, os, secrets, time
-import vault
+import schemas, vault
 
 FORMAT = "vaultsync/0.1"
 MAX_SKEW_MS = int(os.environ.get("VAULT_SYNC_MAX_SKEW_MS", str(5 * 60 * 1000)))   # remote HLC may be ≤ 5 min ahead
@@ -30,8 +38,23 @@ class SyncError(ValueError):
     pass
 
 
-UNSUPPORTED_WARNING = ("WARNING: multi-device sync is an unsigned prototype. Do not use it with real data: no package signing, "
+UNSUPPORTED_WARNING = ("WARNING: multi-device sync is an unsigned, file-based prototype. Do not use it with real data: no package signing, "
                        "no key sync, no redaction/shred propagation. user:* and approval events are quarantined, not applied.")
+
+
+def _schema_problem(e):
+    """Same per-type check as vault.append, on the payload upcast to the current version. Encrypted payloads
+    (placeholders only, receiver may lack the key) and newer-schema events are not checked here."""
+    if e.get("enc_key_id") or schemas.is_future(e["type"], e["schema_version"]):
+        return None
+    try:
+        p = json.loads(e["payload"])
+        if p.get("redacted") is True:
+            return None
+        schemas.validate(e["type"], schemas.upcast(e["type"], e["schema_version"], p), allow_unknown=True)
+    except (schemas.SchemaError, schemas.UnknownVersion, TypeError, ValueError) as x:
+        return f"schema invalid: {x}"
+    return None
 
 
 def _quarantine_reason(e, parents_held):
@@ -42,7 +65,7 @@ def _quarantine_reason(e, parents_held):
         return "unsigned approval/human-only event"
     if any(p in parents_held for p, _ in e["parents"]):
         return "parent quarantined"
-    return None
+    return _schema_problem(e)
 
 
 def quarantined(db):
@@ -184,16 +207,15 @@ def import_package(db, path, dry_run=False, now_ms=None, _trust_unsigned=False):
         if e["id"] in have or e["id"] in held:
             rep["duplicate"] += 1; continue
         todo.append((e, row))
-    hold = []
-    if not _trust_unsigned:
-        rest = []
-        for e, row in todo:   # (hlc, id) order, so a parent is classified before its children
-            why = _quarantine_reason(e, held)
-            if why:
-                held.add(e["id"]); hold.append((e, why))
-            else:
-                rest.append((e, row))
-        todo = rest
+    hold, rest = [], []
+    for e, row in todo:   # (hlc, id) order, so a parent is classified before its children
+        why = _schema_problem(e) or ("parent quarantined" if any(p in held for p, _ in e["parents"]) else None) \
+            if _trust_unsigned else _quarantine_reason(e, held)
+        if why:
+            held.add(e["id"]); hold.append((e, why))
+        else:
+            rest.append((e, row))
+    todo = rest
     if skew:
         raise SyncError(f"clock skew: {len(skew)} event(s) have HLC > now + {MAX_SKEW_MS} ms (first {skew[0]}); package rejected")
     ids_in = have | {e["id"] for e, _ in todo}
@@ -217,8 +239,7 @@ def import_package(db, path, dry_run=False, now_ms=None, _trust_unsigned=False):
             rep["quarantined"] += 1
         plan.append((e, local, quarantine))
     rep["new"] = len(plan)
-    if not _trust_unsigned:
-        rep["quarantined"] = len(hold)
+    rep["quarantined"] += len(hold)
     if dry_run:
         return rep
     ensure_schema(db)

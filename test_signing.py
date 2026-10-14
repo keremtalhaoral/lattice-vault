@@ -402,5 +402,19 @@ class KeyFileAndTTY(unittest.TestCase):
         r = run("keys", "show"); self.assertEqual(json.loads(r.stdout)["problems"], [])
 
 
+@unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
+class TargetsBinding(unittest.TestCase):
+    """event_targets drives projections but is not in the signed message: it must equal the signed rel='target' set."""
+    def test_inserted_target_is_bad(self):
+        fresh(self)
+        x = agent(self.db, "note.added", "x", {"text": "x"}); y = agent(self.db, "note.added", "y", {"text": "y"})
+        ap = vault.review(self.db, x, "approve")
+        self.assertEqual(signing.classify(self.db)[ap][1], "signed")
+        self.db.execute("INSERT INTO event_targets VALUES(?,?)", (ap, y)); self.db.commit()
+        st = signing.classify(self.db)[ap][1]
+        self.assertEqual(st, "targets-mismatch"); self.assertIn(st, signing.BAD)
+        self.assertFalse(ops.verify(self.db)["ok"])
+
+
 if __name__ == "__main__":
     unittest.main()

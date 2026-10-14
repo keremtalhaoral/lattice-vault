@@ -121,8 +121,10 @@ access to an unlocked machine, a compromised Python interpreter or dependency.
 - **First key is TOFU and the key file is unencrypted by default.** Whoever registers the first self-signed user key
   becomes the root; check the fingerprint `keys init-user` shows, before anything else can write to the DB. The key
   file is a 0600 PEM, encrypted only if `VAULT_USER_KEY_PASSPHRASE` is set.
-- **Key loss.** Losing the key file blocks new human-only events unless a recovery code was created beforehand
-  (`vault keys recovery-code`). Whoever holds the recovery code can replace the signing key; keep it offline.
+- **Key loss.** `vault keys init-user` creates a one-time recovery code with the first key; `vault keys recover`
+  replaces a lost key with it. Whoever holds the code can replace the signing key; keep it offline. A lost live
+  code **cannot be replaced** (replacing needs the old code), and vaults initialised before this rule have no recovery
+  key and cannot gain one (doctor warns; re-initialise).
   Revocation is never retroactive (`compromised:true` handling is **(planned)**).
 - **TTY gate.** Any same-user process can allocate a pseudo-terminal.
 - **DNS rebinding.** The citation check resolves and validates addresses, then lets `urllib` connect;

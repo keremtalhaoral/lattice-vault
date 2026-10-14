@@ -87,9 +87,10 @@ Human-only commands require an interactive terminal.
 ```sh
 export VAULT_DB=$HOME/.local/share/lattice-vault/vault.db
 ./vault init                     # once: create the vault (commands never auto-create a missing VAULT_DB)
-./vault keys init-user           # once, after init: create + register your Ed25519 signing key (TTY, confirm fingerprint)
+./vault keys init-user           # once, after init: create + register your Ed25519 signing key and a one-time
+                                 # recovery code (TTY, confirm fingerprint; write the code down offline)
 ./vault keys show                # registered signing key(s), roles, revocation
-./vault keys recovery-code       # once: one-time offline recovery code (shown once; store offline)
+./vault keys recovery-code --replace   # replace the recovery code (asks for the OLD code)
 ./vault keys rotate --new-key PATH   # new key, old one revoked (old signatures stay valid); then set VAULT_USER_KEY=PATH
 ./vault keys revoke KEY_ID --reason ...   # e.g. a lost recovery code
 ./vault keys recover --new-key PATH  # lost key: reads the recovery code from the TTY

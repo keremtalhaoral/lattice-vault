@@ -1272,7 +1272,12 @@ def main(argv=None):
                     if not sys.stdin.isatty():
                         return True    # only reachable in the test harness (require_human_tty above)
                     return input("Register this key as the vault owner's signing key? [yes/no] ").strip() == "yes"
-                kid, created = signing.register_user_key(db, confirm=_fp)
+                if not signing.local_key_registered(db, signing.load_user_key(kp)[1]) and not (
+                        sys.stdout.isatty() or _nontty_allowed()):
+                    raise PermissionError("keys init-user prints the one-time recovery code: stdout must be an interactive terminal")
+                def _code(c):
+                    print(f"RECOVERY CODE (shown once; write it down offline, never store it with the vault):\n  {c}")
+                kid, created = signing.register_user_key(db, confirm=_fp, on_code=_code)
                 signing.write_anchor(db)
                 print(f"user key {kid} {'registered in this vault' if created else 'already registered'}")
             elif args.action == "rotate":
@@ -1294,16 +1299,18 @@ def main(argv=None):
                     import getpass
                     old = getpass.getpass("OLD recovery code: ") if sys.stdin.isatty() else sys.stdin.readline().strip()
                 code, kid = signing.new_recovery_code(db, old_code=old)
-                print(f"recovery key {kid} registered (earlier recovery codes are revoked).\n"
+                print(f"recovery key {kid} registered (the old recovery code is revoked).\n"
                       f"RECOVERY CODE (shown once, write it down offline, never store it with the vault):\n  {code}")
             elif args.action == "recover":
                 if not args.new_key:
                     raise ValueError("keys recover needs --new-key PATH")
                 import getpass
                 code = getpass.getpass("recovery code: ") if sys.stdin.isatty() else sys.stdin.readline().strip()
-                kid = signing.recover_with_code(db, code, args.new_key)
-                print(f"new user key {kid} at {args.new_key}; all earlier user keys and this recovery code are revoked. "
-                      f"Set VAULT_USER_KEY={args.new_key} and run `vault keys recovery-code` for a new code.")
+                if not (sys.stdout.isatty() or _nontty_allowed()):
+                    raise PermissionError("keys recover prints a new recovery code: stdout must be an interactive terminal")
+                kid, new_code = signing.recover_with_code(db, code, args.new_key)
+                print(f"new user key {kid} at {args.new_key}; all earlier user keys and the old recovery code are revoked. "
+                      f"Set VAULT_USER_KEY={args.new_key}.\nNEW RECOVERY CODE (shown once, store offline):\n  {new_code}")
             else:
                 keys, probs = signing.registered_keys(db)
                 local = signing.try_user_key()
@@ -1311,6 +1318,8 @@ def main(argv=None):
                                   "registered": sorted(keys),
                                   "keys": {k: {"role": v["role"], "active": v["active"], "revoked_hlc": v["revoked_hlc"],
                                                "revoked_seq": v["revoked_seq"]} for k, v in sorted(keys.items())},
+                                  "live_recovery_key": next(({"key_id": k, "seq": v["seq"]} for k, v in sorted(keys.items())
+                                                             if v["role"] == "recovery" and v["revoked_seq"] is None), None),
                                   "problems": probs}, indent=2))
             return 0
         if args.cmd == "sign-legacy":

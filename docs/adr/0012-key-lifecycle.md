@@ -16,14 +16,23 @@ recovery code and an optional second anchor (`VAULT_ANCHOR_PATH2`) before any mu
   (old code) or by `recover`, so a thief who rotates with a stolen user key cannot disable the owner's recovery.
 - **Revoke** (`vault keys revoke KEY_ID --reason R`, TTY): the active user key may revoke only device keys it
   certified. A recovery key may revoke only itself. The user key itself is replaced only via rotate/recover.
-- **Recovery code** (`vault keys recovery-code`, TTY on stdin **and stdout**): 160 random bits shown once as base32
-  groups; recovery key seed = `SHA-256("lattice-recovery-seed/v1\n" || code bytes)`; only the public key is stored.
-  Registered by the active user key only while no recovery key is live. Replacing a live code
-  (`--replace`) needs the OLD code: the old recovery key revokes itself first. A stolen user key alone therefore
-  cannot swap or kill the owner's code. Trade-off: a lost code cannot be replaced while it is live (no path without
-  the code); the vault keeps working with the user key.
+- **Recovery code**: 160 random bits shown once as base32 groups (TTY on stdin **and stdout**); recovery key seed =
+  `SHA-256("lattice-recovery-seed/v1\n" || code bytes)`; only the public key is stored. **There is never a window
+  without a live recovery key**, and a user key alone can never add one. The registry accepts a recovery
+  `key.registered` only as the very next log event (same transaction) after one of:
+  1. the first, self-signed user key (`vault keys init-user` creates the code in the same transaction),
+  2. the live recovery key's self-revocation (`vault keys recovery-code --replace`, needs the OLD code; revoke +
+     new registration in one transaction),
+  3. a recovery-certified new user key (`vault keys recover`, which prints a fresh code in the same transaction),
+  and only while no other recovery key is live. A recovery key is never revoked transitively (rotation keeps it).
+  Trade-off: a lost live code cannot be replaced; the vault keeps working with the user key.
+  **Migration:** vaults whose first key was registered before this rule have no recovery key and can never gain
+  one; `doctor`/`verify` warn loudly. Re-initialise (`vault init` on a new path + import/restore of content) to get one.
 - **Recover** (`vault keys recover --new-key PATH`, code from the TTY): the live recovery key registers a new user key;
-  that one event atomically revokes every other user key, everything they certified, and the recovery key.
+  that one event atomically revokes every other user key, everything they certified, and the recovery key; the same
+  transaction registers a fresh recovery key.
+- **Revocation `effective_hlc`**: `"now"` (= the revocation's own HLC) or later; an earlier value is accepted only with
+  `compromised:true` (Data Systems N1).
 - **Revocation is bound to log position**: a revoked key's signature is valid only if the event's `seq < revoked_seq`
   **and** `hlc < revoked_hlc` (or it is the revoking event itself). HLCs are chosen by the signer, so back-dating
   alone no longer works; inserting below the revocation changes chain hashes, which the anchor (rewritten by the new
@@ -36,6 +45,11 @@ recovery code and an optional second anchor (`VAULT_ANCHOR_PATH2`) before any mu
   error. Anchors signed by a revoked or non-user key are errors.
 
 ## Consequences / limits
+- **Root cause noted from the #13 review:** the event signature covers `event_parents` (targets are written there with
+  `rel='target'`), while projections read `event_targets`, which is not signed. Every signed event is therefore only
+  accepted if `event_targets` equals its signed `rel='target'` parents (`signing.targets_match`; status
+  `targets-mismatch`, an error). The sync import/release path enforces the same rule (#13). Long term the target list
+  should be part of the signed message (sig v2).
 - Whoever holds the recovery code can take over signing (by design); store it offline, apart from the key file.
 - An attacker holding the *old* key can sign until the rotation is committed. Retroactive (`compromised:true`)
   revocation is deferred.

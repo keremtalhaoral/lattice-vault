@@ -121,8 +121,8 @@ class SyncTest(unittest.TestCase):
         vault.append(C, "preference.set", U, {"key": "dil", "value": "Klingonca"}, U, "verified")
         vault.append(C, "event.approved", "event:x", {}, U, "verified")
         r = self.imp(self.B, self.pkg(C, "c.vaultsync"))
-        # skipped: the approval AND C's key.registered (signed human-only types from an unpaired device)
-        self.assertEqual((r["new"], r["quarantined"], len(r["skipped"])), (1, 1, 2))
+        # skipped: the approval AND C's user + recovery key.registered (signed human-only types, unpaired device)
+        self.assertEqual((r["new"], r["quarantined"], len(r["skipped"])), (1, 1, 3))
         e = self.B.execute("SELECT e.actor, e.trust, s.status FROM events e JOIN proj_status s ON s.event_id=e.id").fetchone()
         self.assertTrue(e[0].startswith("import:sync-")); self.assertEqual((e[1], e[2]), ("unverified", "proposed"))
         self.assertEqual(self.pref(self.B), [])   # not in the active projection until approved
@@ -200,10 +200,10 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(self.B.execute("SELECT status FROM proj_status WHERE event_id=?", (a,)).fetchone()[0], "proposed")
         vault.review(self.A, a, "approve", actor=U)
         r = sync.import_package(self.B, self.pkg(self.A, "a2", since_peer=self.db_))
-        self.assertEqual((r["new"], r["quarantined"]), (0, 2))   # A's key.registered + the approval
+        self.assertEqual((r["new"], r["quarantined"]), (0, 3))   # A's user + recovery key.registered + the approval
         self.assertEqual(self.sem(self.B), before)
         self.assertEqual(sorted(v.split(" (")[0] for v in self.held(self.B).values()),
-                         ["key.* events are not applied via sync", "unknown signing key " + signing.try_user_key()[1]])
+                         ["key.* events are not applied via sync"] * 2 + ["unknown signing key " + signing.try_user_key()[1]])
 
     def test_approval_type_quarantined_regardless_of_actor(self):
         # a forged batch approval claiming a non-user actor (inserted around the human-only trigger, as a package writer could)
@@ -285,13 +285,13 @@ class SyncTest(unittest.TestCase):
         signing.register_user_key(self.B)                  # receiver knows the same user key (key.registered on B)
         a, ap, p = self.approval_pkg()
         r = sync.import_package(self.B, p)
-        self.assertEqual((r["new"], r["quarantined"]), (2, 1))   # agent event + approval; A's key.registered held
+        self.assertEqual((r["new"], r["quarantined"]), (2, 2))   # agent event + approval; A's two key.registered held
         self.assertEqual(self.B.execute("SELECT status FROM proj_status WHERE event_id=?", (a,)).fetchone()[0], "active")
         self.assertNotIn(ap, self.held(self.B))
         self.assertEqual(signing.classify(self.B)[ap][1], "remote-unsigned")   # stored unsigned locally (#10 semantics)
         r = sync.import_package(self.B, p)                  # idempotent
-        self.assertEqual((r["new"], r["quarantined"], r["duplicate"]), (0, 0, 3))
-        self.assertEqual(len(sync.quarantined(self.B)), 1)
+        self.assertEqual((r["new"], r["quarantined"], r["duplicate"]), (0, 0, 4))
+        self.assertEqual(len(sync.quarantined(self.B)), 2)
 
     @unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
     def test_signed_but_key_not_registered_on_receiver_quarantined(self):

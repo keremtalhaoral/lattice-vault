@@ -9,6 +9,17 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 H = "user:owner"
 
 
+def init_code(db):
+    """The recovery code created atomically with the first user key (harness: testutil.recovery_code)."""
+    rk = next(k for k, v in signing.registered_keys(db)[0].items() if v["role"] == "recovery" and v["revoked_seq"] is None)
+    return testutil.recovery_code(db), rk
+
+
+def code_after(out, marker):
+    lines = out.splitlines()
+    return lines[next(i for i, l in enumerate(lines) if marker in l) + 1].strip()
+
+
 def rj(p):
     with open(p) as f:
         return json.load(f)
@@ -90,7 +101,7 @@ class Revoke(unittest.TestCase):
 
     def test_user_key_cannot_revoke_recovery_key(self):
         # Security B3: the user key may revoke only device keys it certified
-        _, rk = signing.new_recovery_code(self.db)
+        _, rk = init_code(self.db)
         with self.assertRaisesRegex(signing.SignatureError, "only revoke device keys"):
             signing.revoke_key(self.db, rk, "x")
         signing._revoke(self.db, signing._current_user_key(self.db), rk, "forced", H)   # bypass the library check
@@ -113,7 +124,7 @@ class Recovery(unittest.TestCase):
         self.newp = os.path.join(self.d, "recovered.key")
 
     def test_code_stored_only_as_public_key(self):
-        code, rk = signing.new_recovery_code(self.db)
+        code, rk = init_code(self.db)
         self.assertTrue(rk.startswith("recovery/ed25519/"))
         self.db.commit()
         blob = testutil.all_bytes(self.dbp)
@@ -121,7 +132,7 @@ class Recovery(unittest.TestCase):
 
     def test_replacing_code_needs_old_code(self):
         # Security B2: a stolen user key alone cannot replace the owner's recovery code
-        c1, r1 = signing.new_recovery_code(self.db)
+        c1, r1 = init_code(self.db)
         with self.assertRaisesRegex(signing.SignatureError, "needs the old code"):
             signing.new_recovery_code(self.db)
         with self.assertRaisesRegex(signing.SignatureError, "does not match"):
@@ -137,7 +148,7 @@ class Recovery(unittest.TestCase):
 
     def test_recovery_key_cannot_only_revoke_users(self):
         # Security B3: recovery may revoke only itself; user keys are revoked only atomically by `recover`
-        code, rk = signing.new_recovery_code(self.db)
+        code, rk = init_code(self.db)
         rec = signing._priv_kid(signing._recovery_priv(code), "recovery")
         me = signing.load_user_key()[1]
         signing._revoke(self.db, rec, me, "dos", H)
@@ -145,9 +156,9 @@ class Recovery(unittest.TestCase):
         self.assertTrue(keys[me]["active"]); self.assertTrue(probs)
 
     def test_recover_lost_key(self):
-        code, rk = signing.new_recovery_code(self.db)
+        code, rk = init_code(self.db)
         old = signing.load_user_key()[1]
-        new = signing.recover_with_code(self.db, code.lower(), self.newp)   # case/dash tolerant
+        new, _ = signing.recover_with_code(self.db, code.lower(), self.newp)   # case/dash tolerant
         keys, probs = signing.registered_keys(self.db)
         self.assertEqual(probs, [])
         self.assertIsNotNone(keys[old]["revoked_hlc"]); self.assertIsNotNone(keys[rk]["revoked_hlc"])
@@ -160,7 +171,6 @@ class Recovery(unittest.TestCase):
             self.assertTrue(ops.verify(self.db)["ok"])
 
     def test_wrong_code_refused(self):
-        signing.new_recovery_code(self.db)
         with self.assertRaisesRegex(signing.SignatureError, "recovery"):
             signing.recover_with_code(self.db, "AAAA-" * 7 + "AAAA", self.newp)
         self.assertFalse(os.path.exists(self.newp))
@@ -168,7 +178,7 @@ class Recovery(unittest.TestCase):
             signing.recover_with_code(self.db, "not-a-code", self.newp)
 
     def test_recovery_key_cannot_sign_approvals(self):
-        code, rk = signing.new_recovery_code(self.db)
+        code, rk = init_code(self.db)
         rec = signing._priv_kid(signing._recovery_priv(code), "recovery")
         p = agent(self.db, "note.added", "x", {"text": "b"})
         with self.assertRaisesRegex(signing.SignatureError, "may only sign"):
@@ -207,22 +217,21 @@ class Cli(unittest.TestCase):
         env = {**os.environ, "VAULT_USER_KEY": os.path.join(self.d, "u.key")}
         run = lambda *a, inp=None: subprocess.run([sys.executable, os.path.join(HERE, "vault.py"), *a],
                                                   capture_output=True, text=True, env=env, input=inp)
-        self.assertEqual(run("keys", "init-user").returncode, 0)
+        r = run("keys", "init-user"); self.assertEqual(r.returncode, 0, r.stderr)
+        code = code_after(r.stdout, "RECOVERY CODE")                     # created with the first key (ADR 0012)
+        r = run("keys", "show"); self.assertIsNotNone(json.loads(r.stdout)["live_recovery_key"]["seq"])
         r = run("keys", "rotate"); self.assertEqual(r.returncode, 1); self.assertIn("--new-key", r.stderr)
         r = run("keys", "rotate", "--new-key", os.path.join(self.d, "u2.key")); self.assertEqual(r.returncode, 0, r.stderr)
         env["VAULT_USER_KEY"] = os.path.join(self.d, "u2.key")
-        r = run("keys", "recovery-code"); self.assertEqual(r.returncode, 0, r.stderr)
-        code = r.stdout.strip().splitlines()[-1].strip()
+        r = run("keys", "recovery-code"); self.assertEqual(r.returncode, 1); self.assertIn("old code", r.stderr)
         r = run("keys", "recover", "--new-key", os.path.join(self.d, "u3.key"), inp=code + "\n")
         self.assertEqual(r.returncode, 0, r.stderr)
+        c2 = code_after(r.stdout, "NEW RECOVERY CODE")
         env["VAULT_USER_KEY"] = os.path.join(self.d, "u3.key")
         r = run("keys", "show"); self.assertEqual(r.returncode, 0, r.stderr)
         shown = json.loads(r.stdout); self.assertEqual(shown["problems"], [])
-        self.assertEqual(sum(1 for k in shown["keys"].values() if k["revoked_hlc"] is None), 1)
+        self.assertEqual(sum(1 for k in shown["keys"].values() if k["revoked_hlc"] is None), 2)   # user + recovery
         r = run("verify"); self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        r = run("keys", "recovery-code"); self.assertEqual(r.returncode, 0, r.stderr)
-        c2 = r.stdout.strip().splitlines()[-1].strip()
-        r = run("keys", "recovery-code"); self.assertEqual(r.returncode, 1); self.assertIn("old code", r.stderr)
         r = run("keys", "recovery-code", "--replace", inp=c2 + "\n"); self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_recovery_code_refuses_non_tty_stdout(self):
@@ -250,7 +259,7 @@ class SecurityReview(unittest.TestCase):
         with self.assertRaisesRegex(signing.SignatureError, "pending"):
             signing._append_signed(self.db, (evil, ek), "event.approved", f"event:{p}", {"reason": "x"}, H)
         self.db.rollback()
-        code, rk = signing.new_recovery_code(self.db)
+        code, rk = init_code(self.db)
         signing.rotate_user_key(self.db, os.path.join(self.d, "n.key"))  # owner rotates
         keys, probs = signing.registered_keys(self.db)
         self.assertEqual(probs, [])
@@ -261,10 +270,10 @@ class SecurityReview(unittest.TestCase):
     def test_stolen_key_rotation_keeps_owner_recovery(self):
         """Security re-review B1 (PoC test_stolen_key_rotation_kills_owner_recovery): a thief rotating with the stolen
         user key must not kill the owner's offline recovery code; the owner recovers and the thief's key dies."""
-        code, rk = signing.new_recovery_code(self.db)
+        code, rk = init_code(self.db)
         _, evil = signing.rotate_user_key(self.db, os.path.join(self.d, "evil.key"))
         self.assertIsNone(signing.registered_keys(self.db)[0][rk]["revoked_seq"])
-        new = signing.recover_with_code(self.db, code, os.path.join(self.d, "owner.key"))
+        new, _ = signing.recover_with_code(self.db, code, os.path.join(self.d, "owner.key"))
         keys, probs = signing.registered_keys(self.db)
         self.assertEqual(probs, [])
         self.assertIsNotNone(keys[evil]["revoked_seq"]); self.assertIsNotNone(keys[rk]["revoked_seq"])
@@ -282,8 +291,8 @@ class SecurityReview(unittest.TestCase):
     def test_recover_revokes_all_user_keys_and_their_certs(self):
         import cryptography.hazmat.primitives.asymmetric.ed25519 as ed
         dk = signing._register(self.db, self.me, ed.Ed25519PrivateKey.generate(), "device", H)
-        code, rk = signing.new_recovery_code(self.db)
-        new = signing.recover_with_code(self.db, code, os.path.join(self.d, "r.key"))
+        code, rk = init_code(self.db)
+        new, _ = signing.recover_with_code(self.db, code, os.path.join(self.d, "r.key"))
         keys, probs = signing.registered_keys(self.db)
         self.assertEqual(probs, [])
         for k in (self.me[1], dk, rk):
@@ -304,6 +313,97 @@ class SecurityReview(unittest.TestCase):
         cls = signing.classify(self.db); st = cls[ap][1]
         self.assertEqual(st, "revoked-key"); self.assertIn(st, signing.BAD)
         self.assertTrue(all(v == "signed" for k, (_, v) in cls.items() if k != ap))   # genuinely earlier ones stay valid
+
+
+@unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
+class RecoveryWindow(unittest.TestCase):
+    """Security re-review @ c604b44 (HIGH): no window in which a stolen user key can add a recovery key."""
+    def setUp(self):
+        fresh(self)
+
+    def legacy_vault_without_recovery(self):
+        testutil.AUTO_REGISTER = False; self.addCleanup(setattr, testutil, "AUTO_REGISTER", True)
+        priv, kid = signing.load_user_key()
+        pub = signing.pub_raw(priv)
+        vault.append(self.db, "key.registered", f"key:{kid}", {"key_id": kid, "alg": "ed25519", "role": "user",
+                     "pubkey_b64": signing.b64(pub), "certified_by": kid}, H, "verified")
+        approve_one(self.db, "x")
+        return priv, kid
+
+    def test_poc_thief_cannot_register_recovery(self):
+        """PoC test_thief_registered_recovery_survives_owner_rotation, ported: on a vault with NO recovery key the
+        thief (stolen user key) cannot register one, neither via the API nor by writing the event directly."""
+        me = self.legacy_vault_without_recovery()
+        with self.assertRaisesRegex(signing.SignatureError, "old code"):
+            signing.new_recovery_code(self.db)
+        import cryptography.hazmat.primitives.asymmetric.ed25519 as ed
+        thief = ed.Ed25519PrivateKey.generate()
+        trk = signing._register(self.db, me, thief, "recovery", H)
+        keys, probs = signing.registered_keys(self.db)
+        self.assertNotIn(trk, keys); self.assertTrue(any("not allowed" in x for x in probs))
+        code = signing._new_code()   # even a well-formed code for that key is useless
+        with self.assertRaises(signing.SignatureError):
+            signing.recover_with_code(self.db, code, os.path.join(self.d, "thief.key"))
+        rep = ops.doctor(self.db)
+        self.assertTrue(any("NO LIVE RECOVERY KEY" in w for w in rep.get("warnings", []) + rep.get("problems", [])), rep)
+
+    def test_init_user_registers_recovery_atomically(self):
+        approve_one(self.db, "a")
+        keys = signing.registered_keys(self.db)[0]
+        user = [v for v in keys.values() if v["role"] == "user"][0]
+        rec = [v for v in keys.values() if v["role"] == "recovery"]
+        self.assertEqual(len(rec), 1); self.assertEqual(rec[0]["seq"], user["seq"] + 1)
+        self.assertFalse(any("NO LIVE RECOVERY" in w for w in ops.doctor(self.db).get("warnings", [])))
+
+    def test_init_user_failure_registers_nothing(self):
+        testutil.AUTO_REGISTER = False; self.addCleanup(setattr, testutil, "AUTO_REGISTER", True)
+        with mock.patch.object(signing, "_register", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                signing.register_user_key(self.db)
+        self.assertIsNone(signing.epoch_seq(self.db))
+
+    def test_replace_is_atomic(self):
+        approve_one(self.db, "a")
+        code, rk = init_code(self.db)
+        with mock.patch.object(signing, "_register", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                signing.new_recovery_code(self.db, old_code=code)
+        keys = signing.registered_keys(self.db)[0]
+        self.assertIsNone(keys[rk]["revoked_seq"])                      # old code still live
+        new, nk = signing.new_recovery_code(self.db, old_code=code)
+        keys, probs = signing.registered_keys(self.db)
+        self.assertEqual(probs, []); self.assertIsNotNone(keys[rk]["revoked_seq"]); self.assertIsNone(keys[nk]["revoked_seq"])
+        self.assertEqual(keys[nk]["seq"], keys[rk]["revoked_seq"] + 1)
+
+    def test_recover_creates_fresh_recovery(self):
+        approve_one(self.db, "a")
+        code, rk = init_code(self.db)
+        new, code2 = signing.recover_with_code(self.db, code, os.path.join(self.d, "r.key"))
+        keys, probs = signing.registered_keys(self.db)
+        self.assertEqual(probs, [])
+        live = [k for k, v in keys.items() if v["role"] == "recovery" and v["revoked_seq"] is None]
+        self.assertEqual(len(live), 1); self.assertNotEqual(live[0], rk)
+        with mock.patch.dict(os.environ, {"VAULT_USER_KEY": os.path.join(self.d, "r.key")}):
+            self.assertEqual(signing.new_recovery_code(self.db, old_code=code2)[1] in signing.registered_keys(self.db)[0], True)
+
+    def test_backdated_revocation_needs_compromised(self):
+        """Data Systems N1: a user-signed key.revoked may not backdate effective_hlc unless compromised:true."""
+        import cryptography.hazmat.primitives.asymmetric.ed25519 as ed
+        approve_one(self.db, "a")
+        me = signing._current_user_key(self.db)
+        dk = signing._register(self.db, me, ed.Ed25519PrivateKey.generate(), "device", H)
+        signing._append_signed(self.db, me, "key.revoked", f"key:{dk}", {"key_id": dk, "effective_hlc": "000000000000-0000-local",
+                               "reason": "backdated", "compromised": False}, H)
+        keys, probs = signing.registered_keys(self.db)
+        self.assertIsNone(keys[dk]["revoked_seq"]); self.assertTrue(probs)
+
+    def test_anchor_skip_warns_after_rotation(self):
+        import io
+        approve_one(self.db, "a")
+        err = io.StringIO()
+        with mock.patch.object(signing, "write_anchor", return_value=None), mock.patch("sys.stderr", err):
+            signing.rotate_user_key(self.db, os.path.join(self.d, "n.key"))
+        self.assertIn("anchor NOT refreshed", err.getvalue())
 
 
 if __name__ == "__main__":

@@ -1203,10 +1203,11 @@ def main(argv=None):
     rv.add_argument("item"); rv.add_argument("verdict", choices=["supported", "unsupported"])
     rq = sp.add_parser("review-enqueue", help="citation check: run citation check and queue flagged + sample (human CLI only)")
     rq.add_argument("--sample-pct", type=float)
-    sx = sp.add_parser("sync-export", help="write new events to a .vaultsync package"); sx.add_argument("--out", required=True)
+    sx = sp.add_parser("sync-export", help="EXPERIMENTAL, not for real data: write new events to a .vaultsync package"); sx.add_argument("--out", required=True)
     sx.add_argument("--since-peer", help="only events that DEVICE has not yet sent/acknowledged (watermark)")
-    si = sp.add_parser("sync-import", help="verify + merge a .vaultsync package"); si.add_argument("file")
+    si = sp.add_parser("sync-import", help="EXPERIMENTAL, not for real data: verify + merge a .vaultsync package"); si.add_argument("file")
     si.add_argument("--dry-run", action="store_true")
+    sp.add_parser("sync-quarantine", help="list synced events held in quarantine (unsigned user:*/approval events)")
     sp.add_parser("device-id", help="show (create on first use) this vault's stable device id")
     spr = sp.add_parser("sync-pair", help="register another device of the owner (human-only)")
     spr.add_argument("device"); spr.add_argument("--name", required=True)
@@ -1401,9 +1402,13 @@ def main(argv=None):
         elif args.cmd == "shred-finalize":
             import ops
             print(json.dumps({"destroyed_key": ops.shred_finalize(db, args.subject)}))
-        elif args.cmd in ("sync-export", "sync-import", "device-id", "sync-pair"):
+        elif args.cmd in ("sync-export", "sync-import", "device-id", "sync-pair", "sync-quarantine"):
             import sync
-            if args.cmd == "device-id":
+            if args.cmd in ("sync-export", "sync-import", "sync-pair"):
+                print(sync.UNSUPPORTED_WARNING, file=sys.stderr)
+            if args.cmd == "sync-quarantine":
+                print(json.dumps(sync.quarantined(db), ensure_ascii=False))
+            elif args.cmd == "device-id":
                 print(sync.device_id(db))
             elif args.cmd == "sync-pair":
                 sync.pair(db, args.device, args.name); print(f"paired {args.device}")

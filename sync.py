@@ -16,6 +16,10 @@ CREATE TABLE IF NOT EXISTS sync_imported (            -- chain-of-imports record
   origin_row TEXT NOT NULL CHECK (json_valid(origin_row)), package_sha256 TEXT NOT NULL,
   quarantined INTEGER NOT NULL DEFAULT 0,
   at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+CREATE TABLE IF NOT EXISTS sync_quarantine (          -- held, NOT in events: never projected, never verified (no signing yet)
+  event_id TEXT PRIMARY KEY, origin_device TEXT NOT NULL, type TEXT NOT NULL, actor TEXT NOT NULL,
+  origin_row TEXT NOT NULL CHECK (json_valid(origin_row)), package_sha256 TEXT NOT NULL, reason TEXT NOT NULL,
+  at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
 CREATE TABLE IF NOT EXISTS sync_packages (
   body_sha256 TEXT PRIMARY KEY, source_device TEXT NOT NULL, report TEXT NOT NULL CHECK (json_valid(report)),
   at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
@@ -24,6 +28,28 @@ CREATE TABLE IF NOT EXISTS sync_packages (
 
 class SyncError(ValueError):
     pass
+
+
+UNSUPPORTED_WARNING = ("WARNING: multi-device sync is an unsigned prototype. Do not use it with real data: no package signing, "
+                       "no key sync, no redaction/shred propagation. user:* and approval events are quarantined, not applied.")
+
+
+def _quarantine_reason(e, parents_held):
+    """Until package signing exists, nothing that could carry the owner's authority is applied from a package."""
+    if e["actor"].startswith("user:"):
+        return "unsigned user:* event"
+    if e["type"] in vault.HUMAN_ONLY_TYPES:
+        return "unsigned approval/human-only event"
+    if any(p in parents_held for p, _ in e["parents"]):
+        return "parent quarantined"
+    return None
+
+
+def quarantined(db):
+    if not _has(db, "sync_quarantine"):
+        return []
+    return [dict(r) for r in db.execute(
+        "SELECT event_id, origin_device, type, actor, reason, package_sha256, at FROM sync_quarantine ORDER BY at, event_id")]
 
 
 def _has(db, name):
@@ -137,13 +163,17 @@ def _verify_event(e):
     return row
 
 
-def import_package(db, path, dry_run=False, now_ms=None):
-    """Verify then merge a package. All-or-nothing; idempotent (union by event id)."""
+def import_package(db, path, dry_run=False, now_ms=None, _trust_unsigned=False):
+    """Verify then merge a package. All-or-nothing; idempotent (union by event id).
+
+    user:* and human-only (approval/revert/redact/shred/...) events are stored in `sync_quarantine` and not applied,
+    because packages are unsigned. `_trust_unsigned` restores the old paired-device behaviour; tests only, no CLI/env."""
     m, evs = _parse(path)
     now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
     me = device_id(db, create=not dry_run)
     paired = {r[0] for r in db.execute("SELECT replica_id FROM replicas")} | {me}
     have = {r[0] for r in db.execute("SELECT id FROM events")}
+    held = {r[0] for r in db.execute("SELECT event_id FROM sync_quarantine")} if _has(db, "sync_quarantine") else set()
     rep = {"source_device": m["source_device"], "events": len(evs), "new": 0, "duplicate": 0, "quarantined": 0,
            "skipped": [], "dry_run": dry_run}
     todo, skew = [], []
@@ -151,9 +181,19 @@ def import_package(db, path, dry_run=False, now_ms=None):
         row = _verify_event(e)
         if _hlc_ms(e["hlc"]) > now_ms + MAX_SKEW_MS:
             skew.append(e["id"])
-        if e["id"] in have:
+        if e["id"] in have or e["id"] in held:
             rep["duplicate"] += 1; continue
         todo.append((e, row))
+    hold = []
+    if not _trust_unsigned:
+        rest = []
+        for e, row in todo:   # (hlc, id) order, so a parent is classified before its children
+            why = _quarantine_reason(e, held)
+            if why:
+                held.add(e["id"]); hold.append((e, why))
+            else:
+                rest.append((e, row))
+        todo = rest
     if skew:
         raise SyncError(f"clock skew: {len(skew)} event(s) have HLC > now + {MAX_SKEW_MS} ms (first {skew[0]}); package rejected")
     ids_in = have | {e["id"] for e, _ in todo}
@@ -177,6 +217,8 @@ def import_package(db, path, dry_run=False, now_ms=None):
             rep["quarantined"] += 1
         plan.append((e, local, quarantine))
     rep["new"] = len(plan)
+    if not _trust_unsigned:
+        rep["quarantined"] = len(hold)
     if dry_run:
         return rep
     ensure_schema(db)
@@ -197,6 +239,11 @@ def import_package(db, path, dry_run=False, now_ms=None):
             orig = {k: v for k, v in e.items() if k != "origin_device"}
             db.execute("INSERT INTO sync_imported(event_id, origin_device, origin_hash, origin_row, package_sha256, quarantined) "
                        "VALUES(?,?,?,?,?,?)", (e["id"], e["origin_device"], e["hash"], vault.canon(orig), m["body_sha256"], int(q)))
+        for e, why in hold:
+            orig = {k: v for k, v in e.items() if k != "origin_device"}
+            db.execute("INSERT OR IGNORE INTO sync_quarantine(event_id, origin_device, type, actor, origin_row, package_sha256, reason) "
+                       "VALUES(?,?,?,?,?,?,?)", (e["id"], e["origin_device"], e["type"], e["actor"], vault.canon(orig),
+                                                 m["body_sha256"], why))
         # the source device holds everything in its vector -> watermark for `--since-peer <source>`
         for k, v in m["vector"].items():
             db.execute("""INSERT INTO sync_peer_state VALUES(?,?,?) ON CONFLICT(peer_replica_id, origin_replica)

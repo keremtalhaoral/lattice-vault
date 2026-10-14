@@ -73,6 +73,10 @@ All notable changes to this project are documented here. Format: [Keep a Changel
 - `vault doctor` in-memory rebuild could not find the vault's keystore (`''` vs `:memory:` key), so encrypted
   events could be reported as projection drift.
 
+- Sync prototype: unsigned `user:*` and approval/human-only events from a `.vaultsync` package are quarantined
+  (`sync_quarantine`, not applied, not verified); `vault sync-quarantine` lists them. Sync commands warn that
+  multi-device use with real data is unsupported.
+
 ## [0.1.0-prototype] - 2026-10-14
 First public prototype. **Not for production use.**
 ### Added

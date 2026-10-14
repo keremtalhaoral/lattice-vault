@@ -3,6 +3,9 @@
 Status: **prototype** on `feat/sync-prototype`. Implements part of ADR 0008. Single owner, 2+ devices, no server,
 no network code. Device A exports a file, the user moves it (USB, file sync, …), device B imports it.
 
+> **Do not use multi-device sync with real data.** Packages are unsigned, there is no key sync, and redaction/shredding
+> does not propagate to other devices. Until signing exists, `user:*` and approval events are quarantined (see Trust).
+
 ## Package format
 One file. Line 1 is the **manifest** (canonical JSON). Lines 2..n are the **body** (JSONL, one event per line, sorted by `(hlc, id)`).
 
@@ -54,6 +57,13 @@ These go through the existing DAG. Concurrent `preference.set` events on two dev
 whichever correction replays last, but the conflict flag keeps it out of the context pack until the user resolves it.
 
 ## Trust
+**Quarantine (until package signing exists).** Any incoming event whose actor is `user:*`, or whose type is human-only
+(`event.approved`, `event.rejected`, `event.reverted`, `import.batch_approved`, `event.redacted`, `subject.shredded`,
+`conflict.resolved`), or whose parent is quarantined, is stored in `sync_quarantine` (origin row + reason) and **not**
+written to `events`: it is never projected, never verified, and not re-exported. Re-import counts it as a duplicate.
+List with `vault sync-quarantine`. Only agent/import events are applied (and they stay unverified/proposed).
+The rules below describe the pre-quarantine paired-device behaviour, kept behind a test-only flag.
+
 * An event keeps its original actor/trust only if its `origin_device` is this device or a **paired** device (`vault sync-pair`, human-only,
   stored in the existing `replicas` table). Agent events stay unverified/proposed regardless.
 * `user:*` events from an **unknown** device are quarantined: actor becomes `import:sync-<device>`, trust becomes `unverified`, status becomes `proposed`
@@ -73,8 +83,9 @@ vault device-id                                 # create/show stable device id (
 vault sync-pair <device-id> --name laptop       # human-only: trust this device as the owner's
 vault sync-export --out a.vaultsync [--since-peer <device-id>]
 vault sync-import a.vaultsync [--dry-run]       # prints a JSON report (new/duplicate/quarantined/skipped)
+vault sync-quarantine                           # JSON list of held events (id, origin device, type, actor, reason)
 ```
-New tables (all `CREATE TABLE IF NOT EXISTS`, created lazily by sync): `sync_device`, `sync_imported`, `sync_packages`.
+New tables (all `CREATE TABLE IF NOT EXISTS`, created lazily by sync): `sync_device`, `sync_imported`, `sync_quarantine`, `sync_packages`.
 Reuses the reserved `replicas` and `sync_peer_state`. No existing table or trigger is changed.
 
 ## Not built (planned)

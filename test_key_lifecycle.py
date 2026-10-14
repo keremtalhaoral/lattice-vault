@@ -397,6 +397,48 @@ class RecoveryWindow(unittest.TestCase):
         keys, probs = signing.registered_keys(self.db)
         self.assertIsNone(keys[dk]["revoked_seq"]); self.assertTrue(probs)
 
+    def test_l1_legacy_first_key_as_last_event(self):
+        """Security L1 (PoC poc12-578 test_legacy_first_user_is_last_event): adjacency alone is not enough; the first
+        user key event must name the recovery key (signed recovery_key_id). Legacy first-key events have none."""
+        testutil.AUTO_REGISTER = False; self.addCleanup(setattr, testutil, "AUTO_REGISTER", True)
+        priv, kid = signing.load_user_key()
+        vault.append(self.db, "key.registered", f"key:{kid}", {"key_id": kid, "alg": "ed25519", "role": "user",
+                     "pubkey_b64": signing.b64(signing.pub_raw(priv)), "certified_by": kid}, H, "verified")
+        import cryptography.hazmat.primitives.asymmetric.ed25519 as ed
+        trk = signing._register(self.db, (priv, kid), ed.Ed25519PrivateKey.generate(), "recovery", H)
+        keys, probs = signing.registered_keys(self.db)
+        self.assertNotIn(trk, keys); self.assertTrue(probs)
+
+    def test_l1_recovery_must_match_signed_id(self):
+        approve_one(self.db, "a")
+        code, rk = init_code(self.db)
+        import cryptography.hazmat.primitives.asymmetric.ed25519 as ed
+        rec = signing._priv_kid(signing._recovery_priv(code), "recovery")
+        me = signing._current_user_key(self.db)
+        # self-revoke naming recovery key R2, then registering a different key R3: rejected
+        r2 = signing.key_id_for(signing.pub_raw(ed.Ed25519PrivateKey.generate()), "recovery")
+        signing._revoke(self.db, rec, rk, "x", H, recovery_key_id=r2)
+        r3 = signing._register(self.db, me, ed.Ed25519PrivateKey.generate(), "recovery", H)
+        keys, probs = signing.registered_keys(self.db)
+        self.assertNotIn(r3, keys); self.assertTrue(probs)
+
+    def test_recover_rollback_removes_key_file(self):
+        approve_one(self.db, "a")
+        code, rk = init_code(self.db)
+        newp = os.path.join(self.d, "r.key")
+        real = signing._register
+        calls = []
+        def flaky(*a, **kw):
+            calls.append(1)
+            if len(calls) == 2:
+                raise RuntimeError("boom")
+            return real(*a, **kw)
+        with mock.patch.object(signing, "_register", flaky):
+            with self.assertRaises(RuntimeError):
+                signing.recover_with_code(self.db, code, newp)
+        self.assertFalse(os.path.exists(newp))
+        self.assertIsNone(signing.registered_keys(self.db)[0][rk]["revoked_seq"])   # nothing committed
+
     def test_anchor_skip_warns_after_rotation(self):
         import io
         approve_one(self.db, "a")

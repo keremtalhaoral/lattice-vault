@@ -125,7 +125,9 @@ access to an unlocked machine, a compromised Python interpreter or dependency.
   replaces a lost key with it. Whoever holds the code can replace the signing key; keep it offline. A lost live
   code **cannot be replaced** (replacing needs the old code), and vaults initialised before this rule have no recovery
   key and cannot gain one (doctor warns; re-initialise).
-  Revocation is never retroactive (`compromised:true` handling is **(planned)**).
+  A revocation takes effect at its own HLC; only `compromised:true` may set an earlier `effective_hlc` (retroactive,
+  enforced by the registry; there is no CLI for it yet). If printing the code during `keys init-user` fails, the
+  code is lost: re-initialise the vault.
 - **TTY gate.** Any same-user process can allocate a pseudo-terminal.
 - **DNS rebinding.** The citation check resolves and validates addresses, then lets `urllib` connect;
   the connection is not pinned to the validated address, so a rebinding DNS server could race it.

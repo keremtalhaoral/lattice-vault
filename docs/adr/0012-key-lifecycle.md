@@ -24,7 +24,9 @@ recovery code and an optional second anchor (`VAULT_ANCHOR_PATH2`) before any mu
   2. the live recovery key's self-revocation (`vault keys recovery-code --replace`, needs the OLD code; revoke +
      new registration in one transaction),
   3. a recovery-certified new user key (`vault keys recover`, which prints a fresh code in the same transaction),
-  and only while no other recovery key is live. A recovery key is never revoked transitively (rotation keeps it).
+  and only if that preceding event names the new key in its **signed** `recovery_key_id` field (adjacency alone is
+  not enough), and only while no other recovery key is live. `recover` writes the new key file before the
+  transaction and deletes it again if the transaction fails. A recovery key is never revoked transitively (rotation keeps it).
   Trade-off: a lost live code cannot be replaced; the vault keeps working with the user key.
   **Migration:** vaults whose first key was registered before this rule have no recovery key and can never gain
   one; `doctor`/`verify` warn loudly. Re-initialise (`vault init` on a new path + import/restore of content) to get one.
@@ -51,9 +53,10 @@ recovery code and an optional second anchor (`VAULT_ANCHOR_PATH2`) before any mu
   `targets-mismatch`, an error). The sync import/release path enforces the same rule (#13). Long term the target list
   should be part of the signed message (sig v2).
 - Whoever holds the recovery code can take over signing (by design); store it offline, apart from the key file.
-- An attacker holding the *old* key can sign until the rotation is committed. Retroactive (`compromised:true`)
-  revocation is deferred.
+- An attacker holding the *old* key can sign until the rotation is committed. Retroactive revocation
+  (`compromised:true` with an earlier `effective_hlc`) is enforced by the registry but has no CLI yet.
+- If printing the recovery code during `keys init-user` fails, the code is lost: re-initialise the vault.
 - The default key file is unencrypted (0600); set `VAULT_USER_KEY_PASSPHRASE` to encrypt it. Prompting for a
   passphrase on rotate/recover is a follow-up.
 - Anchors are written one after the other; if the second write fails the two disagree and open fails closed.
-- Not done here: OS keychain backend, device keys / per-device signing, retroactive (`compromised:true`) revocation.
+- Not done here: OS keychain backend, device keys / per-device signing, a CLI for `compromised:true` revocation.

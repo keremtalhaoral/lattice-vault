@@ -172,3 +172,7 @@ Arama Türkçe karakter katlamalıdır (`ı/i`, `ş/s` …). **Prototiptir; üre
 
 ## License
 Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+---
+
+<sub>Lattice Labs · Created by Kerem Talha Oral · Licensed under Apache-2.0</sub>

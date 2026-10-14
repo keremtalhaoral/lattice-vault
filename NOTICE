@@ -1,5 +1,6 @@
 Lattice Vault (prototype)
-Copyright 2026 <COPYRIGHT HOLDER>
+Copyright 2026 Lattice Labs
+Created by Kerem Talha Oral.
 
 This product is licensed under the Apache License, Version 2.0 (see LICENSE).
 It optionally uses the "cryptography" Python package (Apache-2.0 / BSD) and the

@@ -6,7 +6,9 @@
 ## Reporting a vulnerability
 - Please report privately via **GitHub private vulnerability reporting** (repository → *Security* →
   *Report a vulnerability*). **Do not open public issues, pull requests or discussions** for vulnerabilities.
-- Fallback contact: `<SECURITY CONTACT EMAIL>` (placeholder — to be filled in by the maintainer).
+- This is the only reporting channel; there is no security email.
+- Maintainer note: private vulnerability reporting must be enabled in the repository settings
+  (*Settings → Code security → Private vulnerability reporting*) before publishing.
 - Expectation: acknowledgement within **7 days**, a first assessment within **14 days**. This is a
   best-effort volunteer prototype; there is no bug bounty and no SLA.
 - Supported version: the latest commit on `main` only.

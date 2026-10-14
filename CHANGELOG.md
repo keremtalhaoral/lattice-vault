@@ -6,6 +6,8 @@ All notable changes to this project are documented here. Format: [Keep a Changel
 - `vault export-context`: MCP-fallback Context Pack (`lattice-context/v1`, Markdown + YAML front matter) of
   approved facts only, with `[encrypted]`/`[redacted]` placeholders, deterministic output, token budget and a
   `vault_update` template. See docs/context-pack.md. `vault pack` is unchanged.
+- `vault show <id|suffix> [--json] [--tree]`: read-only event detail with review/audit history and the full
+  correction/supersede chain (effective head, reverts, conflict flagging); never decrypts. See docs/event-detail.md.
 
 ## [0.1.0-prototype] - 2026-10-14
 First public prototype. **Not for production use.**

@@ -764,6 +764,9 @@ def main(argv=None):
     c.add_argument("--value", required=True); c.add_argument("--reason", required=True)
     rv_ = sp.add_parser("revert"); rv_.add_argument("event_id"); rv_.add_argument("--reason", required=True)
     h = sp.add_parser("history"); h.add_argument("subject")
+    sw = sp.add_parser("show", help="read-only: one event's detail and its correction/supersede chain")
+    sw.add_argument("event_id", help="full id or unique suffix (>=6 chars)"); sw.add_argument("--json", action="store_true")
+    sw.add_argument("--tree", action="store_true")
     im = sp.add_parser("import-markdown"); im.add_argument("vault_dir"); im.add_argument("--dry-run", action="store_true")
     im.add_argument("--json", action="store_true")
     ia = sp.add_parser("import-approve"); ia.add_argument("import_id"); ia.add_argument("--owner-lines", required=True,
@@ -788,6 +791,9 @@ def main(argv=None):
         if args.cmd == "migrate":
             import ops
             ops.migrate(args.old, args.new).close(); print(f"migrated -> {args.new}"); return 0
+        if args.cmd == "show":   # read-only path: does not use connect() (which writes); see docs/event-detail.md
+            import event_detail
+            sys.stdout.write(event_detail.show(args.event_id, args.json, args.tree)); return 0
         db = connect()
         if args.cmd == "add":
             payload = json.loads(args.payload) if args.payload else {"text": args.text}

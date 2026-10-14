@@ -262,6 +262,44 @@ def verify_chains(db):
     return problems
 
 
+CHECKPOINT_SQL = "CREATE TABLE IF NOT EXISTS chain_checkpoint (k TEXT PRIMARY KEY, seq INTEGER NOT NULL, hash TEXT NOT NULL)"
+
+
+def _verify_tail(db, table, key, hasher, cp):
+    """Verify `table` from checkpoint (seq, hash) to head. The checkpoint row itself is re-hashed too."""
+    prev, start = GENESIS, 0
+    if cp:
+        r = db.execute(f"SELECT * FROM {table} WHERE {key}=?", (cp[0],)).fetchone()
+        if r is None or r["hash"] != cp[1] or hasher(r["prev_hash"], r) != r["hash"]:
+            return f"{table} chain broken at {'seq' if key == 'seq' else 'id'} {cp[0]} (checkpoint mismatch)", None
+        prev, start = cp[1], cp[0]
+    head = cp
+    for r in db.execute(f"SELECT * FROM {table} WHERE {key}>? ORDER BY {key}", (start,)):
+        if r["prev_hash"] != prev or hasher(prev, r) != r["hash"]:
+            return f"{'event' if table == 'events' else 'audit'} chain broken at {'seq' if key == 'seq' else 'id'} {r[key]}", None
+        prev = r["hash"]; head = (r[key], prev)
+    return None, head
+
+
+def verify_chains_incremental(db):
+    """Open-time check: verify only events/audit rows after the last verified checkpoint (verified_head_seq/hash),
+    then advance the checkpoint. Rows below the checkpoint are covered by `vault doctor` (full verify_chains)."""
+    db.execute(CHECKPOINT_SQL)
+    cps = {r[0]: (r[1], r[2]) for r in db.execute("SELECT k, seq, hash FROM chain_checkpoint WHERE k IN ('events','audit')")}
+    problems, heads = [], {}
+    for table, key, hasher in (("events", "seq", event_hash), ("audit", "id", audit_hash)):
+        err, head = _verify_tail(db, table, key, hasher, cps.get(table))
+        if err:
+            problems.append(err)
+        elif head:
+            heads[table] = head
+    if not problems:
+        for k, (sq, h) in heads.items():
+            db.execute("INSERT OR REPLACE INTO chain_checkpoint VALUES(?,?,?)", (k, sq, h))
+        db.commit()
+    return problems
+
+
 def _secure_files(path):
     for p in (path, path + "-journal", path + "-wal", path + "-shm"):
         if os.path.exists(p):
@@ -294,14 +332,20 @@ def connect(path=None, verify=True):
             db.close()
             raise TamperError(f"{path}: schema version {v[0] if v else '1'} != {SCHEMA_VERSION}; migrate with `vault migrate <old> <new>`")
         if verify:
-            problems = check_triggers(db) + verify_chains(db)
+            problems = check_triggers(db) + verify_chains_incremental(db)
             if problems:
                 db.close()
                 raise TamperError(f"{path}: integrity check failed: {'; '.join(problems)}. Not auto-repaired; "
                                   "restore from a snapshot or investigate (`vault doctor`).")
-    if not db.execute("SELECT 1 FROM sqlite_master WHERE name='proj_meta'").fetchone():
-        rebuild(db)
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE name='proj_meta'").fetchone() or _proj_last_seq(db) != \
+            db.execute("SELECT COALESCE(MAX(seq),0) FROM events").fetchone()[0]:
+        rebuild(db)   # missing projections or checkpoint behind the log (e.g. crash between append and apply)
     return db
+
+
+def _proj_last_seq(db):
+    r = db.execute("SELECT MIN(last_seq) FROM proj_meta").fetchone()
+    return r[0] if r else None
 
 
 def now():
@@ -423,14 +467,15 @@ def append(db, type_, subject, payload, actor, trust, key=None, target_id=None, 
         for t in targets:
             db.execute("INSERT INTO event_targets VALUES(?,?)", (eid, t))
             db.execute("INSERT OR IGNORE INTO event_parents VALUES(?,?, 'target')", (eid, t))
+        incremental = commit and _rebuild and apply_incremental(db, eid)
     except sqlite3.DatabaseError:
         if commit:
             db.rollback()
         raise
     if commit:
         db.commit()
-        if _rebuild:
-            rebuild(db)
+        if _rebuild and not incremental:
+            rebuild(db)   # fallback: event type/shape not safely applicable incrementally (docs/projections.md)
     return eid, False
 
 
@@ -498,33 +543,67 @@ def is_unknown_version(e):
     return schemas.is_future(e["type"], e["schema_version"])
 
 
-def compute_status(db, events):
-    status, trust_eff = {}, {}
-    for e in events:
-        t = e["type"]
+def _status_step(status, trust_eff, e, targets):
+    """Pure status transition for one event; shared by full rebuild and incremental apply."""
+    t = e["type"]
+    if True:
         if t in REVIEW_TYPES or t == "import.batch_approved":
-            for tid in _targets(db, e):
+            for tid in targets:
                 if status.get(tid, (None,))[0] == "proposed":
                     status[tid] = ("active" if t != "event.rejected" else "rejected", e["actor"], e["seq"])
                     if t == "import.batch_approved":
                         trust_eff[tid] = "verified"
             status[e["id"]] = ("active", e["actor"], e["seq"])
         elif t == "event.reverted":
-            for tid in _targets(db, e):
+            for tid in targets:
                 if status.get(tid, (None,))[0] in ("active", "proposed"):
                     status[tid] = ("reverted", e["actor"], e["seq"])
             status[e["id"]] = ("active", e["actor"], e["seq"])
         else:
             status[e["id"]] = ("active", e["actor"], e["seq"]) if e["actor"].startswith("user:") else ("proposed", None, None)
+
+
+def _link_maps(db):
+    """All targets / supersedes parents in two queries (avoids per-event N+1 lookups during rebuild)."""
+    tg, pa = {}, {}
+    for r in db.execute("SELECT event_id, target_id FROM event_targets ORDER BY event_id, target_id"):
+        tg.setdefault(r[0], []).append(r[1])
+    for r in db.execute("SELECT event_id, parent_id FROM event_parents WHERE rel='supersedes' ORDER BY event_id, parent_id"):
+        pa.setdefault(r[0], []).append(r[1])
+    return tg, pa
+
+
+def compute_status(db, events, targets=None):
+    status, trust_eff = {}, {}
+    tg = targets if targets is not None else _link_maps(db)[0]
+    for e in events:
+        _status_step(status, trust_eff, e, tg.get(e["id"], []))
     return status, trust_eff
 
 
 def rebuild(db):
+    """Full deterministic replay. Runs in ONE transaction: on any error the old projections stay intact."""
+    if db.in_transaction:
+        db.commit()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        _rebuild_body(db)
+    except BaseException:
+        db.rollback()
+        raise
+    db.commit()
+
+
+def _rebuild_body(db):
     for t in PROJ_TABLES:
         db.execute(f"DROP TABLE IF EXISTS {t}")
-    db.executescript(PROJ_SCHEMA)
+    for stmt in PROJ_SCHEMA.split(";"):
+        if stmt.strip():
+            db.execute(stmt)
     events = db.execute("SELECT * FROM events ORDER BY hlc, id").fetchall()
-    status, trust_eff = compute_status(db, events)
+    tg, pa = _link_maps(db)
+    _parents_of = lambda i: pa.get(i, [])
+    status, trust_eff = compute_status(db, events, tg)
     plain = {}
     for e in events:
         if e["type"] in META_TYPES and e["type"] != "event.corrected":
@@ -551,7 +630,7 @@ def rebuild(db):
         return i
     for e in events:   # structural chain (independent of status) so reverting a middle link keeps roots right
         if e["type"] == "event.corrected":
-            par = _parents(db, e["id"])
+            par = _parents_of(e["id"])
             if par:
                 root_of[e["id"]] = par[0]
     eff = {}
@@ -571,22 +650,97 @@ def rebuild(db):
     superseded = set()
     for e in events:
         if active(e["id"]) and e["type"] not in ("event.corrected",):
-            superseded.update(_parents(db, e["id"]))
+            superseded.update(_parents_of(e["id"]))
     for e in events:
         if not active(e["id"]) or e["type"] in META_TYPES or e["id"] not in plain:
             continue
         tr = trust_eff.get(e["id"], e["trust"])
         _apply(db, e, eff.get(e["id"], plain[e["id"]]), tr, e["id"] in superseded)
-    for tbl, col in (("proj_preferences", "subject, key"), ("proj_decisions", "decision_id")):
-        db.execute(f"""UPDATE {tbl} SET conflict=1 WHERE ({col}) IN
-                       (SELECT {col} FROM {tbl} GROUP BY {col} HAVING COUNT(*) > 1)""")
+    _flag_conflicts(db)
     for r in sorted(forked_roots):
         for tbl in ("proj_preferences", "proj_decisions"):
             db.execute(f"UPDATE {tbl} SET conflict=1 WHERE event_id=?", (r,))
-    last = events[-1]["seq"] if events else 0
+    last = db.execute("SELECT COALESCE(MAX(seq),0) FROM events").fetchone()[0]
     for name, v in sorted(PROJ_VERSIONS.items()):
         db.execute("INSERT INTO proj_meta VALUES(?,?,?)", (name, v, last))
-    db.commit()
+    db.execute(CHECKPOINT_SQL)
+    db.execute("INSERT OR REPLACE INTO chain_checkpoint VALUES('projection',?,?)", (last, projection_hash(db)))
+
+
+_CONFLICT_GROUPS = (("proj_preferences", "subject, key"), ("proj_decisions", "decision_id"))
+
+
+def _flag_conflicts(db, event_ids=None):
+    """Group-count conflict flags (shared by rebuild and incremental apply; forked-root flags are rebuild-only).
+    With event_ids, only the groups containing those rows are re-checked (flags only ever go 0 -> 1 here)."""
+    for tbl, col in _CONFLICT_GROUPS:
+        scope = "" if event_ids is None else \
+            f"WHERE ({col}) IN (SELECT {col} FROM {tbl} WHERE event_id IN ({','.join('?' * len(event_ids))}))"
+        db.execute(f"""UPDATE {tbl} SET conflict=1 WHERE ({col}) IN
+                       (SELECT {col} FROM {tbl} {scope} GROUP BY {col} HAVING COUNT(*) > 1)""", list(event_ids or []))
+
+
+# Content types whose projection rows are keyed by event_id, so applying one late (on approval) is order-independent.
+_ORDER_FREE = ("preference.set", "decision.made", "learning.captured")
+
+
+def apply_incremental(db, eid):
+    """Apply one just-inserted event to the projections inside the caller's transaction, using the same
+    _status_step / decrypt_payload / _apply / _flag_conflicts as rebuild(). Returns False (and changes
+    nothing) when the event cannot be applied safely; the caller then runs a full rebuild()."""
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE name='proj_meta'").fetchone():
+        return False
+    e = db.execute("SELECT * FROM events WHERE id=?", (eid,)).fetchone()
+    if _proj_last_seq(db) != e["seq"] - 1:
+        return False
+    if db.execute("SELECT 1 FROM events WHERE hlc>? OR (hlc=? AND id>?) LIMIT 1", (e["hlc"], e["hlc"], eid)).fetchone():
+        return False   # sorts before existing events (merge case): replay order changes
+    t = e["type"]
+    targets, parents = _targets(db, e), _parents(db, eid)
+    if t in META_TYPES and t not in REVIEW_TYPES + ("import.batch_approved",):
+        return False   # corrected / reverted / redacted / shredded: may rewrite earlier state
+    cur = {}
+    for tid in targets:
+        r = db.execute("SELECT status, decided_by, decided_seq FROM proj_status WHERE event_id=?", (tid,)).fetchone()
+        if r is None or r[0] != "proposed":
+            return False
+        cur[tid] = tuple(r)
+    to_apply = []   # (row, trust) of content events that become active now
+    if t in REVIEW_TYPES + ("import.batch_approved",):
+        if parents:
+            return False
+        if t != "event.rejected":
+            for tid in targets:
+                te = db.execute("SELECT * FROM events WHERE id=?", (tid,)).fetchone()
+                if te["type"] not in _ORDER_FREE or _parents(db, tid) or \
+                        db.execute("SELECT 1 FROM event_parents WHERE parent_id=? AND rel='supersedes'", (tid,)).fetchone():
+                    return False
+                to_apply.append(te)
+    status, trust_eff = dict(cur), {}
+    _status_step(status, trust_eff, e, targets)
+    if t not in META_TYPES:
+        p = decrypt_payload(db, e)
+        if p is None:
+            status[eid] = ("redacted", None, None)
+        elif status[eid][0] == "active":
+            if parents and t != "event.corrected":
+                for tbl, _ in _CONFLICT_GROUPS:
+                    rows = db.execute(f"SELECT 1 FROM {tbl} WHERE conflict=1 AND event_id IN ({','.join('?' * len(parents))})",
+                                      parents).fetchone()
+                    if rows:
+                        return False   # un-flagging a conflict group needs the full fold
+                    db.execute(f"DELETE FROM {tbl} WHERE event_id IN ({','.join('?' * len(parents))})", parents)
+            _apply(db, e, p, e["trust"], False)
+    for te in to_apply:
+        p = decrypt_payload(db, te)
+        if p is None:
+            return False
+        _apply(db, te, p, trust_eff.get(te["id"], te["trust"]), False)
+    for i, (st, by, sq) in sorted(status.items()):
+        db.execute("INSERT OR REPLACE INTO proj_status VALUES(?,?,?,?,?)", (i, st, by, sq, trust_eff.get(i)))
+    _flag_conflicts(db, [eid] + [te["id"] for te in to_apply])
+    db.execute("UPDATE proj_meta SET last_seq=?", (e["seq"],))
+    return True
 
 
 def _apply(db, e, p, tr, superseded):
@@ -794,7 +948,9 @@ def main(argv=None):
     p = sp.add_parser("pack"); p.add_argument("--profile", choices=["minimal", "full"], default="full")
     p.add_argument("--max-chars", type=int); p.add_argument("--include-unverified", action="store_true")
     import context_export; context_export.add_parser(sp)
-    sp.add_parser("rebuild"); sp.add_parser("pending"); sp.add_parser("doctor")
+    sp.add_parser("rebuild"); sp.add_parser("pending")
+    sp.add_parser("doctor").add_argument("--full", action="store_true",
+        help="full hash-chain verify from genesis (always on for doctor; open-time checks are incremental)")
     for v in ("approve", "reject"):
         r = sp.add_parser(v); r.add_argument("event_id", nargs="+"); r.add_argument("--reason")
     c = sp.add_parser("correct"); c.add_argument("event_id"); c.add_argument("--field", required=True)

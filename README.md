@@ -81,6 +81,7 @@ Human-only commands require an interactive terminal.
 ```sh
 export VAULT_DB=$HOME/.local/share/lattice-vault/vault.db
 ./vault init                     # once: create the vault (commands never auto-create a missing VAULT_DB)
+./vault keys init-user           # once, after init: create + register your Ed25519 signing key (TTY, confirm fingerprint)
 
 ./vault add preference.set user:ada --key language --payload '{"value":"English"}'
 ./vault add decision.made decision:D-100 --payload '{"decision_id":"D-100","title":"Local-first","decision":"No cloud"}'

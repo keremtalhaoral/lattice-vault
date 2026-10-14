@@ -83,6 +83,23 @@ class SignedApprovals(unittest.TestCase):
         rep = ops.doctor(vault.connect(self.dbp, verify=False))
         self.assertFalse(rep["ok"]); self.assertTrue(any("signature verification" in p for p in rep["problems"]))
 
+    def test_signed_encrypted_event_verifies_when_undecryptable(self):
+        """payload_hash covers payload_ct, so a signature stays valid when the key is missing (payload_state
+        'undecryptable') or shredded; integrity and decryptability are reported separately."""
+        eid, _ = vault.append(self.db, "conflict.resolved", "subject:s", {"reason": "r", "note": "geheim"}, H, "verified",
+                              sensitive=["note"])
+        e = self.db.execute("SELECT * FROM events WHERE id=?", (eid,)).fetchone()
+        self.assertIsNotNone(e["payload_ct"])
+        self.db.close(); vault._KEYSTORE.clear()
+        for f in ("keys.db", "keys.kek"):
+            p = os.path.join(self.d, f)
+            if os.path.exists(p):
+                os.rename(p, p + ".away")
+        db = vault.connect(self.dbp)
+        self.assertEqual(vault.payload_state(db, db.execute("SELECT * FROM events WHERE id=?", (eid,)).fetchone())[1], "undecryptable")
+        self.assertEqual(signing.classify(db)[eid][1], "signed")
+        db.close()
+
     def test_forged_key_id_detected(self):
         vault.review(self.db, self.p, "approve")
         q = agent(self.db, "note.added", "y", {"text": "p2"}); self.db.close()
@@ -369,6 +386,15 @@ class KeyFileAndTTY(unittest.TestCase):
     def test_cli_keys_init_user(self):
         env = {**os.environ, "VAULT_DB": os.path.join(self.d, "v.db"), "VAULT_USER_KEY": os.path.join(self.d, "u.key")}
         run = lambda *a: subprocess.run([sys.executable, os.path.join(HERE, "vault.py"), *a], capture_output=True, text=True, env=env)
+        r = run("keys", "init-user")                                   # before `vault init`: refused, nothing created
+        self.assertEqual(r.returncode, 1); self.assertIn("vault init", r.stderr)
+        self.assertFalse(os.path.exists(env["VAULT_USER_KEY"]))
+        self.assertEqual(run("init").returncode, 0)
+        r = run("search", "x"); self.assertEqual(r.returncode, 0, r.stderr)   # read-only: no key file, no anchor
+        r = run("keys", "show"); self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(os.path.exists(env["VAULT_USER_KEY"]))
+        self.assertFalse(os.path.exists(os.path.join(os.environ["VAULT_CONFIG_DIR"], "anchors",
+                         hashlib.sha256(os.path.abspath(env["VAULT_DB"]).encode()).hexdigest()[:16] + ".anchor.json")))
         r = run("keys", "init-user"); self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("fingerprint", r.stdout); self.assertIn("registered in this vault", r.stdout)
         r = run("keys", "init-user"); self.assertIn("already registered", r.stdout)

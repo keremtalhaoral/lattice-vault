@@ -17,6 +17,7 @@ A human approves everything that becomes "verified".
 ## Hızlı Başlangıç
 - [docs/quickstart.md](docs/quickstart.md) — 2 dakikada kurulum ve ilk komutlar
 - [docs/usage.md](docs/usage.md) — tam kullanım kılavuzu
+- [docs/multi-ai.md](docs/multi-ai.md) — Claude, ChatGPT, Gemini, DeepSeek örnekleri
 
 ## Why
 Context about a person (preferences, decisions, projects, goals) gets scattered across chat tools and

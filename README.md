@@ -14,6 +14,10 @@ Lattice Vault is a local, append-only memory vault for one person that several A
 and *propose* additions to over the [Model Context Protocol](https://modelcontextprotocol.io) (MCP).
 A human approves everything that becomes "verified".
 
+## Hızlı Başlangıç
+- [docs/quickstart.md](docs/quickstart.md) — 2 dakikada kurulum ve ilk komutlar
+- [docs/usage.md](docs/usage.md) — tam kullanım kılavuzu
+
 ## Why
 Context about a person (preferences, decisions, projects, goals) gets scattered across chat tools and
 AI assistants, and a shared Markdown folder is easy to overwrite by accident. The vault keeps:

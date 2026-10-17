@@ -165,10 +165,12 @@ def validate(db, doc):
             r = db.execute("SELECT actor, trust FROM events WHERE id=?", (sup,)).fetchone()
             if not r:
                 raise UpdateRefused(f"{where}: supersedes refers to an unknown event")
-            st = db.execute("SELECT trust_eff FROM proj_status WHERE event_id=?", (sup,)).fetchone()
-            if r["actor"].startswith("user:") or r["trust"] == "verified" or (st and st[0] == "verified"):
+            st = db.execute("SELECT trust_eff, status FROM proj_status WHERE event_id=?", (sup,)).fetchone()
+            if r["actor"].startswith("user:") or r["trust"] == "verified" or not st or st[0] == "verified":
                 # an AI proposal must never block the user's own later writes (double-supersede rule)
                 raise UpdateRefused(f"{where}: supersedes may only target an unverified proposal, not a verified or user fact")
+            if st[1] != "proposed":   # approved/rejected/superseded: the user already decided on it (Security L4r)
+                raise UpdateRefused(f"{where}: supersedes may only target a still-proposed event (status {st[1]!r})")
         cites = e.get("cites", [])
         if not isinstance(cites, list) or len(cites) > 20 or not all(isinstance(c, str) and UUID.fullmatch(c) for c in cites):
             raise UpdateRefused(f"{where}: cites must be a list of full event ids (max 20)")

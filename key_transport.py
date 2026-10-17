@@ -1,42 +1,46 @@
 """Sync key transport PROTOTYPE (roadmap step 1, docs/adr/0013-sync-key-transport.md).
 
 Moves per-subject DEKs (never the KEK, never plaintext DEKs) from one paired device to another in a separate,
-versioned `vaultkeys/0.1` bundle next to the unchanged `vaultsync/0.1` event packages.
+versioned `vaultkeys/0.2` bundle next to the `vaultsync/0.2` event packages (ADR 0016).
 
 * Each device has an X25519 key-agreement (KA) key. The private key is stored in keys.db, wrapped by that device's
   KEK (AES-GCM, AAD 'ka|<device_id>'); it never leaves the device and is never printed.
 * A device KA certificate binds {device_id, X25519 public key} and is signed by the active user Ed25519 key
   (CERT_DOMAIN). A peer certificate is accepted only for a paired, not locally revoked device and only while the
   signing user key is the active user key registered on THIS vault.
-* Per DEK: HPKE-style base mode built from `cryptography` primitives: ephemeral X25519 -> HKDF-SHA256
-  (salt = eph_pub || recipient_pub, info = WRAP_INFO) -> AES-256-GCM. AAD binds protocol version, bundle id, key id,
-  subject, the encrypted event ids, sender and recipient device ids, recipient KA fingerprint and the signing key id.
-* The whole bundle (including every ciphertext) is signed by the user key (BUNDLE_DOMAIN). No unsigned field is used.
+* Per DEK: standard RFC 9180 HPKE, base mode, suite DHKEM(X25519, HKDF-SHA256) / HKDF-SHA256 / AES-256-GCM
+  (`cryptography.hazmat.primitives.hpke`, present in every supported `cryptography` version). The library API has no
+  AAD argument, so the binding (format, bundle id, key id, subject, encrypted event ids, sender and recipient device
+  ids, recipient KA fingerprint, signing key id) goes into the HPKE `info` as WRAP_INFO_DOMAIN || SHA-256(binding).
+* The whole bundle (including every ciphertext, the sender sequence number and the previous bundle hash) is signed by
+  the user key (BUNDLE_DOMAIN). No unsigned field is used. The receiver enforces per-sender monotonic sequence numbers
+  (seqstate.py, stream "vaultkeys"): replays, rollbacks and forks are refused.
+* vaultkeys/0.1 bundles (hand-built HPKE-style wrap, no sequence numbers) are refused; re-export from the sender.
 * The recipient re-wraps each DEK under its own KEK. Shredded or pending-destroy keys are never sent and never
   accepted; a synced, applied `subject.shredded` puts the local copy into pending_destroy with the local grace
   period (apply_remote_shreds), unless its origin is revoked for key transport.
 * The sender device id is NOT cryptographically authenticated: every device holding the user key can sign a
-  certificate for any device id. Device-level authentication needs per-device signing keys (vaultsync/0.2).
+  certificate for any device id. Device-level authentication needs per-device signing keys (future work).
 * Anything that does not verify is recorded in `sync_key_quarantine` (ids and reasons only, no key material) and
   not imported (fail closed).
 """
 import base64, hashlib, json, os, secrets, sys, time
-import signing, vault
+import seqstate, signing, vault
 
-FORMAT = "vaultkeys/0.1"
+FORMAT = "vaultkeys/0.2"
+LEGACY_FORMATS = ("vaultkeys/0.1",)
 CERT_V = "lattice-device-ka-cert/v1"
 CERT_DOMAIN = b"lattice-device-ka-cert/v1\n"
-BUNDLE_DOMAIN = b"lattice-key-bundle-sig/v1\n"
-WRAP_AAD_DOMAIN = b"lattice-key-wrap-aad/v1\n"
-WRAP_INFO = b"lattice-sync-key-transport/v1 x25519-hkdf-sha256-aes256gcm"
+BUNDLE_DOMAIN = b"lattice-key-bundle-sig/v2\n"
+WRAP_INFO_DOMAIN = b"lattice-key-wrap-hpke/v2\n"
 MAX_BUNDLE_BYTES = 16 * 1024 * 1024
 from shredding import SYSTEM_ACTOR, grace_days as shred_grace_days   # noqa: E402,F401
 
 try:
     from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives import hpke, serialization
+    HPKE_SUITE = hpke.Suite(hpke.KEM.X25519, hpke.KDF.HKDF_SHA256, hpke.AEAD.AES_256_GCM)
     HAVE_CRYPTO = True
 except ImportError:  # pragma: no cover
     HAVE_CRYPTO = False
@@ -71,6 +75,10 @@ CREATE TABLE IF NOT EXISTS device_ka (device_id TEXT PRIMARY KEY, pub BLOB NOT N
 
 class KeyTransportError(ValueError):
     pass
+
+
+class SeqRefused(KeyTransportError):
+    """Signed bundle refused by the per-sender sequence check (replay, rollback, fork)."""
 
 
 def _need():
@@ -257,29 +265,21 @@ def _peer_ka(db, dev, keys=None):
 
 
 # ---------------------------------------------------------------- wrap / unwrap
-def _aad(bundle_id, key_id, subject, event_ids, sender, recipient, rfp, signer):
-    return WRAP_AAD_DOMAIN + signing.canon({"v": FORMAT, "bundle_id": bundle_id, "key_id": key_id, "subject": subject,
-                                            "event_ids": event_ids, "sender_device": sender, "recipient_device": recipient,
-                                            "recipient_ka_fp": rfp, "signer_key_id": signer}).encode()
+def _binding(bundle_id, key_id, subject, event_ids, sender, recipient, rfp, signer):
+    """HPKE info for one wrapped DEK: a domain plus the SHA-256 of the canonical binding (fixed length)."""
+    return WRAP_INFO_DOMAIN + hashlib.sha256(signing.canon({
+        "v": FORMAT, "bundle_id": bundle_id, "key_id": key_id, "subject": subject, "event_ids": event_ids,
+        "sender_device": sender, "recipient_device": recipient, "recipient_ka_fp": rfp,
+        "signer_key_id": signer}).encode()).digest()
 
 
-def _kdf(shared, eph_pub, rcpt_pub):
-    if shared == bytes(32):
-        raise KeyTransportError("degenerate X25519 shared secret")
-    return HKDF(algorithm=hashes.SHA256(), length=32, salt=eph_pub + rcpt_pub, info=WRAP_INFO).derive(shared)
+def wrap_dek(dek, rcpt_pub, info):
+    """RFC 9180 HPKE base mode SealBase: returns enc (32 bytes) || ciphertext."""
+    return HPKE_SUITE.encrypt(dek, X25519PublicKey.from_public_bytes(rcpt_pub), info=info)
 
 
-def wrap_dek(dek, rcpt_pub, aad):
-    eph = X25519PrivateKey.generate()
-    eph_pub = eph.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-    k = _kdf(eph.exchange(X25519PublicKey.from_public_bytes(rcpt_pub)), eph_pub, rcpt_pub)
-    n = os.urandom(12)
-    return eph_pub, n + AESGCM(k).encrypt(n, dek, aad)
-
-
-def unwrap_dek(priv, rcpt_pub, eph_pub, ct, aad):
-    k = _kdf(priv.exchange(X25519PublicKey.from_public_bytes(eph_pub)), eph_pub, rcpt_pub)
-    return AESGCM(k).decrypt(ct[:12], ct[12:], aad)
+def unwrap_dek(priv, blob, info):
+    return HPKE_SUITE.decrypt(blob, priv, info=info)
 
 
 # ---------------------------------------------------------------- export
@@ -292,7 +292,7 @@ def _shredded_ids(db):
 
 
 def export_keys(db, recipient, out_path, subjects=None):
-    """Write a signed vaultkeys/0.1 bundle with every live DEK used by an encrypted event in the log, wrapped to
+    """Write a signed vaultkeys/0.2 bundle with every live DEK used by an encrypted event in the log, wrapped to
     `recipient`'s certified KA key. Shredded / pending-destroy keys are skipped. Returns a summary (no secrets)."""
     _need()
     import sync
@@ -313,20 +313,23 @@ def export_keys(db, recipient, out_path, subjects=None):
         if blob is None or state != "active" or kid in shredded:
             skipped.append({"key_id": kid, "reason": "shredded or pending destroy"}); continue
         dek = ks.dek_by_id(kid)
-        aad = _aad(bundle_id, kid, subj, evs[kid], me, recipient, rfp, signer)
-        eph, ct = wrap_dek(dek, rcpt, aad)
-        entries.append({"key_id": kid, "subject": subj, "event_ids": evs[kid], "enc_b64": _b64(eph), "ct_b64": _b64(ct)})
-    b = {"format": FORMAT, "bundle_id": bundle_id, "created_at": vault.now(), "sender_device": me,
-         "recipient_device": recipient, "recipient_ka_fp": rfp, "sender_cert": my_cert, "entries": entries}
-    b["signature"] = {"key_id": signer, "alg": "ed25519", "sig": _b64(priv.sign(_bundle_msg(b)))}
+        info = _binding(bundle_id, kid, subj, evs[kid], me, recipient, rfp, signer)
+        entries.append({"key_id": kid, "subject": subj, "event_ids": evs[kid], "hpke_b64": _b64(wrap_dek(dek, rcpt, info))})
+    seq, prev = seqstate.next_send(db, "vaultkeys")
+    b = {"format": FORMAT, "bundle_id": bundle_id, "created_at": vault.now(), "sender_device": me, "seq": seq,
+         "prev_bundle": prev, "recipient_device": recipient, "recipient_ka_fp": rfp, "sender_cert": my_cert,
+         "entries": entries}
+    msg = _bundle_msg(b)
+    b["signature"] = {"key_id": signer, "alg": "ed25519", "sig": _b64(priv.sign(msg))}
     raw = (vault.canon(b) + "\n").encode()
     tmp = out_path + ".tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "wb") as f:
         f.write(raw); f.flush(); os.fsync(f.fileno())
     os.replace(tmp, out_path)
+    seqstate.commit_send(db, "vaultkeys", seq, seqstate.digest(msg)); db.commit()
     vault.audit(db, vault.HUMAN, "sync_keys_export", "accepted", f"{len(entries)} key(s) to {recipient}")
-    return {"format": FORMAT, "bundle_id": bundle_id, "recipient_device": recipient, "keys": len(entries),
+    return {"format": FORMAT, "bundle_id": bundle_id, "seq": seq, "recipient_device": recipient, "keys": len(entries),
             "skipped": skipped, "bundle_sha256": hashlib.sha256(raw).hexdigest()}
 
 
@@ -343,8 +346,11 @@ def quarantined(db):
 
 def _check_bundle(db, b, me, my_pub, keys):
     """Bundle-level checks. Returns the sender's verified cert pub; raises KeyTransportError (whole bundle refused)."""
-    want = {"format", "bundle_id", "created_at", "sender_device", "recipient_device", "recipient_ka_fp",
-            "sender_cert", "entries", "signature"}
+    want = {"format", "bundle_id", "created_at", "sender_device", "seq", "prev_bundle", "recipient_device",
+            "recipient_ka_fp", "sender_cert", "entries", "signature"}
+    if isinstance(b, dict) and b.get("format") in LEGACY_FORMATS:
+        raise KeyTransportError(f"legacy bundle format {b['format']!r} is no longer accepted; re-export it from the "
+                                f"sending device with this version ({FORMAT})")
     if not isinstance(b, dict) or set(b) != want:
         raise KeyTransportError("malformed bundle")
     if b["format"] != FORMAT:
@@ -366,6 +372,10 @@ def _check_bundle(db, b, me, my_pub, keys):
     verify_cert(db, b["sender_cert"], expect_device=snd, keys=keys)
     if not isinstance(b["entries"], list):
         raise KeyTransportError("malformed entries")
+    try:
+        return seqstate.check(db, "vaultkeys", snd, b["seq"], seqstate.digest(_bundle_msg(b)), b["prev_bundle"])
+    except seqstate.SeqError as x:
+        raise SeqRefused(str(x)) from None
 
 
 def import_keys(db, path, actor=vault.HUMAN):
@@ -373,7 +383,7 @@ def import_keys(db, path, actor=vault.HUMAN):
     bundle; entry-level failures quarantine that entry. Writes are atomic per database. Returns a report (ids only)."""
     _need()
     import sync
-    ensure_schema(db)
+    ensure_schema(db); seqstate.ensure(db)
     if os.path.getsize(path) > MAX_BUNDLE_BYTES:
         raise KeyTransportError("bundle too large")
     raw = open(path, "rb").read()
@@ -386,9 +396,12 @@ def import_keys(db, path, actor=vault.HUMAN):
     priv, my_pub = _device_priv(db)
     keys = signing.registered_keys(db)[0]
     try:
-        _check_bundle(db, b, me, my_pub, keys)
+        seq_state = _check_bundle(db, b, me, my_pub, keys)
     except KeyTransportError as x:
-        _q(db, sha, (b or {}).get("sender_device") if isinstance(b, dict) else None, None, f"bundle refused: {x}")
+        snd0 = b.get("sender_device") if isinstance(b, dict) else None
+        _q(db, sha, snd0 if isinstance(snd0, str) else None, None, f"bundle refused: {x}")
+        if isinstance(x, SeqRefused):
+            seqstate.refuse(db, "vaultkeys", snd0, b.get("seq"), seqstate.digest(_bundle_msg(b)), x)
         db.commit()
         vault.audit(db, actor, "sync_keys_import", "refused", f"bundle {sha[:16]} refused")
         raise
@@ -397,12 +410,13 @@ def import_keys(db, path, actor=vault.HUMAN):
     shredded = _shredded_ids(db)
     local = {r[0]: (r[1], r[2], r[3]) for r in ks.db.execute("SELECT key_id, subject, wrapped_dek, state FROM subject_keys")}
     local_subj = {v[0]: k for k, v in local.items()}
-    rep = {"bundle_sha256": sha, "sender_device": snd, "imported": [], "duplicate": [], "quarantined": {}}
+    mh = seqstate.digest(_bundle_msg(b))
+    rep = {"bundle_sha256": sha, "sender_device": snd, "seq": b["seq"], "seq_state": seq_state, "imported": [], "duplicate": [], "quarantined": {}}
     plan, seen = [], set()
     for e in b["entries"]:
         kid = e.get("key_id") if isinstance(e, dict) else None
         try:
-            if not isinstance(e, dict) or set(e) != {"key_id", "subject", "event_ids", "enc_b64", "ct_b64"} \
+            if not isinstance(e, dict) or set(e) != {"key_id", "subject", "event_ids", "hpke_b64"} \
                     or not isinstance(kid, str) or not isinstance(e["subject"], str) or not isinstance(e["event_ids"], list) \
                     or not e["event_ids"] or not all(isinstance(i, str) for i in e["event_ids"]):
                 raise KeyTransportError("malformed entry")
@@ -415,12 +429,12 @@ def import_keys(db, path, actor=vault.HUMAN):
                 r = db.execute("SELECT enc_key_id, subject FROM events WHERE id=?", (eid,)).fetchone()
                 if not r or r[0] != kid or r[1] != e["subject"]:
                     raise KeyTransportError("key does not match the encrypted events held here (sync the events first)")
-            aad = _aad(bid, kid, e["subject"], e["event_ids"], snd, me, ka_fp(my_pub), signer)
-            eph, ct = _unb64(e["enc_b64"]), _unb64(e["ct_b64"])
-            if len(eph) != 32 or len(ct) < 12 + 16:
+            info = _binding(bid, kid, e["subject"], e["event_ids"], snd, me, ka_fp(my_pub), signer)
+            blob = _unb64(e["hpke_b64"])
+            if len(blob) != 32 + 32 + 16:
                 raise KeyTransportError("malformed wrap")
             try:
-                dek = unwrap_dek(priv, my_pub, eph, ct, aad)
+                dek = unwrap_dek(priv, blob, info)
             except KeyTransportError:
                 raise
             except Exception:
@@ -453,6 +467,7 @@ def import_keys(db, path, actor=vault.HUMAN):
             _q(db, sha, snd, kid, why)
         for kid, _, _ in plan:
             db.execute("INSERT OR IGNORE INTO sync_key_imports(bundle_sha256, key_id, sender_device) VALUES(?,?,?)", (sha, kid, snd))
+        seqstate.record(db, "vaultkeys", snd, b["seq"], mh, b["prev_bundle"])
         db.commit()
     except Exception:
         db.rollback(); raise

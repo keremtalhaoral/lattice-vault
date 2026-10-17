@@ -1165,7 +1165,7 @@ def pack(db, profile="full", max_chars=None, include_unverified=False):
 
 # ---------- CLI ----------
 HUMAN_CMDS = {"add", "approve", "reject", "correct", "revert", "import-approve", "revert-import", "redact",
-              "shred-cancel", "shred-finalize", "agent-add", "agent-revoke", "review-verdict", "migrate", "sync-pair", "backup", "backup-keys", "backup-kek", "restore"}
+              "shred-cancel", "shred-finalize", "agent-add", "agent-revoke", "review-verdict", "migrate", "sync-pair", "sync-seq-advance", "backup", "backup-keys", "backup-kek", "restore"}
 
 
 def _tip(db, event_id):
@@ -1258,6 +1258,10 @@ def main(argv=None):
     sk.add_argument("--out", help="cert/export: output file"); sk.add_argument("--to", help="export: recipient DEVICE")
     sk.add_argument("--subject", action="append", help="export: only keys of these subjects")
     sk.add_argument("--reason", help="revoke-peer: reason")
+    sp.add_parser("sync-seq", help="show this device's send counters and refused artefacts (ADR 0016)")
+    ssa2 = sp.add_parser("sync-seq-advance", help="human-only recovery after restoring an old backup: move this "
+                         "device's send counter forward so peers accept its next package/bundle (ADR 0016)")
+    ssa2.add_argument("--stream", required=True, choices=["vaultsync", "vaultkeys"]); ssa2.add_argument("--to", required=True, type=int)
     spr = sp.add_parser("sync-pair", help="register another device of the owner (human-only)")
     spr.add_argument("device"); spr.add_argument("--name", required=True)
     bk = sp.add_parser("backup", help="consistent online copy of vault.db (never keys.db) with manifest.json")
@@ -1508,6 +1512,14 @@ def main(argv=None):
                 raise ValueError("confirmation did not match; nothing changed")
             print(json.dumps({"destroyed_key": ops.shred_finalize(db, args.subject),
                               "note": "delete keys backups taken before now: they can still decrypt this subject"}))
+        elif args.cmd in ("sync-seq", "sync-seq-advance"):
+            import seqstate
+            if args.cmd == "sync-seq-advance":
+                print(json.dumps({"stream": args.stream, "seq": seqstate.advance(db, args.stream, args.to)}))
+            else:
+                seqstate.ensure(db)
+                print(json.dumps({"send": {r[0]: r[1] for r in db.execute("SELECT stream, seq FROM sync_seq_send")},
+                                  "refused": seqstate.refused(db)}, ensure_ascii=False))
         elif args.cmd in ("sync-export", "sync-import", "device-id", "sync-pair", "sync-quarantine"):
             import sync
             if args.cmd in ("sync-export", "sync-import", "sync-pair"):

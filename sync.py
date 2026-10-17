@@ -2,8 +2,10 @@
 
 Quarantined events are kept with their full origin row and stay retryable: `vault sync-quarantine --release`
 re-verifies them against the current key registry/pairings (release_quarantined), independent of peer watermarks.
-Not for real data: packages are unsigned and redaction does not propagate. DEKs move in separate signed
-vaultkeys/0.1 bundles (key_transport.py, ADR 0013); an applied subject.shredded schedules the local DEK for destroy.
+Packages (vaultsync/0.2, ADR 0016) carry a manifest signed by the active user key: sender device, a monotonic
+per-sender sequence number with the previous package hash (seqstate.py), the vector used for peer watermarks and the
+body hash. vaultsync/0.1 (unsigned) packages are refused. Redaction does not propagate. DEKs move in separate signed
+vaultkeys/0.2 bundles (key_transport.py, ADR 0013/0016); an applied subject.shredded schedules the local DEK for destroy.
 Human-only events are applied only with a valid user signature (signing.py, #10) from a key registered on this vault and
 a paired origin device; all other user:*/human-only events are quarantined (sync_quarantine), never applied.
 Integration with main: incoming plaintext payloads are upcast (schemas.upcast) and validated against the current
@@ -12,13 +14,17 @@ are stored as-is and kept out of projections by rebuild() (unknown_version). Aft
 rebuilt in full (imported events may sort before local ones, which apply_incremental refuses by design);
 rebuild() also refreshes the projection checkpoint.
 
-Package = line 1: manifest JSON; lines 2..n: body JSONL (one origin event per line, sorted by (hlc, id)).
+Package = line 1: signed manifest JSON; lines 2..n: body JSONL (one origin event per line, sorted by (hlc, id)).
 No network code. Additive schema only (CREATE TABLE IF NOT EXISTS); existing tables/triggers untouched.
 """
 import base64, hashlib, json, os, secrets, time
-import schemas, signing, vault
+import schemas, seqstate, signing, vault
 
-FORMAT = "vaultsync/0.1"
+FORMAT = "vaultsync/0.2"
+LEGACY_FORMATS = ("vaultsync/0.1",)
+MANIFEST_DOMAIN = b"lattice-sync-manifest/v2\n"
+MANIFEST_KEYS = {"format", "source_device", "created_at", "seq", "prev_package", "vector", "since", "event_count",
+                 "body_sha256", "signature"}
 MAX_SKEW_MS = int(os.environ.get("VAULT_SYNC_MAX_SKEW_MS", str(5 * 60 * 1000)))   # remote HLC may be ≤ 5 min ahead
 
 SCHEMA = """
@@ -28,7 +34,7 @@ CREATE TABLE IF NOT EXISTS sync_imported (            -- chain-of-imports record
   origin_row TEXT NOT NULL CHECK (json_valid(origin_row)), package_sha256 TEXT NOT NULL,
   quarantined INTEGER NOT NULL DEFAULT 0,
   at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
-CREATE TABLE IF NOT EXISTS sync_quarantine (          -- held, NOT in events: never projected, never verified (no signing yet)
+CREATE TABLE IF NOT EXISTS sync_quarantine (          -- held, NOT in events: never projected; release re-verifies each event
   event_id TEXT PRIMARY KEY, origin_device TEXT NOT NULL, type TEXT NOT NULL, actor TEXT NOT NULL,
   origin_row TEXT NOT NULL CHECK (json_valid(origin_row)), package_sha256 TEXT NOT NULL, reason TEXT NOT NULL,
   at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
@@ -45,8 +51,8 @@ class SyncError(ValueError):
     pass
 
 
-UNSUPPORTED_WARNING = ("WARNING: multi-device sync is an unsigned, file-based prototype. Do not use it with real data: no package signing, "
-                       "key transport only via signed vaultkeys bundles (ADR 0013), no redaction propagation. Unsigned user:*/approval events are quarantined, not applied.")
+UNSUPPORTED_WARNING = ("WARNING: multi-device sync is a file-based prototype: signed packages with sequence numbers (ADR 0016), "
+                       "key transport via signed vaultkeys bundles, no redaction propagation. Unsigned user:*/approval events are quarantined, not applied.")
 
 
 def _schema_problem(e):
@@ -264,17 +270,47 @@ def export(db, out_path, since_peer=None):
     for dev, row in _origin_rows(db, me):
         k = _vkey(dev, row)
         vector[k] = max(vector.get(k, 0), row["replica_seq"])
+        if row["type"] in signing.KEY_TYPES:
+            continue   # key registry events are never applied from a package; each device registers the user key itself
         if row["replica_seq"] > known.get(k, 0):
             lines.append(vault.canon({"origin_device": dev, **row}))
     body = ("\n".join(lines) + "\n" if lines else "").encode()
-    manifest = {"format": FORMAT, "source_device": me, "created_at": vault.now(), "vector": vector,
-                "since": known, "event_count": len(lines), "body_sha256": hashlib.sha256(body).hexdigest(),
-                "signature": None}
+    priv, kid = signing._current_user_key(db)        # fail before anything is written or counted
+    seq, prev = seqstate.next_send(db, "vaultsync")
+    manifest = {"format": FORMAT, "source_device": me, "created_at": vault.now(), "seq": seq, "prev_package": prev,
+                "vector": vector, "since": known, "event_count": len(lines),
+                "body_sha256": hashlib.sha256(body).hexdigest()}
+    msg = _manifest_msg(manifest)
+    manifest["signature"] = {"key_id": kid, "alg": "ed25519", "sig": base64.b64encode(priv.sign(msg)).decode()}
     tmp = out_path + ".tmp"
     with open(tmp, "wb") as f:
         f.write(vault.canon(manifest).encode() + b"\n" + body)
     os.replace(tmp, out_path)
+    seqstate.commit_send(db, "vaultsync", seq, seqstate.digest(msg)); db.commit()
     return manifest
+
+
+def _manifest_msg(m):
+    return MANIFEST_DOMAIN + signing.canon({k: v for k, v in m.items() if k != "signature"}).encode()
+
+
+def _verify_manifest(db, m):
+    """Raise SyncError unless the manifest is a well-formed vaultsync/0.2 manifest signed by the active user key
+    registered on this vault. Everything used afterwards (sender, seq, prev, vector, body hash) is covered."""
+    if not isinstance(m, dict) or set(m) != MANIFEST_KEYS:
+        raise SyncError("malformed manifest")
+    sg = m["signature"]
+    if not isinstance(sg, dict) or set(sg) != {"key_id", "alg", "sig"} or sg["alg"] != "ed25519" or not isinstance(sg["sig"], str):
+        raise SyncError("unsigned or malformed manifest signature")
+    if not signing.HAVE_CRYPTO:
+        raise SyncError("package signature not verifiable here (cryptography not installed)")
+    import key_transport
+    pub = key_transport._active_user_pub(db, sg["key_id"])
+    if not pub or not signing._verify(pub, sg["sig"], _manifest_msg(m)):
+        raise SyncError("bad package signature (not the active user key of this vault)")
+    if not isinstance(m["source_device"], str) or not isinstance(m["vector"], dict) or \
+            not all(isinstance(k, str) and type(v) is int and v >= 0 for k, v in m["vector"].items()):
+        raise SyncError("malformed manifest fields")
 
 
 def _parse(path):
@@ -284,6 +320,11 @@ def _parse(path):
         m = json.loads(head)
     except ValueError:
         raise SyncError("not a .vaultsync package (bad manifest)")
+    if not isinstance(m, dict):
+        raise SyncError("not a .vaultsync package (bad manifest)")
+    if m.get("format") in LEGACY_FORMATS:
+        raise SyncError(f"{m.get('format')} packages are unsigned and no longer accepted; re-export on the sending "
+                        f"device with this version ({FORMAT})")
     if m.get("format") != FORMAT:
         raise SyncError(f"unsupported package format {m.get('format')!r}")
     if hashlib.sha256(body).hexdigest() != m.get("body_sha256"):
@@ -332,11 +373,21 @@ def import_package(db, path, dry_run=False, now_ms=None, _trust_unsigned=False):
     m, evs = _parse(path)
     now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
     me = device_id(db, create=not dry_run)
+    _verify_manifest(db, m)
+    mh = seqstate.digest(_manifest_msg(m))
+    if m["source_device"] == me:
+        raise SyncError("package was exported by this device")
+    try:
+        seq_state = seqstate.check(db, "vaultsync", m["source_device"], m["seq"], mh, m["prev_package"])
+    except seqstate.SeqError as x:
+        if not dry_run:
+            seqstate.refuse(db, "vaultsync", m["source_device"], m["seq"], mh, x)
+        raise SyncError(f"package refused: {x}") from None
     paired = {r[0] for r in db.execute("SELECT replica_id FROM replicas")} | {me}
     have = {r[0] for r in db.execute("SELECT id FROM events")}
     held = _held_ids(db)
     rep = {"source_device": m["source_device"], "events": len(evs), "new": 0, "duplicate": 0, "quarantined": 0,
-           "skipped": [], "dry_run": dry_run}
+           "skipped": [], "dry_run": dry_run, "seq": m["seq"], "seq_state": seq_state}
     todo, skew = [], []
     for e in sorted(evs, key=lambda x: (x["hlc"], x["id"])):
         row = _verify_event(e)
@@ -383,7 +434,7 @@ def import_package(db, path, dry_run=False, now_ms=None, _trust_unsigned=False):
     rep["quarantined"] += len(hold)
     if dry_run:
         return rep
-    ensure_schema(db)
+    ensure_schema(db); seqstate.ensure(db)   # executescript commits: run DDL before the import transaction
     try:
         prev = (db.execute("SELECT hash FROM events ORDER BY seq DESC LIMIT 1").fetchone() or [vault.GENESIS])[0]
         for e, local, q in plan:
@@ -393,10 +444,18 @@ def import_package(db, path, dry_run=False, now_ms=None, _trust_unsigned=False):
             db.execute("INSERT OR IGNORE INTO sync_quarantine(event_id, origin_device, type, actor, origin_row, package_sha256, reason) "
                        "VALUES(?,?,?,?,?,?,?)", (e["id"], e["origin_device"], e["type"], e["actor"], vault.canon(orig),
                                                  m["body_sha256"], why))
-        # the source device holds everything in its vector -> watermark for `--since-peer <source>`
+        # the source device holds everything in its (signed) vector -> watermark for `--since-peer <source>`.
+        # Capped at what this device itself holds, so a watermark can never claim more than was really exchanged.
+        mine = {}
+        for dev, row in _origin_rows(db, me):
+            k = _vkey(dev, row); mine[k] = max(mine.get(k, 0), row["replica_seq"])
         for k, v in m["vector"].items():
+            v = min(v, mine.get(k, 0))
+            if v <= 0:
+                continue
             db.execute("""INSERT INTO sync_peer_state VALUES(?,?,?) ON CONFLICT(peer_replica_id, origin_replica)
                           DO UPDATE SET max_replica_seq=max(max_replica_seq, excluded.max_replica_seq)""", (m["source_device"], k, v))
+        seqstate.record(db, "vaultsync", m["source_device"], m["seq"], mh, m["prev_package"])
         db.execute("INSERT OR IGNORE INTO sync_packages(body_sha256, source_device, report) VALUES(?,?,?)",
                    (m["body_sha256"], m["source_device"], json.dumps(rep)))
         db.commit()

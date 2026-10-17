@@ -8,6 +8,16 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 U = "user:owner"
 
 
+def resign(m, db):
+    """Re-sign a modified manifest with the user key: models a package writer that holds the user key, so the
+    event-level checks below the (valid) package signature are what is being tested."""
+    import base64
+    priv, kid = signing._current_user_key(db)
+    m = {k: v for k, v in m.items() if k != "signature"}
+    m["signature"] = {"key_id": kid, "alg": "ed25519", "sig": base64.b64encode(priv.sign(sync._manifest_msg(m))).decode()}
+    return vault.canon(m).encode()
+
+
 class SyncTest(unittest.TestCase):
     def setUp(self):
         for k in ("VAULT_KEYS_DB", "VAULT_KEK_FILE", "VAULT_PASSPHRASE", "VAULT_AGENTS"):
@@ -17,6 +27,8 @@ class SyncTest(unittest.TestCase):
         self.A, self.B = self.mk("a"), self.mk("b")
         self.da, self.db_ = sync.device_id(self.A), sync.device_id(self.B)
         sync.pair(self.A, self.db_, "B"); sync.pair(self.B, self.da, "A")
+        for x in (self.A, self.B):   # packages are signed by the user key (vaultsync/0.2): same owner on both devices
+            signing.register_user_key(x)
 
     def imp(self, db, path, **kw):   # pre-quarantine semantics (paired user:* trusted) for the merge/conflict mechanics tests
         return sync.import_package(db, path, _trust_unsigned=True, **kw)
@@ -29,11 +41,13 @@ class SyncTest(unittest.TestCase):
         p = os.path.join(self.d, name); sync.export(src, p, **kw); return p
 
     def sem(self, db):   # projection_hash includes local seq (decided_seq), so compare the semantic content instead
-        return [list(r) for r in db.execute("SELECT event_id, status, decided_by FROM proj_status ORDER BY 1")] + \
+        # each device registers the user key itself (key.* events are not synced): compare everything else
+        return [list(r) for r in db.execute("SELECT s.event_id, s.status, s.decided_by FROM proj_status s JOIN events e ON "
+                                            "e.id=s.event_id WHERE e.type NOT LIKE 'key.%' ORDER BY 1")] + \
                [list(r) for r in db.execute("SELECT * FROM proj_preferences ORDER BY 1,2,4")]
 
     def count(self, db):
-        return db.execute("SELECT count(*) FROM events").fetchone()[0]
+        return db.execute("SELECT count(*) FROM events WHERE type NOT LIKE 'key.%'").fetchone()[0]
 
     def pref(self, db, key="dil"):
         return sorted(tuple(r) for r in db.execute("SELECT value, conflict FROM proj_preferences WHERE key=?", (key,)))
@@ -70,10 +84,14 @@ class SyncTest(unittest.TestCase):
         open(p, "w", encoding="utf-8").write(raw.replace("Türkçe", "Almanca"))
         with self.assertRaisesRegex(sync.SyncError, "sha256"):
             self.imp(self.B, p)
-        # attacker also fixes the body sha256 -> per-event hash still catches it
+        # fixing the body sha256 breaks the manifest signature (vaultsync/0.2)
         head, body = raw.split("\n", 1); body = body.replace("Türkçe", "Almanca")
         m = json.loads(head); import hashlib; m["body_sha256"] = hashlib.sha256(body.encode()).hexdigest()
         open(p, "w", encoding="utf-8").write(json.dumps(m) + "\n" + body)
+        with self.assertRaisesRegex(sync.SyncError, "bad package signature"):
+            self.imp(self.B, p)
+        # even a writer holding the user key cannot change an event: the per-event hash still catches it
+        open(p, "wb").write(resign(m, self.A) + b"\n" + body.encode())
         with self.assertRaisesRegex(sync.SyncError, "hash mismatch"):
             self.imp(self.B, p)
         self.assertEqual(self.count(self.B), 0)
@@ -121,9 +139,10 @@ class SyncTest(unittest.TestCase):
         vault.append(C, "preference.set", U, {"key": "dil", "value": "Klingonca"}, U, "verified")
         vault.append(C, "event.approved", "event:x", {}, U, "verified")
         r = self.imp(self.B, self.pkg(C, "c.vaultsync"))
-        # skipped: the approval AND C's user + recovery key.registered (signed human-only types, unpaired device)
-        self.assertEqual((r["new"], r["quarantined"], len(r["skipped"])), (1, 1, 3))
-        e = self.B.execute("SELECT e.actor, e.trust, s.status FROM events e JOIN proj_status s ON s.event_id=e.id").fetchone()
+        # skipped: the approval (signed human-only type, unpaired device); key.* events are never exported
+        self.assertEqual((r["new"], r["quarantined"], len(r["skipped"])), (1, 1, 1))
+        e = self.B.execute("SELECT e.actor, e.trust, s.status FROM events e JOIN proj_status s ON s.event_id=e.id "
+                           "WHERE e.type NOT LIKE 'key.%'").fetchone()
         self.assertTrue(e[0].startswith("import:sync-")); self.assertEqual((e[1], e[2]), ("unverified", "proposed"))
         self.assertEqual(self.pref(self.B), [])   # not in the active projection until approved
 
@@ -158,7 +177,7 @@ class SyncTest(unittest.TestCase):
         bdb = os.path.join(self.d, "b", "v.db")
         r = run("sync-import", out, "--dry-run", db=bdb); self.assertEqual(json.loads(r.stdout)["quarantined"], 1)
         r = run("sync-import", out, db=bdb); self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("Do not use it with real data", r.stderr)
+        self.assertIn("file-based prototype", r.stderr)
         r = run("sync-import", out, db=bdb); self.assertEqual((json.loads(r.stdout)["new"], json.loads(r.stdout)["duplicate"]), (0, 1))
         q = json.loads(run("sync-quarantine", db=bdb).stdout)
         self.assertEqual([(x["actor"], x["reason"]) for x in q], [(U, "unsigned user:* event")])
@@ -190,7 +209,8 @@ class SyncTest(unittest.TestCase):
         u = vault.append(self.A, "learning.captured", "y", {"text": "sahte"}, U, "verified")[0]
         r = sync.import_package(self.B, self.pkg(self.A))
         self.assertEqual((r["new"], r["quarantined"]), (1, 1))
-        row = self.B.execute("SELECT e.actor, e.trust, s.status FROM events e JOIN proj_status s ON s.event_id=e.id").fetchall()
+        row = self.B.execute("SELECT e.actor, e.trust, s.status FROM events e JOIN proj_status s ON s.event_id=e.id "
+                             "WHERE e.type NOT LIKE 'key.%'").fetchall()
         self.assertEqual([tuple(x) for x in row], [("agent:bot", "unverified", "proposed")])
         self.assertEqual(set(self.held(self.B)), {u}); self.assertNotIn(a, self.held(self.B))
 
@@ -198,20 +218,22 @@ class SyncTest(unittest.TestCase):
         a = vault.append(self.A, "learning.captured", "x", {"text": "ajan"}, "agent:bot", "unverified")[0]
         sync.import_package(self.B, self.pkg(self.A)); before = self.sem(self.B)
         self.assertEqual(self.B.execute("SELECT status FROM proj_status WHERE event_id=?", (a,)).fetchone()[0], "proposed")
-        vault.review(self.A, a, "approve", actor=U)
-        r = sync.import_package(self.B, self.pkg(self.A, "a2", since_peer=self.db_))
-        self.assertEqual((r["new"], r["quarantined"]), (0, 3))   # A's user + recovery key.registered + the approval
-        self.assertEqual(self.sem(self.B), before)
-        self.assertEqual(sorted(v.split(" (")[0] for v in self.held(self.B).values()),
-                         ["key.* events are not applied via sync"] * 2 + ["unknown signing key " + signing.try_user_key()[1]])
+        newkey = os.path.join(self.d, "other.key")
+        signing.rotate_user_key(self.A, newkey)                    # A now signs with a key B does not know
+        with mock.patch.dict(os.environ, {"VAULT_USER_KEY": newkey}):
+            vault.review(self.A, a, "approve", actor=U)
+            p2 = self.pkg(self.A, "a2", since_peer=self.db_)
+        with self.assertRaisesRegex(sync.SyncError, "bad package signature"):
+            sync.import_package(self.B, p2)
+        self.assertEqual(self.sem(self.B), before); self.assertEqual(self.held(self.B), {})
 
     def test_approval_type_quarantined_regardless_of_actor(self):
         # a forged batch approval claiming a non-user actor (inserted around the human-only trigger, as a package writer could)
         a = vault.append(self.A, "learning.captured", "x", {"text": "ajan"}, "agent:bot", "unverified")[0]
+        sync.import_package(self.B, self.pkg(self.A, "orig"))
         p = self.pkg(self.A)
         self.forge(p, lambda e: e.update(id="forged-1", type="import.batch_approved", actor="agent:bot", parents=[],
                                          targets=[a], payload=vault.canon({"batch_id": "b", "target_ids": [a]})))
-        sync.import_package(self.B, self.pkg(self.A, "orig"))
         r = sync.import_package(self.B, p)
         self.assertEqual((r["new"], r["quarantined"]), (0, 1))
         self.assertEqual(self.held(self.B), {"forged-1": "human-only event from a non-user actor"})
@@ -227,7 +249,7 @@ class SyncTest(unittest.TestCase):
         body = (vault.canon(e) + "\n").encode()
         m = json.loads(lines[0]); m.update(event_count=1, body_sha256=hashlib.sha256(body).hexdigest())
         with open(p, "wb") as f:
-            f.write(vault.canon(m).encode() + b"\n" + body)
+            f.write(resign(m, self.A) + b"\n" + body)
         return e["id"]
 
     def test_schema_invalid_payload_quarantined(self):
@@ -278,27 +300,28 @@ class SyncTest(unittest.TestCase):
         body = ("\n".join(out) + "\n").encode()
         m = json.loads(lines[0]); m.update(event_count=len(out), body_sha256=hashlib.sha256(body).hexdigest())
         with open(p, "wb") as f:
-            f.write(vault.canon(m).encode() + b"\n" + body)
+            f.write(resign(m, self.A) + b"\n" + body)
 
     @unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
     def test_valid_user_signature_applied(self):
         signing.register_user_key(self.B)                  # receiver knows the same user key (key.registered on B)
         a, ap, p = self.approval_pkg()
         r = sync.import_package(self.B, p)
-        self.assertEqual((r["new"], r["quarantined"]), (2, 2))   # agent event + approval; A's two key.registered held
+        self.assertEqual((r["new"], r["quarantined"]), (2, 0))   # agent event + approval
         self.assertEqual(self.B.execute("SELECT status FROM proj_status WHERE event_id=?", (a,)).fetchone()[0], "active")
         self.assertNotIn(ap, self.held(self.B))
         self.assertEqual(signing.classify(self.B)[ap][1], "remote-signed")   # origin signature re-verified from origin_row
         r = sync.import_package(self.B, p)                  # idempotent
-        self.assertEqual((r["new"], r["quarantined"], r["duplicate"]), (0, 0, 4))
-        self.assertEqual(len(sync.quarantined(self.B)), 2)
+        self.assertEqual((r["new"], r["quarantined"], r["duplicate"], r["seq_state"]), (0, 0, 2, "duplicate"))
+        self.assertEqual(len(sync.quarantined(self.B)), 0)
 
     @unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
-    def test_signed_but_key_not_registered_on_receiver_quarantined(self):
+    def test_package_from_unknown_user_key_refused(self):
         a, ap, p = self.approval_pkg()
-        sync.import_package(self.B, p)
-        self.assertTrue(self.held(self.B)[ap].startswith("unknown signing key user/ed25519/"))
-        self.assertEqual(self.B.execute("SELECT status FROM proj_status WHERE event_id=?", (a,)).fetchone()[0], "proposed")
+        C = self.mk("nokey"); sync.pair(C, self.da, "A")        # paired, but no user key registered here
+        with self.assertRaisesRegex(sync.SyncError, "bad package signature"):
+            sync.import_package(C, p)
+        self.assertEqual(self.count(C), 0); self.assertEqual(self.held(C), {})
 
     @unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
     def test_forged_or_stripped_signature_quarantined(self):
@@ -331,25 +354,29 @@ class SyncTest(unittest.TestCase):
         return db.execute("SELECT status FROM proj_status WHERE event_id=?", (eid,)).fetchone()[0]
 
     @unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
-    def test_release_after_key_registered(self):
+    def unpaired_receiver(self, name="c"):
+        """A device of the same owner (user key registered) that has not paired A yet: A's signed approvals are held."""
+        C = self.mk(name); signing.register_user_key(C); return C
+
+    def test_release_after_pairing(self):
         a, ap, p = self.approval_pkg()
-        sync.import_package(self.B, p)
-        self.assertIn(ap, self.held(self.B))
-        r = sync.release_quarantined(self.B)                       # key still unknown: nothing released
+        C = self.unpaired_receiver()
+        sync.import_package(C, p)
+        self.assertIn(ap, self.held(C))
+        r = sync.release_quarantined(C)                             # origin still unpaired: nothing released
         self.assertEqual(r["released"], []); self.assertIn(ap, r["still_held"])
-        signing.register_user_key(self.B)
-        r = sync.release_quarantined(self.B, dry_run=True)
-        self.assertEqual(r["released"], [ap]); self.assertEqual(self.st(self.B, a), "proposed")
-        r = sync.release_quarantined(self.B)
+        sync.pair(C, self.da, "A")
+        r = sync.release_quarantined(C, dry_run=True)
+        self.assertEqual(r["released"], [ap]); self.assertEqual(self.st(C, a), "proposed")
+        r = sync.release_quarantined(C)
         self.assertEqual(r["released"], [ap])
-        self.assertTrue(any(v.startswith("key.* events") for v in r["still_held"].values()))   # A's key.registered stays held
-        self.assertEqual(self.st(self.B, a), "active")
-        self.assertNotIn(ap, self.held(self.B))
-        self.assertEqual(signing.classify(self.B)[ap][1], "remote-signed")
-        self.assertEqual(vault.verify_chains(self.B), [])
+        self.assertEqual(self.st(C, a), "active")
+        self.assertNotIn(ap, self.held(C))
+        self.assertEqual(signing.classify(C)[ap][1], "remote-signed")
+        self.assertEqual(vault.verify_chains(C), [])
         with self.assertRaises(sync.SyncError):                     # already released
-            sync.release_quarantined(self.B, [ap])
-        r = sync.import_package(self.B, p)                          # re-import stays a no-op
+            sync.release_quarantined(C, [ap])
+        r = sync.import_package(C, p)                               # re-import stays a no-op
         self.assertEqual(r["new"], 0)
 
     @unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
@@ -374,8 +401,9 @@ class SyncTest(unittest.TestCase):
     @unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
     def test_reimport_reports_still_quarantined(self):
         a, ap, p = self.approval_pkg()
-        sync.import_package(self.B, p)
-        r = sync.import_package(self.B, self.pkg(self.A, "again"))
+        C = self.unpaired_receiver()
+        sync.import_package(C, p)
+        r = sync.import_package(C, self.pkg(self.A, "again"))
         self.assertGreaterEqual(r.get("still_quarantined", 0), 1)
 
     @unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
@@ -397,8 +425,9 @@ class SyncTest(unittest.TestCase):
     @unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
     def test_cli_release(self):
         a, ap, p = self.approval_pkg()
-        sync.import_package(self.B, p); signing.register_user_key(self.B); self.B.commit()
-        env = {**os.environ, "VAULT_DB": os.path.join(self.d, "b", "v.db")}
+        C = self.unpaired_receiver()
+        sync.import_package(C, p); sync.pair(C, self.da, "A"); C.commit()
+        env = {**os.environ, "VAULT_DB": os.path.join(self.d, "c", "v.db")}
         run = lambda *x: subprocess.run([sys.executable, os.path.join(HERE, "vault.py"), *x], capture_output=True, text=True, env=env)
         r = run("sync-quarantine", "--release", "--dry-run"); self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(json.loads(r.stdout)["released"], [ap])
@@ -438,12 +467,12 @@ class SyncTest(unittest.TestCase):
         a, ap, p = self.applied_approval()
         signing.rotate_user_key(self.B, os.path.join(self.d, "rot.key"))
         self.assertEqual(signing.classify(self.B)[ap][1], "remote-signed")   # imported before the revocation: valid
-        # the same signed approval arriving AFTER the revocation (any HLC) is never accepted: Security (a)
+        # the same package arriving AFTER the revocation is refused as a whole: its manifest is signed by a revoked key
         C = self.mk("c2"); sync.pair(C, self.da, "A"); signing.register_user_key(C)
         signing.rotate_user_key(C, os.path.join(self.d, "rotc.key"))
-        sync.import_package(C, p)
-        self.assertEqual(self.held(C)[ap], "revoked key (imported after revocation)")
-        self.assertEqual(sync.release_quarantined(C, [ap])["released"], [])   # B2: release with a revoked key
+        with self.assertRaisesRegex(sync.SyncError, "bad package signature"):
+            sync.import_package(C, p)
+        self.assertNotIn(ap, self.held(C))
         # a revoked-key status in doctor terms: force the local copy to sit after the revocation
         keys = signing.registered_keys(self.B)[0]
         kid = json.loads(self.B.execute("SELECT origin_row FROM sync_imported WHERE event_id=?", (ap,)).fetchone()[0])["sig"]["key_id"]
@@ -469,14 +498,15 @@ class SyncTest(unittest.TestCase):
         rv = vault.append(self.A, "event.reverted", f"event:{a}", {"reason": "undo"}, U, "verified", target_id=a,
                           supersedes=ap)[0]
         p = self.pkg(self.A, "child")
-        sync.import_package(self.B, p)
-        self.assertIn(ap, self.held(self.B)); self.assertIn(rv, self.held(self.B))
-        signing.register_user_key(self.B)
-        r = sync.release_quarantined(self.B, [rv])                         # child alone: parent still held
+        C = self.unpaired_receiver()
+        sync.import_package(C, p)
+        self.assertIn(ap, self.held(C)); self.assertIn(rv, self.held(C))
+        sync.pair(C, self.da, "A")
+        r = sync.release_quarantined(C, [rv])                              # child alone: parent still held
         self.assertEqual(r["released"], []); self.assertEqual(r["still_held"][rv], "parent quarantined")
-        r = sync.release_quarantined(self.B, [rv, ap])                     # both: parent first, then child
+        r = sync.release_quarantined(C, [rv, ap])                          # both: parent first, then child
         self.assertEqual(r["released"], [ap, rv])
-        self.assertEqual(vault.verify_chains(self.B), [])
+        self.assertEqual(vault.verify_chains(C), [])
 
     @unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
     def test_b2_legacy_user_content_never_released(self):
@@ -489,18 +519,19 @@ class SyncTest(unittest.TestCase):
     @unittest.skipUnless(HAVE_CRYPTO, "cryptography not installed")
     def test_release_is_signed_attestation_and_listed(self):
         a, ap, p = self.approval_pkg()
-        sync.import_package(self.B, p); signing.register_user_key(self.B)
-        r = sync.release_quarantined(self.B, [ap])
+        C = self.unpaired_receiver()
+        sync.import_package(C, p); sync.pair(C, self.da, "A")
+        r = sync.release_quarantined(C, [ap])
         att = r["attestation"]
-        row = self.B.execute("SELECT type, actor FROM events WHERE id=?", (att,)).fetchone()
+        row = C.execute("SELECT type, actor FROM events WHERE id=?", (att,)).fetchone()
         self.assertEqual(row["type"], "attestation.recorded")
-        self.assertEqual(signing.classify(self.B)[att][1], "signed")
-        listed = {x["event_id"]: x for x in sync.quarantined(self.B, include_released=True)}
+        self.assertEqual(signing.classify(C)[att][1], "signed")
+        listed = {x["event_id"]: x for x in sync.quarantined(C, include_released=True)}
         self.assertEqual(listed[ap]["released_attestation"], att)
-        self.assertNotIn(ap, {x["event_id"] for x in sync.quarantined(self.B)})
-        self.B.commit()
-        anchor = json.load(open(signing.anchor_path(os.path.join(self.d, "b", "v.db"))))   # N3: anchor is current
-        self.assertEqual(anchor["events"]["seq"], self.B.execute("SELECT MAX(seq) FROM events").fetchone()[0])
+        self.assertNotIn(ap, {x["event_id"] for x in sync.quarantined(C)})
+        C.commit()
+        anchor = json.load(open(signing.anchor_path(os.path.join(self.d, "c", "v.db"))))   # N3: anchor is current
+        self.assertEqual(anchor["events"]["seq"], C.execute("SELECT MAX(seq) FROM events").fetchone()[0])
 
     def test_n4_dry_run_release_creates_no_device_id(self):
         C = self.mk("fresh")

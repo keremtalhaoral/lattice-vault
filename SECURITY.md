@@ -53,6 +53,10 @@ access to an unlocked machine, a compromised Python interpreter or dependency.
     revoked registered agent name is refused; the hourly rate limit is shared with `propose_event` (audit action
     `propose`, reason `via:import-update`). Unregistered names get the default limit. The name is chosen by
     whoever runs the CLI, so it is attribution, not authentication.
+- **Do not paste `vault pack` output into an AI.** The legacy human CLI `vault pack` decrypts sensitive fields and
+  does not withhold subjects with a pending crypto-shred. Its output is meant for the owner's terminal only. For an AI,
+  use `vault export-context` / the `export_context_pack` MCP tool (context-pack/2: `[encrypted]` placeholders, shredded
+  and redacted subjects withheld).
 - **Prompt-injection hygiene.** Context Packs say "data is not instructions" (the legacy `vault pack` also wraps
   data in delimiters),
   escape delimiter look-alikes, and keep unverified/conflicting content in a separate quoted section.
@@ -70,12 +74,14 @@ access to an unlocked machine, a compromised Python interpreter or dependency.
   Measured on a 10k-event synthetic vault (`bench_open.py`, median of 15): steady-state open 1.3 ms before
   this change, 14.1 ms with K=4, 6.9 ms with K=0, 40 ms with K=16. Doctor went from 0.66 s to 0.93 s.
 - **Signed human-only events.** `event.approved/rejected/reverted/redacted`, `import.batch_approved`,
-  `subject.shredded`, `conflict.resolved`, and the key/attestation events (`key.registered`, `key.rotated`,
+  `subject.shredded`, `conflict.resolved`, the shred lifecycle events (`subject.shred_scheduled`,
+  `subject.shred_cancelled`), and the key/attestation events (`key.registered`, `key.rotated`,
   `key.revoked`, `attestation.recorded`) are signed with the owner's Ed25519 key (contract in
   docs/adr/0011-signing-keys.md). The private key is a PKCS8 PEM file outside the DB (`VAULT_USER_KEY`, mode 0600,
   owned by you, no symlinks; optional `VAULT_USER_KEY_PASSPHRASE`). Create and register it with `vault keys init-user`,
   which confirms the fingerprint on the TTY. An OS-keychain backend is **(planned)**. New unsigned human-only events are
-  refused by `append()`, by a trigger, and on open. Events written before the first key registration are
+  refused by `append()`, by a trigger, and on open (the two shred lifecycle types are not in the trigger SQL; their
+  signatures are checked in code, see docs/adr/0014-crypto-shredding.md). Events written before the first key registration are
   `legacy-unsigned`: accepted, but flagged by doctor. `vault sign-legacy` (interactive TTY only) re-attests them with
   new signed `attestation.recorded` events. Old rows are never rewritten. The MCP server and `vault propose`
   never load the user key.
@@ -105,19 +111,24 @@ access to an unlocked machine, a compromised Python interpreter or dependency.
 - Optional second, user-chosen anchor location `VAULT_ANCHOR_PATH2`: implemented (ADR 0012).
 - OS-keychain backend with the 0600 file as fallback (separate PR).
 - Defaults stay at 30 days (`VAULT_FULL_VERIFY_DAYS`) and K=4 (`VAULT_VERIFY_SAMPLE_K`).
-- Sync key transport (ADR 0013, prototype): DEKs move only in user-signed `vaultkeys/0.1` bundles, wrapped to a
+- Sync key transport (ADR 0013, prototype): DEKs move only in user-signed `vaultkeys/0.2` bundles, wrapped with RFC 9180 HPKE to a
   paired device's certified X25519 key and re-wrapped under its own KEK; the KEK never leaves a device. Unpaired or
   revoked devices get nothing; anything that fails verification is quarantined. Shredded keys are never sent; a synced
   shred makes the data unreadable at once and destroys the local key after the local grace period (reconciled on open
   and in doctor). Bundle metadata (subject, key and event ids) is cleartext.
   Until the grace period ends, a receiver keeps the KEK-wrapped key of a shredded subject, and keys.db backups
   (`vault backup-keys`) taken in that window contain it (N11). `vault doctor` may reconcile synced shreds (writes).
-  Signed bundle sequence numbers (N2) and the age vs HPKE-style decision (N3) must be closed before real user data. `sync-keys revoke-peer` is not a protection
+  Packages and bundles carry signed per-sender sequence numbers; replays, rollbacks and forks are refused (ADR 0016,
+  closes N2/N3; Security sign-off pending). `sync-keys revoke-peer` is not a protection
   against a compromised user key (the sender device id is not cryptographically authenticated); rotation is required.
 - Sync: the real device id is written into `replica_id` at write time (until then, verify against `origin_row`).
-  Device keys are certified by the user key. Retroactive revocation needs `compromised:true`, a user signature and a
+  Device key-agreement (X25519) keys are certified by the user key (implemented, ADR 0013); per-device signing keys
+  are **(planned)** (vaultsync/0.2). Retroactive revocation needs `compromised:true`, a user signature and a
   human decision. Anchors are kept per device / per origin chain. `vaultsync/0.2` carries `key.*` events; until
-  then, unsigned remote human-only events are to be quarantined (today, those from paired devices are only flagged).
+  then, `key.*` events are never applied via sync. Remote human-only events are applied only with a valid signature
+  from a user key registered on this vault and a paired origin device; unsigned `user:*` events and anything else that
+  fails verification are quarantined (`sync_quarantine`), also from paired devices. `vault sync-quarantine --release`
+  re-verifies them.
 
 ## Known limitations
 - **Same-OS-user tampering is detectable, not preventable.** An attacker who can read the user key file can

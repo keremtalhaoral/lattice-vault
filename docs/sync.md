@@ -1,20 +1,34 @@
-# Sync & multi-device prototype (`.vaultsync`, format `vaultsync/0.1`)
+# Sync & multi-device prototype (`.vaultsync`, format `vaultsync/0.2`)
 
-Status: **file-based prototype** (packages are files you move by hand; no server, no network, no signing). Implements part of ADR 0008. Single owner, 2+ devices, no server,
+Status: **file-based prototype** (packages are files you move by hand; no server, no network). Implements part of ADR 0008. Single owner, 2+ devices, no server,
 no network code. Device A exports a file, the user moves it (USB, file sync, …), device B imports it.
 
-> **Do not use multi-device sync with real data.** Packages are unsigned, keys move only in separate signed `vaultkeys/0.1` bundles (see below, ADR 0013), and redaction
-> does not propagate to other devices. Until signing exists, `user:*` and approval events are quarantined (see Trust).
+> **Do not use multi-device sync with real data.** Packages are signed by the user key with per-sender sequence numbers (ADR 0016), keys move only in separate signed `vaultkeys/0.2` bundles (see below, ADR 0013/0016), and redaction
+> does not propagate to other devices. Individual `user:*` content events are not signed, so they are quarantined (see Trust).
 
 ## Package format
 One file. Line 1 is the **manifest** (canonical JSON). Lines 2..n are the **body** (JSONL, one event per line, sorted by `(hlc, id)`).
 
 ```json
-{"format":"vaultsync/0.1","source_device":"dev-…","created_at":"…Z",
+{"format":"vaultsync/0.2","source_device":"dev-…","created_at":"…Z",
+ "seq":N,"prev_package":"<sha256 of the previous package's signed manifest>"|null,
  "vector":{"<origin_device>/<replica_id>": max_replica_seq, …},   // everything the source holds
  "since":{…},                                                      // watermark used for --since-peer
- "event_count":N,"body_sha256":"<hex sha256 of body bytes>","signature":null}
+ "event_count":N,"body_sha256":"<hex sha256 of body bytes>",
+ "signature":{"key_id":"user/ed25519/…","alg":"ed25519","sig":"<base64>"}}
 ```
+The signature covers every other manifest field (domain `lattice-sync-manifest/v2`), so the body hash, the vector
+used for peer watermarks and the sequence number are all signed. The receiver refuses packages that are unsigned,
+signed by a key not registered and active on it, from itself, or in the old `vaultsync/0.1` format (re-export).
+`key.*` events are not exported (each device registers the user key itself).
+
+## Sequence numbers (ADR 0016)
+Each device numbers its packages (and, separately, its key bundles) 1, 2, 3, … and names the previous one by hash.
+A receiver refuses a package that repeats a number with different content (fork), is older than the newest it accepted
+(rollback), or does not continue its history (fork). Re-importing the same package is a no-op. Gaps are fine: a
+package sent to another device leaves a gap. Refusals: `vault sync-seq`. After restoring a sending device from an old
+backup, its peers refuse its packages until you run `vault sync-seq-advance --stream vaultsync --to N` (and
+`--stream vaultkeys`) on it with N above any number it used before.
 Each body line is the event **exactly as it was on its origin device**: every `EVENT_HASH_FIELDS` column, `prev_hash`,
 `hash`, `payload_ct` (base64 ciphertext or null), `parents` (`[[parent_id, rel], …]` from `event_parents`), `targets`,
 plus `origin_device`. Forwarded events (A→B→C) are re-exported from the stored origin row, so C can still verify A's hash.
@@ -129,12 +143,12 @@ New tables (all `CREATE TABLE IF NOT EXISTS`, created lazily by sync): `sync_dev
 Reuses the reserved `replicas` and `sync_peer_state`. No existing table or trigger is changed.
 
 ## Not built (planned)
-Ed25519 package/event signing and device keys. Package encryption (age/AEAD). Key sync and cross-device shredding.
+Per-device signing keys. Package encryption (age/AEAD). Key sync and cross-device shredding.
 Propagation of redaction to other devices (redact-copy on each device). A flag-instead-of-reject mode for skew. HLC counter overflow handling.
 `conflict.resolved` UX for correction forks. Sync-folder automation and compression. Watermarks acknowledged by the receiver.
 Partial import (it is all-or-nothing by design). `projection_hash` includes local `seq` (`decided_seq`), so it is **not** comparable across devices.
 
-## Key transport (`vaultkeys/0.1`, prototype, ADR 0013)
+## Key transport (`vaultkeys/0.2`, prototype, ADR 0013/0016)
 Encrypted fields stay ciphertext in `.vaultsync` packages. To let a paired device read them, move the data keys in a
 separate signed bundle (human-only, TTY):
 
@@ -148,7 +162,8 @@ separate signed bundle (human-only, TTY):
     vault sync-keys import keys.vaultkeys
     vault sync-keys quarantine                        # refused bundles / entries (ids and reasons only)
 
-The KEK never leaves a device; DEKs are wrapped to the recipient's certified X25519 key and re-wrapped under the
+The KEK never leaves a device; DEKs are wrapped with RFC 9180 HPKE (X25519, HKDF-SHA256, AES-256-GCM) to the
+recipient's certified X25519 key and re-wrapped under the
 recipient's KEK on import. Shredded keys are never sent; when a signed `subject.shredded` from another device is applied,
 its payloads become unreadable at once and the local DEK moves to `pending_destroy`. It is destroyed after the local
 grace period, on the next vault open or `vault doctor`. Shreds from a device revoked for key transport are ignored and

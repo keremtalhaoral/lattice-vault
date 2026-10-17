@@ -119,8 +119,8 @@ class KeyTransportTest(unittest.TestCase):
     def test_tampered_wrap_quarantined(self):
         eid = self.secret(); self.sync_events(self.A, self.B); self.ready()
         p = self.bundle(); b = json.load(open(p))
-        ct = bytearray(kt._unb64(b["entries"][0]["ct_b64"])); ct[-1] ^= 1
-        b["entries"][0]["ct_b64"] = kt._b64(bytes(ct)); open(p, "w").write(vault.canon(b))
+        ct = bytearray(kt._unb64(b["entries"][0]["hpke_b64"])); ct[-1] ^= 1
+        b["entries"][0]["hpke_b64"] = kt._b64(bytes(ct)); open(p, "w").write(vault.canon(b))
         with self.assertRaisesRegex(kt.KeyTransportError, "bad bundle signature"):   # unsigned change: whole bundle refused
             kt.import_keys(self.B, p)
         self.resign(p, lambda b: None)                  # validly signed but the wrap does not authenticate
@@ -128,8 +128,9 @@ class KeyTransportTest(unittest.TestCase):
         self.assertEqual(r["imported"], []); self.assertIn("does not authenticate", list(r["quarantined"].values())[0])
         self.assertEqual(self.payload(self.B, eid), (None, "undecryptable"))
         # AAD binding: moving a wrap to another subject / event set fails
+        head = kt.seqstate.digest(kt._bundle_msg(json.load(open(p))))   # the re-signed bundle B accepted
         p2 = self.bundle()
-        self.resign(p2, lambda b: b["entries"][0].__setitem__("subject", "person:other"))
+        self.resign(p2, lambda b: (b["entries"][0].__setitem__("subject", "person:other"), b.__setitem__("prev_bundle", head)))
         self.assertTrue(kt.import_keys(self.B, p2)["quarantined"])
         q = [r["reason"] for r in kt.quarantined(self.B)]
         self.assertEqual(len(q), 3)
@@ -341,7 +342,7 @@ class KeyTransportTest(unittest.TestCase):
         self.assertEqual(run("b", "add-peer", ca).returncode, 0)
         out = self.path("k")
         r = run("a", "export", "--to", self.db_, "--out", out); self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertNotIn("ct_b64", r.stdout)
+        self.assertNotIn("hpke_b64", r.stdout)
         r = run("b", "import", out); self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(len(json.loads(r.stdout)["imported"]), 1)
         vault._KEYSTORE.clear()
